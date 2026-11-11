@@ -1,0 +1,198 @@
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name            = "winnowr"
+version         = "0.1.0"
+description     = "Machine-learned genotyping and filtering of germline small-variant calls."
+readme          = "README.md"
+license         = "MIT"
+license-files   = ["LICENSE"]
+authors         = [{ name="Fulcrum Genomics LLC", email="contact@fulcrumgenomics.com" }]
+requires-python = ">=3.12"
+dependencies    = [
+    "defopt~=6.4",
+    "fgpyo~=1.5",
+    "numpy~=2.5",
+    "pandas~=3.1",
+    "pyarrow~=26.0",
+    "pysam~=0.24",
+    "xgboost~=3.4",
+]
+classifiers     = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+
+[project.urls]
+"homepage" = "https://github.com/fg-labs/winnowr"
+"repository" = "https://github.com/fg-labs/winnowr"
+"Bug Tracker" = "https://github.com/fg-labs/winnowr/issues"
+
+[project.scripts]
+winnowr = "winnowr.main:run"
+
+[dependency-groups]
+dev = [
+    "ruff ==0.16.0",
+    "mypy ==2.3.0",
+    "pytest ~=8.4",
+    "pytest-cov ~=6.2",
+    "pytest-mock ~=3.14",
+    "poethepoet ~=0.36",
+    "validate-pyproject[all] ~=0.25",
+    "pandas-stubs ~=3.1.0",
+]
+ipython = [
+    "ipython ~=9.2",
+]
+
+[tool.uv]
+# Ignore releases younger than a week, so a compromised publish has time to be
+# caught before it can be locked. Must stay >= the Dependabot `cooldown` in
+# .github/dependabot.yml, or Dependabot will propose versions that can't lock.
+exclude-newer = "1 week"
+
+[tool.poe.tasks]
+fix-format = "ruff format"
+fix-lint   = "ruff check --fix"
+
+fix-all.ignore_fail = "return_non_zero"
+fix-all.sequence    = [
+    "fix-format",
+    "fix-lint"
+]
+
+check-format    = "ruff format --check --diff"
+check-lint      = "ruff check"
+check-pyproject = "validate-pyproject pyproject.toml"
+check-tests     = "pytest"
+check-typing    = "mypy"
+
+check-all.ignore_fail = "return_non_zero"
+check-all.sequence    = [
+    "check-format",
+    "check-lint",
+    "check-pyproject",
+    "check-typing",
+    "check-tests"
+]
+
+fix-and-check-all.ignore_fail = "return_non_zero"
+fix-and-check-all.sequence    = [
+    "fix-format",
+    "fix-lint",
+    "check-pyproject",
+    "check-typing",
+    "check-tests"
+]
+
+[tool.mypy]
+files                       = ["./"]
+strict_optional             = true
+strict_equality             = true
+check_untyped_defs          = true
+disallow_any_generics       = true
+disallow_untyped_calls      = true
+disallow_untyped_decorators = true
+disallow_untyped_defs       = true
+no_implicit_optional        = true
+warn_no_return              = true
+warn_redundant_casts        = true
+warn_return_any             = true
+warn_unreachable            = true
+warn_unused_configs         = true
+warn_unused_ignores         = true
+enable_error_code           = [
+    "ignore-without-code",
+    "possibly-undefined",
+    "exhaustive-match",
+]
+exclude                     = [
+    "docs/",
+    "site/",
+]
+
+[[tool.mypy.overrides]]
+module = "defopt"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.4"
+addopts    = [
+    "--color=yes",
+    "--import-mode=importlib",
+    "--cov"
+]
+
+[tool.coverage.run]
+omit   = ["tests/*"]
+branch = true
+
+[tool.coverage.report]
+skip_empty = true
+fail_under = 98
+
+[tool.ruff]
+line-length    = 100
+target-version = "py312"
+output-format  = "full"
+preview        = true
+
+[tool.ruff.lint]
+select    = [
+    "A",      # Builtin shadowing
+    "ARG",    # Unused arguments
+    "C901",   # McCabe complexity
+    "B",      # bugbear
+    "D",      # pydocstyle (docstrings. We have the "google" convention enabled)
+    "D204",   # Blank line between class docstring and first (__init__) method
+    "D213",   # Summary line should be located on the line after opening quotes
+    "E",      # pycodestyle errors
+    "LOG",    # flake8-logging
+    "LOG015", # (preview rule) Prohibit calls to the root logger
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # PEP8 naming
+    "W",      # pycodestyle warnings
+    "Q",      # flake8-quotes
+    "RUF008", # Do not use mutable default values for dataclass attributes 
+    "RUF012", # Mutable class attributes should be annotated with typing.ClassVar
+    "RUF024", # Do not pass mutable objects as values to dict.fromKeys
+]
+ignore    = [
+    "E203",
+    "E701",
+    "D212",  # summary line should be located on the same line as opening quotes
+    "D100",  # missing docstring in public module
+    "D104",  # missing docstring in public package
+]
+unfixable = ["B"]
+# NB: only preview rules explicitly selected above (e.g. LOG015) will be enforced
+preview = true
+explicit-preview-rules = true
+
+[tool.ruff.lint.per-file-ignores]
+# Ignore `D103` Missing docstring in public function in test files
+"tests/**.py" = ["D103"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+
