@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -5,9 +7,13 @@ from winnowr.common import NEVER
 from winnowr.labels import Label
 from winnowr.rescore import Counts
 from winnowr.rescore import Mode
+from winnowr.rescore import RepeatFlip
+from winnowr.rescore import flip_thresholds
+from winnowr.rescore import has_repeat_info
 from winnowr.thresholds import FoldPredictions
 from winnowr.thresholds import PromoteFold
 from winnowr.thresholds import search_promote_thresholds
+from winnowr.thresholds import search_repeat_flip
 from winnowr.thresholds import search_thresholds
 
 
@@ -157,3 +163,186 @@ def test_regenotype_search() -> None:
     # without the re-genotype search, or in veto mode, t_regenotype stays NEVER
     assert search_thresholds([fold], Mode.GENOTYPER, grid=[0.5, 0.8]).t_regenotype == NEVER
     assert search_thresholds([fold], Mode.VETO, regenotype=True).t_regenotype == NEVER
+
+
+def _repeat_fold(str_period: np.ndarray | None, str_repeats: np.ndarray | None) -> FoldPredictions:
+    # four flippy calls: two correct flips outside long repeats at P(flip) 0.55, and in a long
+    # dinucleotide repeat a correct flip at 0.95 and a TP at 0.6; t_flip 0.5 is best for all calls,
+    # but a stricter threshold in the repeat leaves its TP alone
+    probabilities = np.array([
+        [0.0, 0.45, 0.55],
+        [0.0, 0.45, 0.55],
+        [0.0, 0.05, 0.95],
+        [0.0, 0.4, 0.6],
+    ])
+    return FoldPredictions(
+        probabilities=probabilities,
+        labels=np.array([Label.FLIP, Label.FLIP, Label.FLIP, Label.KEEP]),
+        flip_ok=np.array([True, True, True, False]),
+        flippable=np.ones(4, dtype=np.bool_),
+        baseline=Counts(tp=10, fp=3, fn=3),
+        regenotypable=np.zeros(4, dtype=np.bool_),
+        regenotypes_to_ref=np.zeros(4, dtype=np.bool_),
+        regenotype_ok=np.zeros(4, dtype=np.bool_),
+        str_period=str_period,
+        str_repeats=str_repeats,
+    )
+
+
+def test_repeat_flip_selects_long_repeats() -> None:
+    repeat_flip = RepeatFlip(min_period=2, min_units=8, t_flip=0.9)
+    period = np.array([1.0, 2.0, 2.0, 3.0, np.nan])
+    units = np.array([20.0, 7.0, 8.0, 12.0, np.nan])
+    assert repeat_flip.selects(period, units).tolist() == [False, False, True, True, False]
+    assert flip_thresholds(0.5, None, None, None) == 0.5
+    per_call = flip_thresholds(0.5, repeat_flip, period, units)
+    assert isinstance(per_call, np.ndarray)
+    assert per_call.tolist() == [0.5, 0.5, 0.9, 0.9, 0.5]
+    with pytest.raises(ValueError, match="repeat period and count"):
+        flip_thresholds(0.5, repeat_flip, None, units)
+    with pytest.raises(ValueError, match="repeat period and count"):
+        flip_thresholds(0.5, repeat_flip, period, None)
+    assert has_repeat_info(period, units) and not has_repeat_info(period, None)
+    assert not has_repeat_info(np.array([1.0, np.nan]), np.array([np.nan, 8.0]))
+
+
+def test_repeat_flip_search() -> None:
+    fold = _repeat_fold(np.array([np.nan, 1.0, 2.0, 2.0]), np.array([np.nan, 5.0, 12.0, 12.0]))
+    chosen = search_thresholds([fold], Mode.GENOTYPER, grid=[0.5, 0.7, 0.9])
+    assert (chosen.t_drop, chosen.t_flip, chosen.repeat_flip) == (NEVER, 0.5, None)
+    best = search_repeat_flip(
+        [fold], chosen, grid=[0.5, 0.7, 0.9], periods=[1, 2], units=[6, 11], nested=False
+    )
+    # the narrowest stratum and the highest threshold that skip only the repeat TP
+    assert best.repeat_flip == RepeatFlip(min_period=2, min_units=11, t_flip=0.9)
+    assert (best.t_drop, best.t_flip) == (chosen.t_drop, chosen.t_flip)
+    assert best.gain == pytest.approx(Counts(13, 0, 0).f1 - Counts(10, 3, 3).f1)
+    assert best.gain > chosen.gain
+    drop, flip, _ = fold.decide(best.t_drop, best.t_flip, Mode.GENOTYPER, NEVER, best.repeat_flip)
+    assert flip.tolist() == [True, True, True, False] and not drop.any()
+
+
+def test_repeat_flip_search_keeps_the_regenotype_threshold() -> None:
+    # the repeat TP of `_repeat_fold` gets a re-genotype class: re-genotyping it would break it,
+    # and a fifth call outside repeats is fixed only by re-genotyping
+    fold = _repeat_fold(np.array([np.nan, 1.0, 2.0, 2.0]), np.array([np.nan, 5.0, 12.0, 12.0]))
+    probabilities = np.zeros((5, 4))
+    probabilities[:4, :3] = fold.probabilities
+    probabilities[4] = [0.0, 0.1, 0.0, 0.9]
+    fold = replace(
+        fold,
+        probabilities=probabilities,
+        labels=np.array([*fold.labels, Label.REGENOTYPE]),
+        flip_ok=np.array([*fold.flip_ok, False]),
+        flippable=np.ones(5, dtype=np.bool_),
+        regenotypable=np.ones(5, dtype=np.bool_),
+        regenotypes_to_ref=np.zeros(5, dtype=np.bool_),
+        regenotype_ok=np.array([False, False, False, False, True]),
+        str_period=np.array([np.nan, 1.0, 2.0, 2.0, np.nan]),
+        str_repeats=np.array([np.nan, 5.0, 12.0, 12.0, np.nan]),
+    )
+    grid = [0.5, 0.7, 0.9]
+    chosen = search_thresholds([fold], Mode.GENOTYPER, grid=grid, regenotype=True)
+    assert chosen.t_regenotype < NEVER
+    best = search_repeat_flip([fold], chosen, grid=grid, periods=[2], units=[11], nested=False)
+    assert best.repeat_flip == RepeatFlip(min_period=2, min_units=11, t_flip=0.9)
+    assert best.t_regenotype == chosen.t_regenotype
+    assert best.gain == pytest.approx(
+        fold.f1_gain(best.t_drop, best.t_flip, Mode.GENOTYPER, best.t_regenotype, best.repeat_flip)
+    )
+    assert best.gain > fold.f1_gain(
+        best.t_drop, best.t_flip, Mode.GENOTYPER, NEVER, best.repeat_flip
+    )
+
+
+def test_repeat_flip_search_keeps_the_thresholds_without_evidence() -> None:
+    # no call is in a repeat: no stratum threshold changes anything
+    fold = _repeat_fold(np.full(4, np.nan), np.full(4, np.nan))
+    chosen = search_thresholds([fold], Mode.GENOTYPER, grid=[0.5, 0.7])
+    assert search_repeat_flip([fold], chosen, grid=[0.5, 0.7], nested=False) == chosen
+    assert search_repeat_flip([fold, fold], chosen, grid=[0.5, 0.7]) == chosen
+    with pytest.raises(ValueError, match="at least one fold"):
+        search_repeat_flip([], chosen)
+    with pytest.raises(ValueError, match="needs 2\\+ folds"):
+        search_repeat_flip([fold], chosen)
+    with pytest.raises(ValueError, match="repeat period and count"):
+        search_repeat_flip([_repeat_fold(None, None)], chosen, nested=False)
+    with_stratum = replace(chosen, repeat_flip=RepeatFlip(min_period=1, min_units=6, t_flip=0.9))
+    with pytest.raises(ValueError, match="without a repeat_flip"):
+        search_repeat_flip([fold], with_stratum, nested=False)
+
+
+def _flip_fold(calls: list[tuple[float, bool, tuple[float, float] | None]]) -> FoldPredictions:
+    """A fold of flippable calls: (P(flip), whether a flip fixes it, (period, units) or None)."""
+    n = len(calls)
+    p_flip = np.array([p for p, _, _ in calls])
+    fixes = np.array([fix for _, fix, _ in calls])
+    period = np.array([np.nan if r is None else r[0] for _, _, r in calls])
+    units = np.array([np.nan if r is None else r[1] for _, _, r in calls])
+    return FoldPredictions(
+        probabilities=np.stack([np.zeros(n), 1 - p_flip, p_flip], axis=1),
+        labels=np.where(fixes, Label.FLIP, Label.KEEP),
+        flip_ok=fixes,
+        flippable=np.ones(n, dtype=np.bool_),
+        baseline=Counts(tp=20, fp=10, fn=10),
+        regenotypable=np.zeros(n, dtype=np.bool_),
+        regenotypes_to_ref=np.zeros(n, dtype=np.bool_),
+        regenotype_ok=np.zeros(n, dtype=np.bool_),
+        str_period=period,
+        str_repeats=units,
+    )
+
+
+LONG: tuple[float, float] = (2.0, 12.0)
+
+
+def test_repeat_flip_search_can_choose_a_lower_threshold() -> None:
+    # outside repeats a TP sits at P(flip) 0.6, so t_flip stays high; in the repeat a fixable call
+    # sits at 0.6 too, which only a lower stratum threshold flips
+    fold = _flip_fold([(0.95, True, None), (0.6, False, None), (0.6, True, LONG)])
+    grid = [0.5, 0.7, 0.9]
+    chosen = search_thresholds([fold], Mode.GENOTYPER, grid=grid)
+    assert chosen.t_flip == 0.9
+    best = search_repeat_flip([fold], chosen, grid=grid, periods=[2], units=[11], nested=False)
+    assert best.repeat_flip == RepeatFlip(min_period=2, min_units=11, t_flip=0.5)
+    assert best.repeat_flip.t_flip < chosen.t_flip and best.gain > chosen.gain
+
+
+def test_repeat_flip_search_breaks_ties_by_count_then_period() -> None:
+    # two strata that skip different repeat TPs gain the same: (period >= 3, units >= 6) skips the
+    # first, (period >= 1, units >= 11) the second; the stratum that covers both also covers two
+    # fixable calls, so it gains nothing; the higher minimum count wins the tie
+    fold = _flip_fold([
+        *[(0.95, True, None)] * 5,
+        (0.6, False, (3.0, 6.0)),
+        (0.6, False, (1.0, 11.0)),
+        (0.6, True, (2.0, 8.0)),
+        (0.6, True, (2.0, 8.0)),
+    ])
+    chosen = search_thresholds([fold], Mode.GENOTYPER, grid=[0.5])
+    assert chosen.t_flip == 0.5
+    best = search_repeat_flip(
+        [fold], chosen, grid=[0.5, 0.9], periods=[1, 2, 3], units=[6, 8, 11], nested=False
+    )
+    assert best.repeat_flip == RepeatFlip(min_period=1, min_units=11, t_flip=NEVER)
+    skip_first = RepeatFlip(min_period=3, min_units=6, t_flip=NEVER)
+    assert fold.f1_gain(NEVER, 0.5, Mode.GENOTYPER, NEVER, skip_first) == best.gain
+
+
+def test_repeat_flip_search_nested_selection() -> None:
+    # every fold has two repeat TPs that a stricter stratum threshold leaves alone: kept
+    effect = _flip_fold([*[(0.95, True, None)] * 3, (0.6, False, LONG), (0.6, False, LONG)])
+    chosen = search_thresholds([effect] * 3, Mode.GENOTYPER, grid=[0.5])
+    assert chosen.t_flip == 0.5
+    best = search_repeat_flip([effect] * 3, chosen, grid=[0.5], periods=[2], units=[11])
+    assert best.repeat_flip == RepeatFlip(min_period=2, min_units=11, t_flip=NEVER)
+    # one fold has three such TPs, two folds a fixable repeat call each: the stratum gains
+    # in-sample, but chosen without the first fold it never gains on another fold, so it is dropped
+    big = _flip_fold([(0.95, True, None), *[(0.6, False, LONG)] * 3])
+    small = _flip_fold([(0.95, True, None), (0.6, True, LONG)])
+    folds = [big, small, small]
+    chosen = search_thresholds(folds, Mode.GENOTYPER, grid=[0.5])
+    assert chosen.t_flip == 0.5
+    in_sample = search_repeat_flip(folds, chosen, grid=[0.5], periods=[2], units=[11], nested=False)
+    assert in_sample.repeat_flip is not None and in_sample.gain > chosen.gain
+    assert search_repeat_flip(folds, chosen, grid=[0.5], periods=[2], units=[11]) == chosen

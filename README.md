@@ -46,6 +46,17 @@ fitted on the training samples turns those read lengths into a diploid length ge
 with the length caller's (e.g. a `0/1` call whose truth is `1/2`, or a call with the wrong repeat
 length), adding an ALT allele if needed.
 
+Experimental and off by default: with `train --repeat-flip`, an indel genotype model also gets a
+separate het<->hom flip threshold, higher or lower than `t_flip`, for calls in long tandem repeats
+(it needs DRAGstrInfo in the VCFs). Cross-validation picks the stratum (a minimum DRAGstr repeat
+period of 1, 2 or 3 bp and a minimum repeat count of 6, 8, 11, 15 or 20 units) and its threshold
+together, after the other thresholds. With so many candidates the best one gains on the CV folds
+even when repeats behave like other calls, so it is kept only if nested selection also gains: chosen
+on all but one fold, it must raise F1 on the held-out fold for more than half of the folds, and in
+sum. Flips elsewhere keep the model's `t_flip`. It is opt-in because it adds a CV-chosen parameter
+whose benefit has been small, and because models trained without it keep sidecar format 2 (see
+[Model files](#model-files)).
+
 ## Installation
 
 Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/), then:
@@ -174,7 +185,9 @@ winnowr train --tables $tables --sample-groups $trio --variant-type INDEL --task
 
 Each writes `<output>.xgb.json` and `<output>.winnowr.json` (see [Model files](#model-files)).
 `--regenotype` adds the re-genotype class and the repeat-length features (`--repeat-length` adds
-only the features); `--no-neighbourhood` leaves out the neighbourhood features.
+only the features); `--no-neighbourhood` leaves out the neighbourhood features. Add
+`--repeat-flip` to the indel genotype model to give calls in long tandem repeats their own flip
+threshold (see above).
 
 ### 5. Evaluate on the held-out sample
 
@@ -185,18 +198,23 @@ winnowr evaluate --models indel.winnowr.json indel-promote.winnowr.json \
   --table HG002.parquet --output HG002.indel.tsv
 ```
 
-`evaluate` writes one row per policy (a TSV with a header). The policies are `baseline` (no
-action), `veto` and `genotyper` at the model's CV-chosen thresholds, `flip_only` (the genotyper's
-flips alone), `genotyper_no_regenotype` for re-genotype models, and, with a promote model,
-`promote`, `promote_no_flip` and `genotyper+promote`. `--tuned` adds `veto_tuned`,
-`genotyper_tuned` and `promote_tuned`, with thresholds tuned on the evaluated sample itself; they
-peek at its labels, so they are optimistic and only bound what better thresholds could do. The
-columns are the PASS-call thresholds and actions (`t_drop`, `t_flip`, `t_regenotype`, `dropped`,
+`evaluate` writes one row per policy (a TSV with a header). The policies are `baseline` (no action),
+`veto` and `genotyper` at the model's CV-chosen thresholds, `flip_only` (the genotyper's flips
+alone), `genotyper_no_regenotype` for re-genotype models, `genotyper_no_repeat_flip` (the genotyper
+with `t_flip` for every call) for models with a long-repeat flip threshold, and, with a promote
+model, `promote`, `promote_no_flip` and `genotyper+promote`. `--tuned` adds `veto_tuned`,
+`genotyper_tuned` and `promote_tuned`, with thresholds tuned on the evaluated sample itself; for a
+model trained with `--repeat-flip` (whether or not it kept a stratum), `genotyper_tuned` also tunes
+the long-repeat stratum and threshold, after the other thresholds as in training. The tuned policies
+peek at the sample's labels, so they are optimistic and only bound what better thresholds could do.
+The columns are the PASS-call thresholds and actions (`t_drop`, `t_flip`, `t_regenotype`, `dropped`,
 `dropped_tp`, `flipped`, `flips_fixed`, `flips_broke_tp`, `regenotyped`, `regenotypes_fixed`,
 `regenotypes_broke_tp`), the promote thresholds and actions (`t_promote`, `t_promote_flip`,
 `promoted`, `promoted_correct`, `promoted_flipped`), and the outcome (`tp`, `fp`, `fn`, `f1`, and
-`f1_gain` versus the baseline). Evaluating a sample the models were trained on logs a warning: its
-metrics are in-sample.
+`f1_gain` versus the baseline), then the long-repeat flip stratum and threshold
+(`repeat_min_period`, `repeat_min_units`, `t_flip_repeat`; 0, 0 and 1.01 without one; a stratum can
+also have threshold 1.01, never flip, so `repeat_min_period` = 0 is what marks no stratum).
+Evaluating a sample the models were trained on logs a warning: its metrics are in-sample.
 
 ## Model inputs
 
@@ -282,11 +300,15 @@ XGBoost's missing-value handling.
 `train --output PREFIX` writes `PREFIX.xgb.json`, the XGBoost booster, and `PREFIX.winnowr.json`,
 the sidecar that `evaluate` and `score` take (the booster is read from beside it). The sidecar
 records the variant type and task, the ordered feature names, the region names, the CV-chosen
-thresholds, the training samples and contigs, the training parameters, the stutter model of a
-repeat-length model, and for compatibility checks:
+thresholds (with the long-repeat flip threshold of a `--repeat-flip` model), the training samples
+and contigs, the training parameters, the stutter model of a repeat-length model, and for
+compatibility checks:
 
-- `format_version`: the sidecar format (schema) version. This winnowr writes version 2 and reads
-  versions 1 and 2; a newer version is an error.
+- `format_version`: the sidecar format (schema) version. This winnowr reads versions 1 to 3; a newer
+  version is an error. It writes version 2, or version 3 for a model trained with `--repeat-flip`,
+  which adds `repeat_flip_searched` (true) and the long-repeat flip threshold (`repeat_flip` in each
+  mode's thresholds: `min_period`, `min_units`, `t_flip`; null without one). So models trained
+  without `--repeat-flip` stay readable by winnowr versions that read only format 2.
 - `winnowr_version` and `xgboost_version`: the versions that trained the model. `score` and
   `evaluate` warn when the model was trained by another winnowr version.
 - `reference_contigs`: the length of each training contig in the reference the training calls

@@ -98,6 +98,7 @@ def train(
     neighbourhood: bool = True,
     repeat_length: bool = False,
     regenotype: bool = False,
+    repeat_flip: bool = False,
     sample_groups: list[str] | None = None,
     grid: list[float] | None = None,
     learning_rate: float = TrainingParams.learning_rate,
@@ -132,6 +133,13 @@ def train(
         regenotype: Add the re-genotype class (implies --repeat-length): calls whose genotype a
             het<->hom flip does not fix but the length caller's genotype does; its threshold is
             chosen by CV with the genotyper's.
+        repeat_flip: Experimental and opt-in. Also choose by CV a separate genotyper flip threshold
+            (higher or lower than t_flip) for calls in long tandem repeats (INDEL GENOTYPE models;
+            needs DRAGstrInfo in the VCFs): the stratum (minimum DRAGstr repeat period and count)
+            and its threshold are searched after the other thresholds, and kept only if nested
+            selection (chosen on the other folds, scored on each held-out fold) also raises F1.
+            Opt-in because it adds a CV-chosen parameter whose benefit has been small; models
+            trained with it are written as sidecar format 3, others as format 2.
         sample_groups: Samples to hold out together in CV, one comma-separated group per value
             (e.g. a trio: HG005,HG006,HG007). Samples not in a group are held out alone, so by
             default each sample is its own fold (leave-one-sample-out).
@@ -157,6 +165,11 @@ def train(
         raise ValueError(
             "Repeat-length features (--repeat-length, or --regenotype) need --variant-type INDEL "
             f"and --task GENOTYPE, got --variant-type {variant_type.name} --task {task.name}"
+        )
+    if repeat_flip and (variant_type is not VariantType.INDEL or task is not Task.GENOTYPE):
+        raise ValueError(
+            "--repeat-flip needs --variant-type INDEL and --task GENOTYPE, got --variant-type "
+            f"{variant_type.name} --task {task.name}"
         )
     stutter = fit_stutter_from_feature_tables(loaded) if use_strlen else None
     repeat_features = (*STRLEN_FEATURES, *LENGTH_CALL_FEATURES) if use_strlen else ()
@@ -226,6 +239,7 @@ def train(
             groups=groups,
             refit=refit if use_strlen else None,
             reference_contigs=reference_contigs,
+            repeat_flip=repeat_flip,
         )
     sidecar = model.save(output)
     logger.info(f"Wrote model sidecar {sidecar}")

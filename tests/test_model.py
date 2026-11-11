@@ -9,6 +9,7 @@ import pytest
 from winnowr.common import Task
 from winnowr.common import VariantType
 from winnowr.labels import Label
+from winnowr.model import SIDECAR_FORMAT_VERSION
 from winnowr.model import ModelInfo
 from winnowr.model import TrainingParams
 from winnowr.model import WinnowrModel
@@ -17,6 +18,7 @@ from winnowr.model import fit_booster
 from winnowr.model import num_classes
 from winnowr.model import to_matrix
 from winnowr.rescore import Mode
+from winnowr.rescore import RepeatFlip
 from winnowr.stutter import fit_stutter_model
 from winnowr.thresholds import PromoteThresholds
 from winnowr.thresholds import Thresholds
@@ -149,6 +151,58 @@ def test_regenotype_sidecar_round_trip_and_checks() -> None:
     assert old.thresholds[Mode.GENOTYPER].t_regenotype == 1.01
 
 
+def test_repeat_flip_sidecar_round_trip() -> None:
+    repeat_flip = RepeatFlip(min_period=2, min_units=8, t_flip=0.8)
+    genotype = {
+        Mode.GENOTYPER: Thresholds(0.5, 0.7, 0.01, repeat_flip=repeat_flip),
+        Mode.VETO: Thresholds(0.5, 1.01, 0.0),
+    }
+    info = replace(_info(genotype), repeat_flip_searched=True)
+    raw = json.loads(info.to_json())
+    assert raw["format_version"] == 3 == SIDECAR_FORMAT_VERSION
+    assert raw["repeat_flip_searched"] is True
+    assert raw["thresholds"]["genotyper"]["repeat_flip"] == {
+        "min_period": 2,
+        "min_units": 8,
+        "t_flip": 0.8,
+    }
+    assert raw["thresholds"]["veto"]["repeat_flip"] is None
+    loaded = ModelInfo.from_json(info.to_json())
+    assert loaded == info and loaded.thresholds[Mode.GENOTYPER].repeat_flip == repeat_flip
+    # sidecars written before the repeat-stratum threshold load without it
+    for thresholds in raw["thresholds"].values():
+        del thresholds["repeat_flip"]
+    raw["format_version"] = 2
+    del raw["repeat_flip_searched"]
+    old = ModelInfo.from_json(json.dumps(raw))
+    assert all(t.repeat_flip is None for t in old.thresholds.values())
+    assert not old.repeat_flip_searched and old.format_version == 2
+    # a search that kept no stratum is still recorded (format 3)
+    no_stratum = {m: replace(t, repeat_flip=None) for m, t in genotype.items()}
+    searched = replace(_info(no_stratum), repeat_flip_searched=True)
+    raw = json.loads(searched.to_json())
+    assert raw["format_version"] == 3 and raw["thresholds"]["genotyper"]["repeat_flip"] is None
+    assert ModelInfo.from_json(searched.to_json()).repeat_flip_searched
+
+
+def test_malformed_sidecar_fields_are_value_errors() -> None:
+    genotype = {
+        Mode.GENOTYPER: Thresholds(0.5, 0.7, 0.01, repeat_flip=RepeatFlip(2, 8, 0.8)),
+        Mode.VETO: Thresholds(0.5, 1.01, 0.0),
+    }
+    raw = json.loads(_info(genotype).to_json())
+    raw["thresholds"]["genotyper"]["repeat_flip"]["min_length"] = 3
+    with pytest.raises(ValueError, match="Malformed sidecar .*min_length"):
+        ModelInfo.from_json(json.dumps(raw))
+    raw = json.loads(_info(genotype).to_json())
+    raw["params"]["max_depth_typo"] = 3
+    with pytest.raises(ValueError, match="Malformed sidecar .*max_depth_typo"):
+        ModelInfo.from_json(json.dumps(raw))
+    del raw["params"]
+    with pytest.raises(ValueError, match="Malformed sidecar .*params"):
+        ModelInfo.from_json(json.dumps(raw))
+
+
 def test_validation_fraction_must_leave_training_calls() -> None:
     for fraction in (-0.1, 1.0):
         with pytest.raises(ValueError, match="at least 0 and below 1"):
@@ -194,8 +248,12 @@ def test_sidecar_records_versions_and_reference(
     genotype = {Mode.GENOTYPER: Thresholds(0.5, 0.5, 0.0), Mode.VETO: Thresholds(0.5, 1.01, 0.0)}
     info = replace(_info(genotype), reference_contigs={"chr1": 1000}, winnowr_version="0.0.1")
     raw = json.loads(info.to_json())
+    # without --repeat-flip the sidecar stays format 2, without the long-repeat fields
     assert (raw["format_version"], raw["reference_contigs"]) == (2, {"chr1": 1000})
+    assert "repeat_flip_searched" not in raw
+    assert set(raw["thresholds"]["genotyper"]) == {"t_drop", "t_flip", "gain", "t_regenotype"}
     assert ModelInfo.from_json(info.to_json()) == info
+    assert ModelInfo.from_json(info.to_json()).format_version == 2
     calls = synthetic_calls(50, seed=1)
     booster = fit_booster(calls, calls["label"], ["x"], FAST, num_classes(Task.GENOTYPE))
     WinnowrModel.load(WinnowrModel(booster, info).save(tmp_path / "m"))

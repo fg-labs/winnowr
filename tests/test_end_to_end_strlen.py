@@ -1,5 +1,6 @@
 """Extract -> train -> evaluate -> score an indel model with repeat-length features."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import pysam
@@ -14,8 +15,13 @@ from tests.util import gvcf_builder
 from tests.util import happy_builder
 from tests.util import vcf_builder
 from tests.util import write
+from winnowr.common import NEVER
+from winnowr.common import Task
 from winnowr.common import VariantType
 from winnowr.evaluation import PolicyMetric
+from winnowr.model import WinnowrModel
+from winnowr.rescore import Mode
+from winnowr.rescore import RepeatFlip
 from winnowr.scoring import ORIGINAL_GT_FORMAT
 from winnowr.scoring import REGENOTYPE_INFO
 from winnowr.strlen import STRLEN_COLUMNS
@@ -73,7 +79,9 @@ def _sample(tmp_path: Path, name: str, offset: int) -> dict[str, Path]:
     }
 
 
-def test_regenotype_model(tmp_path: Path, mocker: MockerFixture) -> None:
+def test_regenotype_model(
+    tmp_path: Path, mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
     tables, inputs = [], []
     for i, name in enumerate(["a", "b", "c"]):
         paths = _sample(tmp_path, name, offset=i)
@@ -91,11 +99,13 @@ def test_regenotype_model(tmp_path: Path, mocker: MockerFixture) -> None:
         inputs.append(paths)
     prefix = tmp_path / "indel"
     fit = mocker.spy(winnowr.tools.train, "fit_stutter_from_feature_tables")
+    caplog.set_level("INFO")
     train(
         tables=tables[:2],
         variant_type=VariantType.INDEL,
         output=prefix,
         regenotype=True,
+        repeat_flip=True,
         max_rounds=30,
         min_child_weight=0.5,
         validation_fraction=0.0,
@@ -105,6 +115,12 @@ def test_regenotype_model(tmp_path: Path, mocker: MockerFixture) -> None:
     # the final model's stutter model is fitted on both samples, each CV fold's on the other only
     fitted_on = [[info.sample for _, info in call.args[0]] for call in fit.call_args_list]
     assert fitted_on == [["a", "b"], ["b"], ["a"]]
+    # the calls are in short tracts, so no repeat-stratum flip threshold is chosen, but the sidecar
+    # records that --repeat-flip searched for one
+    trained = WinnowrModel.load(sidecar).info
+    assert trained.thresholds[Mode.GENOTYPER].repeat_flip is None
+    assert trained.repeat_flip_searched and trained.format_version == 3
+    assert "no repeat-stratum flip threshold kept" in caplog.text
 
     metrics_path = tmp_path / "c.tsv"
     evaluate(models=[sidecar], table=tables[2], output=metrics_path)
@@ -115,6 +131,23 @@ def test_regenotype_model(tmp_path: Path, mocker: MockerFixture) -> None:
     assert genotyper.regenotypes_broke_tp == 0 and genotyper.flips_fixed == n_multi
     assert genotyper.fp == 0
     assert metrics["genotyper_no_regenotype"].fp == n_multi
+
+    # the same model with flips off in every repeat tract
+    model = WinnowrModel.load(sidecar)
+    genotyper_thresholds = model.info.thresholds[Mode.GENOTYPER]
+    no_repeat_flips = replace(
+        genotyper_thresholds, repeat_flip=RepeatFlip(min_period=1, min_units=1, t_flip=NEVER)
+    )
+    thresholds = {**model.info.thresholds, Mode.GENOTYPER: no_repeat_flips}
+    stratified = replace(model, info=replace(model.info, thresholds=thresholds))
+    stratified_sidecar = stratified.save(tmp_path / "stratified")
+    caplog.set_level("INFO")
+    evaluate(models=[stratified_sidecar], table=tables[2], output=metrics_path)
+    metrics = {m.policy: m for m in PolicyMetric.read(metrics_path)}
+    assert metrics["genotyper"].flipped == 0 and metrics["genotyper"].t_flip_repeat == NEVER
+    assert metrics["genotyper"].repeat_min_period == 1
+    assert metrics["genotyper_no_repeat_flip"].flips_fixed == n_multi
+    assert "(repeat >= 1 bp x 1: t_flip=1.01)" in caplog.text
 
     out = tmp_path / "c.scored.vcf"
     paths = inputs[2]
@@ -133,3 +166,13 @@ def test_regenotype_model(tmp_path: Path, mocker: MockerFixture) -> None:
         score(vcf=paths["vcf"], gvcf=paths["gvcf"], models=[sidecar], output=out)
     with pytest.raises(ValueError, match="need --variant-type INDEL and --task GENOTYPE, got"):
         train(tables=tables[:2], variant_type=VariantType.SNP, output=prefix, repeat_length=True)
+    with pytest.raises(ValueError, match="--repeat-flip needs --variant-type INDEL"):
+        train(tables=tables[:2], variant_type=VariantType.SNP, output=prefix, repeat_flip=True)
+    with pytest.raises(ValueError, match="--repeat-flip needs .* got .* --task PROMOTE"):
+        train(
+            tables=tables[:2],
+            variant_type=VariantType.INDEL,
+            task=Task.PROMOTE,
+            output=prefix,
+            repeat_flip=True,
+        )

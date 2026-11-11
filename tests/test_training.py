@@ -43,6 +43,67 @@ def test_train_model_chooses_thresholds_that_help() -> None:
     assert genotyper.t_flip < NEVER and veto.t_flip == NEVER
 
 
+def _repeat_sample(name: str, seed: int) -> SampleCalls:
+    """Synthetic calls where most flips in long repeats (a random fifth) would break a TP."""
+    calls = without_regenotype(synthetic_calls(2000, seed))
+    rng = np.random.default_rng(seed + 100)
+    in_repeat = rng.random(len(calls)) < 0.2
+    calls["str_period"] = np.where(in_repeat, 2.0, np.nan)
+    calls["str_repeats"] = np.where(in_repeat, 12.0, np.nan)
+    broken = in_repeat & (calls["label"] == Label.FLIP).to_numpy() & (rng.random(len(calls)) < 0.8)
+    calls.loc[broken, "label"] = float(Label.KEEP)
+    calls.loc[broken, "flip_ok"] = False
+    return SampleCalls(sample=name, calls=calls, baseline=baseline_counts(calls["label"], fn=50))
+
+
+def test_train_model_chooses_a_repeat_flip_threshold(caplog: pytest.LogCaptureFixture) -> None:
+    samples = [_repeat_sample("a", 1), _repeat_sample("b", 2), _repeat_sample("c", 3)]
+    caplog.set_level("INFO")
+    model = train_model(
+        samples, VariantType.INDEL, ["x", "y"], [], ["chr1"], FAST, repeat_flip=True
+    )
+    genotyper = model.info.thresholds[Mode.GENOTYPER]
+    plain_model = train_model(samples, VariantType.INDEL, ["x", "y"], [], ["chr1"], FAST)
+    plain = plain_model.info.thresholds[Mode.GENOTYPER]
+    assert plain.repeat_flip is None and model.info.thresholds[Mode.VETO].repeat_flip is None
+    assert genotyper.repeat_flip is not None and genotyper.gain > plain.gain
+    assert (genotyper.t_drop, genotyper.t_flip) == (plain.t_drop, plain.t_flip)
+    assert genotyper.repeat_flip.t_flip > genotyper.t_flip
+    assert "(repeat period >= 2 bp, >= " in caplog.text and "(kept)" in caplog.text
+    assert model.info.repeat_flip_searched and not plain_model.info.repeat_flip_searched
+    # the stratum threshold comes from the given grid (plus NEVER)
+    grid = [0.3, 0.5, 0.95]
+    gridded = train_model(
+        samples, VariantType.INDEL, ["x", "y"], [], ["chr1"], FAST, grid=grid, repeat_flip=True
+    ).info.thresholds[Mode.GENOTYPER]
+    assert gridded.repeat_flip is not None and gridded.repeat_flip.t_flip in {*grid, NEVER}
+
+
+def test_train_model_repeat_flip_without_a_repeat_effect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # calls in repeats behave like the others: no stratum is kept
+    samples = [_sample(name, seed) for name, seed in (("a", 1), ("b", 2), ("c", 3))]
+    for seed, s in enumerate(samples):
+        in_repeat = np.random.default_rng(seed).random(len(s.calls)) < 0.3
+        s.calls["str_period"] = np.where(in_repeat, 2.0, np.nan)
+        s.calls["str_repeats"] = np.where(in_repeat, 12.0, np.nan)
+    caplog.set_level("INFO")
+    model = train_model(
+        samples, VariantType.INDEL, ["x", "y"], [], ["chr1"], FAST, repeat_flip=True
+    )
+    assert model.info.thresholds[Mode.GENOTYPER].repeat_flip is None
+    assert model.info.repeat_flip_searched
+    assert caplog.text.count("no repeat-stratum flip threshold kept") == 1
+    veto_line = next(line for line in caplog.text.splitlines() if "CV-chosen veto" in line)
+    assert "repeat" not in veto_line
+    # without any call in a repeat (no DRAGstrInfo) the search could not select anything
+    for s in samples:
+        s.calls["str_period"] = np.nan
+    with pytest.raises(ValueError, match="no training call has them"):
+        train_model(samples, VariantType.INDEL, ["x", "y"], [], ["chr1"], FAST, repeat_flip=True)
+
+
 def test_cross_validate_needs_two_distinct_samples() -> None:
     with pytest.raises(ValueError, match="at least two samples"):
         cross_validate([_sample("a", 1)], ["x"], FAST)

@@ -21,6 +21,8 @@ from winnowr.model import fit_booster
 from winnowr.model import num_classes
 from winnowr.model import predict_probabilities
 from winnowr.rescore import Mode
+from winnowr.rescore import RepeatFlip
+from winnowr.rescore import has_repeat_info
 from winnowr.samples import PromoteSampleCalls
 from winnowr.samples import SampleCalls
 from winnowr.stutter import StutterModel
@@ -28,6 +30,7 @@ from winnowr.thresholds import DEFAULT_GRID
 from winnowr.thresholds import DEFAULT_PROMOTE_FLIP_GRID
 from winnowr.thresholds import DEFAULT_PROMOTE_GRID
 from winnowr.thresholds import search_promote_thresholds
+from winnowr.thresholds import search_repeat_flip
 from winnowr.thresholds import search_thresholds
 
 logger = logging.getLogger(__name__)
@@ -195,6 +198,7 @@ def train_model(
     groups: Iterable[Iterable[str]] = (),
     refit: Callable[[frozenset[str]], Sequence[SampleCalls]] | None = None,
     reference_contigs: ContigLengths | None = None,
+    repeat_flip: bool = False,
 ) -> WinnowrModel:
     """
     Choose thresholds by leave-one-group-out CV, then fit the final model on all samples.
@@ -216,25 +220,42 @@ def train_model(
             model fitted on the fold's training samples only, so that held-out samples' features
             and labels do not depend on their own truth.
         reference_contigs: the lengths of `contigs` in the training samples' reference.
+        repeat_flip: also choose by CV a separate genotyper flip threshold for calls in long
+            tandem repeats (see `search_repeat_flip`).
 
     Returns:
         The trained model with CV-chosen thresholds for every mode.
+
+    Raises:
+        ValueError: with `repeat_flip`, if no training call has a repeat period and count (e.g. the
+            VCFs lack DRAGstrInfo), so no stratum could select any call.
     """
+    if repeat_flip and not any(
+        has_repeat_info(s.calls.get("str_period"), s.calls.get("str_repeats")) for s in samples
+    ):
+        raise ValueError(
+            "--repeat-flip needs calls with a DRAGstr repeat period and count (the str_period and "
+            "str_repeats columns, from the VCFs' DRAGstrInfo), but no training call has them"
+        )
     folds = cross_validate(
         samples, features, params, regenotype=regenotype, groups=groups, refit=refit
     )
     thresholds = {
         mode: search_thresholds(folds, mode, grid, regenotype=regenotype) for mode in Mode
     }
+    if repeat_flip:
+        thresholds[Mode.GENOTYPER] = search_repeat_flip(folds, thresholds[Mode.GENOTYPER], grid)
     for mode, chosen in thresholds.items():
         regenotype_text = (
             f" t_regenotype={chosen.t_regenotype:.10g}"
             if regenotype and mode is Mode.GENOTYPER
             else ""
         )
+        repeat_text = _repeat_flip_text(chosen.repeat_flip, repeat_flip and mode is Mode.GENOTYPER)
         logger.info(
             f"CV-chosen {mode.value}: t_drop={chosen.t_drop:.10g} t_flip={chosen.t_flip:.10g}"
-            f"{regenotype_text} (summed CV F1 gain {chosen.gain:+.5f})"
+            f"{regenotype_text}{repeat_text} "
+            f"(summed CV F1 gain {chosen.gain:+.5f})"
         )
     booster = _fit(samples, features, params, Task.GENOTYPE, regenotype)
     info = ModelInfo(
@@ -248,8 +269,19 @@ def train_model(
         stutter=stutter,
         regenotype=regenotype,
         reference_contigs=reference_contigs,
+        repeat_flip_searched=repeat_flip,
     )
     return WinnowrModel(booster=booster, info=info)
+
+
+def _repeat_flip_text(chosen: RepeatFlip | None, searched: bool) -> str:
+    """The log text of a CV-chosen repeat-stratum flip threshold."""
+    if chosen is not None:
+        return (
+            f" t_flip_repeat={chosen.t_flip:.10g} (repeat period >= {chosen.min_period} bp, "
+            f">= {chosen.min_units} units)"
+        )
+    return " (no repeat-stratum flip threshold kept)" if searched else ""
 
 
 def train_promote_model(
