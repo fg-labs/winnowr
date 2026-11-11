@@ -7,11 +7,20 @@ line and the files it reads and writes (see the README); the Python modules are 
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- winnowr failed at startup on Python 3.13 and 3.14 when installed without its development
-  dependencies (`No module named 'typing_extensions'`): fgpyo imports `typing_extensions` but
-  declares it only for Python 3.12 and earlier. winnowr now depends on it directly.
+- Experimental: `winnowr train --repeat-flip` (indel genotype models): cross-validation also chooses
+  a separate het<->hom flip threshold for calls in long tandem repeats, with the stratum (minimum
+  DRAGstr repeat period and repeat count) chosen with it. It is searched after the other thresholds,
+  which it does not change, and kept only when nested selection (chosen on the other folds, scored
+  on the held-out fold) also raises F1, so that it rarely picks up noise. The threshold can be
+  higher or lower than `t_flip`. Training fails if no call has DRAGstrInfo. `score` and `evaluate`
+  apply it, warning when no scored call has DRAGstrInfo, and `evaluate` adds a
+  `genotyper_no_repeat_flip` policy and the `repeat_min_period`, `repeat_min_units` and
+  `t_flip_repeat` columns (`--tuned` tunes the stratum too). Such models are written as sidecar
+  format version 3, which records the threshold and that the search ran; other models are still
+  written as format 2, and sidecars of versions 1 and 2 load and score as before. Without the flag,
+  training is unchanged.
 
 ### Changed
 
@@ -20,6 +29,14 @@ line and the files it reads and writes (see the README); the Python modules are 
   optional. A VCF without them still needs `--gvcf`, which works as before; when the VCF has them,
   `--gvcf` is not read (with a warning). Without either source, both commands fail with an error
   naming the missing annotations.
+
+### Fixed
+
+- winnowr failed at startup on Python 3.13 and 3.14 when installed without its development
+  dependencies (`No module named 'typing_extensions'`): fgpyo imports `typing_extensions` but
+  declares it only for Python 3.12 and earlier. winnowr now depends on it directly.
+- A sidecar with a missing or unexpected field now fails to load with an error naming the field,
+  not a bare `TypeError` or `KeyError`.
 
 ## [0.1.0] - Unreleased
 

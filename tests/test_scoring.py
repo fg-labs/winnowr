@@ -13,6 +13,7 @@ from tests.util import write
 from winnowr.common import NEVER
 from winnowr.common import Task
 from winnowr.common import VariantType
+from winnowr.labels import Label
 from winnowr.model import ModelInfo
 from winnowr.model import WinnowrModel
 from winnowr.model import fit_booster
@@ -20,6 +21,7 @@ from winnowr.model import num_classes
 from winnowr.regenotype import regenotype_target
 from winnowr.regenotype import regenotyped_alleles
 from winnowr.rescore import Mode
+from winnowr.rescore import RepeatFlip
 from winnowr.scoring import DROP_FILTER
 from winnowr.scoring import FLIP_INFO
 from winnowr.scoring import MAX_GQ
@@ -125,6 +127,48 @@ def _decision(
     **actions: bool,
 ) -> tuple[Key, Decision]:
     return ("chr1", pos, ref, alt, filter), Decision(task, p, regenotype=regenotype, **actions)
+
+
+def test_decide_calls_with_a_repeat_flip_threshold(caplog: pytest.LogCaptureFixture) -> None:
+    calls = synthetic_calls(500, seed=3)
+    booster = fit_booster(calls, calls["label"], ["x", "y"], FAST, num_classes(Task.GENOTYPE))
+    repeat_flip = RepeatFlip(min_period=2, min_units=11, t_flip=NEVER)
+    info = ModelInfo(
+        variant_type=VariantType.INDEL,
+        thresholds={
+            Mode.GENOTYPER: Thresholds(0.5, 0.5, 0.0, repeat_flip=repeat_flip),
+            Mode.VETO: Thresholds(0.3, NEVER, 0.0),
+        },
+        features=("x", "y"),
+        region_names=(),
+        training_samples=("a",),
+        contigs=("chr1",),
+    )
+    # every other call is in a long dinucleotide repeat, where flips are off
+    table = calls.assign(
+        chrom="chr1",
+        pos=range(len(calls)),
+        ref="AC",
+        alt="A",
+        variant_type="indel",
+        filter="PASS",
+        str_period=[2.0, np.nan] * 250,
+        str_repeats=[12.0, np.nan] * 250,
+    )
+    model = WinnowrModel(booster, info)
+    flips = np.array([d.flip for d in decide_calls(table, [model], Mode.GENOTYPER).values()])
+    p = model.predict(table)
+    expected = (p[:, Label.FLIP] >= 0.5) & (p[:, Label.DROP] < 0.5)
+    expected[::2] = False
+    np.testing.assert_array_equal(flips, expected)
+    assert expected[1::2].any()
+    # without repeat information the stratum selects nothing, with a warning
+    no_repeats = table.assign(str_period=np.nan, str_repeats=np.nan)
+    flips = np.array([d.flip for d in decide_calls(no_repeats, [model], Mode.GENOTYPER).values()])
+    np.testing.assert_array_equal(flips, (p[:, Label.FLIP] >= 0.5) & (p[:, Label.DROP] < 0.5))
+    assert "The indel genotype model has a long-tandem-repeat flip threshold, but no" in caplog.text
+    with pytest.raises(ValueError, match="needs the calls' str_period and str_repeats columns"):
+        decide_calls(table.drop(columns="str_repeats"), [model], Mode.GENOTYPER)
 
 
 @pytest.mark.parametrize("suffix", [".vcf", ".vcf.gz", ".bcf"])

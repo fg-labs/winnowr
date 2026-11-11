@@ -90,11 +90,101 @@ def baseline_counts(labels: npt.ArrayLike, fn: int) -> Counts:
     return Counts(tp=int(is_tp.sum()), fp=int((~is_tp).sum()), fn=fn)
 
 
+@dataclass(frozen=True)
+class RepeatFlip:
+    """
+    A separate flip threshold for calls in long tandem repeats.
+
+    A call is in the stratum when its DRAGstr repeat period (`str_period`, bp) is at least
+    `min_period` and its repeat count (`str_repeats`, units) at least `min_units`; calls without
+    DRAGstr information (e.g. most SNPs) never are. In the stratum `t_flip` replaces the model's
+    flip threshold, in both flip directions.
+
+    Attributes:
+        min_period: the minimum repeat period (bp).
+        min_units: the minimum repeat count (units).
+        t_flip: the flip threshold of calls in the stratum.
+    """
+
+    min_period: int
+    min_units: int
+    t_flip: float
+
+    def selects(self, period: npt.ArrayLike, units: npt.ArrayLike) -> BoolArray:
+        """
+        Which calls are in the stratum.
+
+        Args:
+            period: the repeat period of each call (NaN when unknown).
+            units: the repeat count of each call (NaN when unknown).
+
+        Returns:
+            Per call, whether it is in the stratum.
+        """
+        period_array = np.asarray(period, dtype=np.float64)
+        units_array = np.asarray(units, dtype=np.float64)
+        selected: BoolArray = (period_array >= self.min_period) & (units_array >= self.min_units)
+        return selected
+
+
+def flip_thresholds(
+    t_flip: float,
+    repeat_flip: RepeatFlip | None,
+    period: npt.ArrayLike | None,
+    units: npt.ArrayLike | None,
+) -> float | FloatArray:
+    """
+    The flip threshold of each call.
+
+    Args:
+        t_flip: the flip threshold outside the long-tandem-repeat stratum.
+        repeat_flip: the stratum's threshold, if any.
+        period: the repeat period of each call (needed with `repeat_flip`).
+        units: the repeat count of each call (needed with `repeat_flip`).
+
+    Returns:
+        `t_flip` without `repeat_flip`, otherwise one threshold per call.
+
+    Raises:
+        ValueError: if `repeat_flip` is given without the calls' repeat periods and counts.
+    """
+    if repeat_flip is None:
+        return t_flip
+    if period is None or units is None:
+        raise ValueError(
+            "A long-tandem-repeat flip threshold needs the calls' repeat period and count (the "
+            "str_period and str_repeats columns, from the VCF's DRAGstrInfo)"
+        )
+    thresholds: FloatArray = np.where(
+        repeat_flip.selects(period, units), repeat_flip.t_flip, t_flip
+    )
+    return thresholds
+
+
+def has_repeat_info(period: npt.ArrayLike | None, units: npt.ArrayLike | None) -> bool:
+    """
+    Whether any call has both a repeat period and a repeat count (a `RepeatFlip` can select it).
+
+    Args:
+        period: the repeat period of each call (NaN when unknown), or None if not known at all.
+        units: the repeat count of each call (NaN when unknown), or None if not known at all.
+
+    Returns:
+        False if either is None or no call has both, e.g. for VCFs without DRAGstrInfo.
+    """
+    if period is None or units is None:
+        return False
+    known = np.isfinite(np.asarray(period, dtype=np.float64)) & np.isfinite(
+        np.asarray(units, dtype=np.float64)
+    )
+    return bool(known.any())
+
+
 def decide(
     probabilities: FloatArray,
     flippable: npt.ArrayLike,
     t_drop: float,
-    t_flip: float,
+    t_flip: float | FloatArray,
     mode: Mode,
     t_regenotype: float,
     regenotypable: npt.ArrayLike,
@@ -111,7 +201,9 @@ def decide(
             re-genotype models.
         flippable: per call, whether the genotype is `0/1` or `1/1`.
         t_drop: the drop threshold.
-        t_flip: the flip threshold (ignored in veto mode).
+        t_flip: the flip threshold (ignored in veto mode): one for all calls, or one per call
+            (e.g. a separate threshold for calls in long tandem repeats, see `RepeatFlip` and
+            `flip_thresholds`).
         mode: the decision mode.
         t_regenotype: the re-genotype threshold (used only with 4 classes in genotyper mode).
         regenotypable: per call, whether the re-genotype action can change it (all false without

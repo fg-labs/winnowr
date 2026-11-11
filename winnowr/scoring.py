@@ -53,6 +53,8 @@ from winnowr.regenotype import without_regenotype
 from winnowr.rescore import Mode
 from winnowr.rescore import decide
 from winnowr.rescore import decide_promote
+from winnowr.rescore import flip_thresholds
+from winnowr.rescore import has_repeat_info
 from winnowr.stutter import add_length_call_features
 
 logger = logging.getLogger(__name__)
@@ -153,11 +155,26 @@ def _decide_model_calls(
         drop = no_action
     else:
         thresholds = model.info.thresholds[mode]
+        period, units = calls.get("str_period"), calls.get("str_repeats")
+        if thresholds.repeat_flip is not None:
+            described = f"The {model.info.variant_type} {model.info.task.value} model"
+            if period is None or units is None:
+                raise ValueError(
+                    f"{described} has a long-tandem-repeat flip threshold, which needs the calls' "
+                    "str_period and str_repeats columns; the feature table lacks them"
+                )
+            if not has_repeat_info(period, units):
+                logger.warning(
+                    f"{described} has a long-tandem-repeat flip threshold, but no call has a "
+                    "DRAGstr repeat period and count (DRAGstrInfo), so it applies t_flip to every "
+                    "call"
+                )
+        t_flip = flip_thresholds(thresholds.t_flip, thresholds.repeat_flip, period, units)
         drop, flip, regenotype = decide(
             probabilities,
             calls["flippable"],
             thresholds.t_drop,
-            thresholds.t_flip,
+            t_flip,
             mode,
             thresholds.t_regenotype,
             calls["regenotypable"],

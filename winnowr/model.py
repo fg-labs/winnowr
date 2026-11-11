@@ -45,8 +45,14 @@ logger = logging.getLogger(__name__)
 
 MODEL_SUFFIX: Final[str] = ".xgb.json"
 SIDECAR_SUFFIX: Final[str] = ".winnowr.json"
-SIDECAR_FORMAT_VERSION: Final[int] = 2
-"""The sidecar format (schema) version this winnowr writes; it reads every version up to it."""
+SIDECAR_FORMAT_VERSION: Final[int] = 3
+"""The newest sidecar format (schema) version; this winnowr reads every version up to it."""
+
+REPEAT_FLIP_FORMAT_VERSION: Final[int] = 3
+"""The first sidecar format that can record a long-tandem-repeat flip threshold (`--repeat-flip`).
+
+Models trained without `--repeat-flip` are written in format 2, so older winnowr still reads them.
+"""
 
 ContigLengths = dict[str, int | None]
 """Contig names and lengths (None when the length is unknown)."""
@@ -263,9 +269,13 @@ class ModelInfo:
         regenotype: whether the model has the re-genotype class (`Label.REGENOTYPE`).
         winnowr_version: the winnowr version that trained the model.
         xgboost_version: the XGBoost version that trained the model.
-        format_version: the sidecar format version.
+        format_version: the format version of the sidecar it was loaded from (None if it was not
+            loaded from one); not compared, as it describes the file and not the model. See
+            `sidecar_format_version` for the version `to_json` writes.
         reference_contigs: the lengths of `contigs` in the reference the training calls were
             called on (None for sidecars of format 1, or tables extracted without them).
+        repeat_flip_searched: whether training searched a long-tandem-repeat flip threshold
+            (`train --repeat-flip`), whether or not it kept one; `evaluate --tuned` then tunes one.
     """
 
     variant_type: VariantType
@@ -281,8 +291,21 @@ class ModelInfo:
     regenotype: bool = False
     winnowr_version: str = __version__
     xgboost_version: str = xgb.__version__
-    format_version: int = SIDECAR_FORMAT_VERSION
+    format_version: int | None = field(default=None, compare=False)
     reference_contigs: ContigLengths | None = None
+    repeat_flip_searched: bool = False
+
+    @property
+    def uses_repeat_flip(self) -> bool:
+        """Whether training searched for, or the thresholds have, a long-repeat flip threshold."""
+        return self.repeat_flip_searched or any(
+            t.repeat_flip is not None for t in self.thresholds.values()
+        )
+
+    @property
+    def sidecar_format_version(self) -> int:
+        """The sidecar format `to_json` writes: the oldest that can record this model."""
+        return REPEAT_FLIP_FORMAT_VERSION if self.uses_repeat_flip else 2
 
     def __post_init__(self) -> None:
         """
@@ -313,10 +336,16 @@ class ModelInfo:
             The sidecar JSON text.
         """
         raw = asdict(self)
+        raw["format_version"] = self.sidecar_format_version
         raw["variant_type"] = self.variant_type.value
         raw["task"] = self.task.value
         raw["thresholds"] = {mode.value: asdict(t) for mode, t in self.thresholds.items()}
         raw["stutter"] = None if self.stutter is None else self.stutter.to_dict()
+        if not self.uses_repeat_flip:
+            # format 2 has no long-repeat fields, and older winnowr rejects unknown keys
+            del raw["repeat_flip_searched"]
+            for thresholds in raw["thresholds"].values():
+                del thresholds["repeat_flip"]
         return json.dumps(raw, indent=2)
 
     @classmethod
@@ -332,7 +361,8 @@ class ModelInfo:
 
         Raises:
             ValueError: if the sidecar format version is not supported (e.g. it was written by a
-                newer winnowr) or the thresholds do not match the task.
+                newer winnowr), a field is missing or unexpected, or the thresholds do not match
+                the task.
         """
         raw = json.loads(text)
         version = raw.get("format_version")
@@ -342,29 +372,36 @@ class ModelInfo:
                 f"{raw.get('winnowr_version', 'unknown')}); winnowr {__version__} reads versions "
                 f"1 to {SIDECAR_FORMAT_VERSION}"
             )
-        return cls(
-            variant_type=VariantType(raw["variant_type"]),
-            features=tuple(raw["features"]),
-            region_names=tuple(raw["region_names"]),
-            thresholds={Mode(m): Thresholds(**t) for m, t in raw["thresholds"].items()},
-            training_samples=tuple(raw["training_samples"]),
-            contigs=tuple(raw["contigs"]),
-            task=Task(raw["task"]),
-            promote_thresholds=(
-                None
-                if raw["promote_thresholds"] is None
-                else PromoteThresholds(**raw["promote_thresholds"])
-            ),
-            params=TrainingParams(**raw["params"]),
-            stutter=(
-                None if raw.get("stutter") is None else StutterModel.from_dict(raw["stutter"])
-            ),
-            regenotype=raw.get("regenotype", False),
-            winnowr_version=raw["winnowr_version"],
-            xgboost_version=raw["xgboost_version"],
-            format_version=version,
-            reference_contigs=raw.get("reference_contigs"),
-        )
+        try:
+            info = cls(
+                variant_type=VariantType(raw["variant_type"]),
+                features=tuple(raw["features"]),
+                region_names=tuple(raw["region_names"]),
+                thresholds={Mode(m): Thresholds.from_dict(t) for m, t in raw["thresholds"].items()},
+                training_samples=tuple(raw["training_samples"]),
+                contigs=tuple(raw["contigs"]),
+                task=Task(raw["task"]),
+                promote_thresholds=(
+                    None
+                    if raw["promote_thresholds"] is None
+                    else PromoteThresholds(**raw["promote_thresholds"])
+                ),
+                params=TrainingParams(**raw["params"]),
+                stutter=(
+                    None if raw.get("stutter") is None else StutterModel.from_dict(raw["stutter"])
+                ),
+                regenotype=raw.get("regenotype", False),
+                winnowr_version=raw["winnowr_version"],
+                xgboost_version=raw["xgboost_version"],
+                format_version=version,
+                reference_contigs=raw.get("reference_contigs"),
+                repeat_flip_searched=raw.get("repeat_flip_searched", False),
+            )
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"Malformed sidecar (format version {version}): {type(error).__name__}: {error}"
+            ) from error
+        return info
 
 
 @dataclass(frozen=True)

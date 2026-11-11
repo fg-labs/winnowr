@@ -21,6 +21,11 @@ from winnowr.thresholds import FoldPredictions
 from winnowr.thresholds import PromoteFold
 
 
+def _column(calls: pd.DataFrame, name: str) -> FloatArray | None:
+    """A numeric column of the calls as floats, or None if the calls lack it."""
+    return calls[name].to_numpy(dtype=np.float64) if name in calls.columns else None
+
+
 @dataclass(frozen=True)
 class SampleCalls:
     """
@@ -107,6 +112,8 @@ class SampleCalls:
             regenotypable=self.calls["regenotypable"].to_numpy(dtype=np.bool_),
             regenotypes_to_ref=self.calls["regenotypes_to_ref"].to_numpy(dtype=np.bool_),
             regenotype_ok=self.calls["regenotype_ok"].to_numpy(dtype=np.bool_),
+            str_period=_column(self.calls, "str_period"),
+            str_repeats=_column(self.calls, "str_repeats"),
         )
 
 

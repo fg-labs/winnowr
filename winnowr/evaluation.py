@@ -1,5 +1,6 @@
 """F1 reports for a model's decisions on a labelled sample."""
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import replace
@@ -13,6 +14,7 @@ from winnowr.labels import Label
 from winnowr.rescore import Counts
 from winnowr.rescore import Mode
 from winnowr.rescore import decide_promote
+from winnowr.rescore import has_repeat_info
 from winnowr.rescore import rescore_promote
 from winnowr.samples import PromoteSampleCalls
 from winnowr.samples import SampleCalls
@@ -20,7 +22,10 @@ from winnowr.thresholds import FoldPredictions
 from winnowr.thresholds import PromoteThresholds
 from winnowr.thresholds import Thresholds
 from winnowr.thresholds import search_promote_thresholds
+from winnowr.thresholds import search_repeat_flip
 from winnowr.thresholds import search_thresholds
+
+logger = logging.getLogger(__name__)
 
 _NO_ACTION = Thresholds(t_drop=NEVER, t_flip=NEVER, gain=0.0)
 """Thresholds that take no action."""
@@ -35,8 +40,9 @@ class PolicyMetric(Metric["PolicyMetric"]):
         sample: the sample name.
         variant_type: the variant type.
         policy: the policy name (`baseline`, `veto`, `genotyper`, `genotyper_no_regenotype`,
-            `flip_only`, `promote`, `promote_no_flip`, `genotyper+promote`, or `*_tuned` for
-            thresholds tuned on this sample, which are optimistic).
+            `genotyper_no_repeat_flip`, `flip_only`, `promote`, `promote_no_flip`,
+            `genotyper+promote`, or `*_tuned` for thresholds tuned on this sample, which are
+            optimistic).
         mode: the decision mode of the PASS-call policy.
         t_drop: the drop threshold of the PASS-call policy.
         t_flip: the flip threshold of the PASS-call policy.
@@ -60,6 +66,13 @@ class PolicyMetric(Metric["PolicyMetric"]):
             dropped).
         regenotypes_fixed: re-genotyped PASS calls that got the truth genotype.
         regenotypes_broke_tp: re-genotyped true-positive PASS calls.
+        repeat_min_period: the minimum repeat period of the long-tandem-repeat flip stratum (0
+            without one).
+        repeat_min_units: the minimum repeat count of the long-tandem-repeat flip stratum (0
+            without one).
+        t_flip_repeat: the flip threshold of the long-tandem-repeat stratum (`NEVER` without
+            one, when `t_flip` applies to every call; a stratum can also have `NEVER`, so
+            `repeat_min_period` = 0 is what marks "no stratum").
     """
 
     sample: str
@@ -87,6 +100,9 @@ class PolicyMetric(Metric["PolicyMetric"]):
     regenotyped: int = 0
     regenotypes_fixed: int = 0
     regenotypes_broke_tp: int = 0
+    repeat_min_period: int = 0
+    repeat_min_units: int = 0
+    t_flip_repeat: float = NEVER
 
 
 def evaluate_policy(
@@ -111,10 +127,9 @@ def evaluate_policy(
     Returns:
         The policy outcome.
     """
+    repeat_flip = thresholds.repeat_flip
     fold = calls.to_fold(probabilities)
-    drop, flip, regenotype = fold.decide(
-        thresholds.t_drop, thresholds.t_flip, mode, thresholds.t_regenotype
-    )
+    drop, flip, regenotype = fold.decide_thresholds(thresholds, mode)
     counts = fold.rescore(drop, flip, regenotype)
     is_tp = fold.labels == Label.KEEP
     return PolicyMetric(
@@ -138,6 +153,9 @@ def evaluate_policy(
         regenotyped=int(regenotype.sum()),
         regenotypes_fixed=int((regenotype & ~is_tp & fold.regenotype_ok).sum()),
         regenotypes_broke_tp=int((regenotype & is_tp).sum()),
+        repeat_min_period=0 if repeat_flip is None else repeat_flip.min_period,
+        repeat_min_units=0 if repeat_flip is None else repeat_flip.min_units,
+        t_flip_repeat=NEVER if repeat_flip is None else repeat_flip.t_flip,
     )
 
 
@@ -164,12 +182,17 @@ def evaluate_model(
     variant_type: str,
     thresholds: dict[Mode, Thresholds],
     tuned: bool = False,
+    tune_repeat_flip: bool = False,
 ) -> list[PolicyMetric]:
     """
     Report baseline, each mode at the given thresholds, flips alone, and optionally tuned.
 
     For a re-genotype model (4 class probabilities) also reports `genotyper_no_regenotype`: the
-    genotyper thresholds with the re-genotype action off.
+    genotyper thresholds with the re-genotype action off. When the genotyper has a
+    long-tandem-repeat flip threshold, also reports `genotyper_no_repeat_flip`: the genotyper
+    thresholds with `t_flip` for every call. If it has one, or `tune_repeat_flip` is set (the
+    model was trained with `--repeat-flip`, whether or not it kept a stratum), `genotyper_tuned`
+    also tunes the stratum and its threshold, after the other thresholds as in training.
 
     Args:
         calls: the sample's labelled calls.
@@ -177,10 +200,20 @@ def evaluate_model(
         variant_type: the variant type (for the report).
         thresholds: the thresholds per mode.
         tuned: also report thresholds tuned on this sample (optimistic: they see the test data).
+        tune_repeat_flip: with `tuned`, also tune a long-tandem-repeat flip threshold, even if the
+            genotyper has none.
 
     Returns:
         One metric per policy.
     """
+    repeat_info = has_repeat_info(calls.calls.get("str_period"), calls.calls.get("str_repeats"))
+    has_stratum = thresholds[Mode.GENOTYPER].repeat_flip is not None
+    tune_stratum = tuned and (tune_repeat_flip or has_stratum)
+    if (tune_stratum or has_stratum) and not repeat_info:
+        logger.warning(
+            f"{calls.sample}: no call has a DRAGstr repeat period and count (DRAGstrInfo), so the "
+            "long-tandem-repeat flip threshold selects no call"
+        )
     metrics = [baseline_metric(calls, variant_type)]
     for mode in (Mode.VETO, Mode.GENOTYPER):
         metrics.append(
@@ -199,6 +232,17 @@ def evaluate_model(
                 replace(genotyper, t_regenotype=NEVER),
             )
         )
+    if genotyper.repeat_flip is not None:
+        metrics.append(
+            evaluate_policy(
+                calls,
+                probabilities,
+                variant_type,
+                "genotyper_no_repeat_flip",
+                Mode.GENOTYPER,
+                replace(genotyper, repeat_flip=None),
+            )
+        )
     metrics.append(
         evaluate_policy(
             calls,
@@ -206,13 +250,17 @@ def evaluate_model(
             variant_type,
             "flip_only",
             Mode.GENOTYPER,
-            replace(_NO_ACTION, t_flip=genotyper.t_flip),
+            replace(_NO_ACTION, t_flip=genotyper.t_flip, repeat_flip=genotyper.repeat_flip),
         )
     )
     if tuned:
         fold: FoldPredictions = calls.to_fold(probabilities)
         for mode in (Mode.VETO, Mode.GENOTYPER):
             best = search_thresholds([fold], mode, regenotype=regenotype)
+            if mode is Mode.GENOTYPER and tune_stratum and repeat_info:
+                # tune the stratum too (after the other thresholds, as in training); on one sample
+                # there is no nested check, which is fine for an optimistic bound
+                best = search_repeat_flip([fold], best, nested=False)
             metrics.append(
                 evaluate_policy(
                     calls, probabilities, variant_type, f"{mode.value}_tuned", mode, best

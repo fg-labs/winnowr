@@ -11,6 +11,7 @@ from winnowr.promote_labels import PromoteLabel
 from winnowr.regenotype import without_regenotype
 from winnowr.rescore import Counts
 from winnowr.rescore import Mode
+from winnowr.rescore import RepeatFlip
 from winnowr.samples import PromoteSampleCalls
 from winnowr.samples import SampleCalls
 from winnowr.thresholds import PromoteThresholds
@@ -75,6 +76,93 @@ def test_pass_call_policies() -> None:
     flip_only = metrics["flip_only"]
     assert (flip_only.t_drop, flip_only.dropped, flip_only.flipped) == (NEVER, 0, 2)
     assert (flip_only.tp, flip_only.fp, flip_only.fn) == (3, 2, 5)
+
+
+def test_repeat_flip_policies() -> None:
+    calls, probabilities = _calls()
+    # the flipped TP (P(flip) 0.6) is in a long repeat, where the threshold is 0.7
+    repeats = calls.calls.assign(
+        str_period=[np.nan, np.nan, np.nan, 2.0, np.nan],
+        str_repeats=[np.nan, np.nan, np.nan, 12.0, np.nan],
+    )
+    calls = SampleCalls(sample="s", calls=repeats, baseline=BASELINE)
+    repeat_flip = RepeatFlip(min_period=2, min_units=11, t_flip=0.7)
+    thresholds = {
+        Mode.GENOTYPER: Thresholds(0.5, 0.5, 0.0, repeat_flip=repeat_flip),
+        Mode.VETO: Thresholds(0.5, NEVER, 0.0),
+    }
+    metrics = {m.policy: m for m in evaluate_model(calls, probabilities, "indel", thresholds)}
+    genotyper = metrics["genotyper"]
+    assert (genotyper.flipped, genotyper.flips_fixed, genotyper.flips_broke_tp) == (1, 1, 0)
+    assert (genotyper.repeat_min_period, genotyper.repeat_min_units) == (2, 11)
+    assert genotyper.t_flip_repeat == 0.7
+    unstratified = metrics["genotyper_no_repeat_flip"]
+    assert (unstratified.flipped, unstratified.flips_broke_tp) == (2, 1)
+    assert unstratified.t_flip_repeat == NEVER and unstratified.repeat_min_period == 0
+    assert genotyper.f1 > unstratified.f1
+    assert metrics["flip_only"].flipped == 1
+    # without a stratum threshold there is no genotyper_no_repeat_flip policy
+    assert "genotyper_no_repeat_flip" not in _metrics()
+
+
+def test_tuned_genotyper_tunes_the_repeat_flip_threshold() -> None:
+    # two fixed flips outside repeats at P(flip) 0.6, and in a long repeat a TP at 0.8 and a fixed
+    # flip at 0.95: only a separate threshold in the repeat gets all of the fixes and no TP
+    labels = [Label.FLIP, Label.FLIP, Label.KEEP, Label.FLIP, Label.KEEP]
+    frame = pd.DataFrame({
+        "label": np.array(labels, dtype=np.float64),
+        "flip_ok": [True, True, False, True, False],
+        "flippable": True,
+        "str_period": [np.nan, np.nan, 2.0, 2.0, np.nan],
+        "str_repeats": [np.nan, np.nan, 12.0, 12.0, np.nan],
+    })
+    calls = SampleCalls(sample="s", calls=without_regenotype(frame), baseline=BASELINE)
+    probabilities = np.array([
+        [0, 0.4, 0.6],
+        [0, 0.4, 0.6],
+        [0, 0.2, 0.8],
+        [0, 0.05, 0.95],
+        [0, 1, 0],
+    ])
+    thresholds = {
+        Mode.GENOTYPER: Thresholds(NEVER, 0.6, 0.0, repeat_flip=RepeatFlip(2, 11, 0.9)),
+        Mode.VETO: Thresholds(NEVER, NEVER, 0.0),
+    }
+    metrics = {
+        m.policy: m for m in evaluate_model(calls, probabilities, "indel", thresholds, tuned=True)
+    }
+    genotyper, tuned = metrics["genotyper"], metrics["genotyper_tuned"]
+    assert (genotyper.flipped, genotyper.flips_broke_tp) == (3, 0)
+    assert tuned.f1 == genotyper.f1 > metrics["genotyper_no_repeat_flip"].f1
+    assert tuned.flips_broke_tp == 0
+    assert tuned.repeat_min_period > 0 and 0.8 < tuned.t_flip_repeat <= 0.95
+    # a --repeat-flip model whose search kept no stratum still gets one tuned, if asked
+    plain = {**thresholds, Mode.GENOTYPER: Thresholds(NEVER, 0.6, 0.0)}
+    for tune_repeat_flip, stratum in ((False, False), (True, True)):
+        metrics = {
+            m.policy: m
+            for m in evaluate_model(
+                calls, probabilities, "indel", plain, tuned=True, tune_repeat_flip=tune_repeat_flip
+            )
+        }
+        assert (metrics["genotyper_tuned"].repeat_min_period > 0) is stratum
+        assert "genotyper_no_repeat_flip" not in metrics
+
+
+def test_repeat_flip_without_repeat_info_warns(caplog: pytest.LogCaptureFixture) -> None:
+    calls, probabilities = _calls()
+    no_repeats = calls.calls.assign(str_period=np.nan, str_repeats=np.nan)
+    calls = SampleCalls(sample="s", calls=no_repeats, baseline=BASELINE)
+    thresholds = {
+        Mode.GENOTYPER: Thresholds(0.5, 0.5, 0.0, repeat_flip=RepeatFlip(2, 11, NEVER)),
+        Mode.VETO: Thresholds(0.5, NEVER, 0.0),
+    }
+    metrics = {
+        m.policy: m for m in evaluate_model(calls, probabilities, "indel", thresholds, tuned=True)
+    }
+    assert "no call has a DRAGstr repeat period and count" in caplog.text
+    assert metrics["genotyper"].f1 == metrics["genotyper_no_repeat_flip"].f1
+    assert metrics["genotyper_tuned"].repeat_min_period == 0
 
 
 def test_promote_policies_report_promote_flips_separately() -> None:
