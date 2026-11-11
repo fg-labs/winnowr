@@ -7,6 +7,12 @@ line and the files it reads and writes (see the README); the Python modules are 
 
 ## [Unreleased]
 
+### Fixed
+
+- winnowr failed at startup on Python 3.13 and 3.14 when installed without its development
+  dependencies (`No module named 'typing_extensions'`): fgpyo imports `typing_extensions` but
+  declares it only for Python 3.12 and earlier. winnowr now depends on it directly.
+
 ### Changed
 
 - `winnowr extract` and `winnowr score` read the raw annotations (`RAW_MQandDP`, `QUALapprox`,

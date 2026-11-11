@@ -1213,6 +1213,7 @@ dependencies = [
     { name = "pandas" },
     { name = "pyarrow" },
     { name = "pysam" },
+    { name = "typing-extensions" },
     { name = "xgboost" },
 ]
 
@@ -1239,6 +1240,7 @@ requires-dist = [
     { name = "pandas", specifier = "~=3.1" },
     { name = "pyarrow", specifier = "~=26.0" },
     { name = "pysam", specifier = "~=0.24" },
+    { name = "typing-extensions", specifier = "~=4.12" },
     { name = "xgboost", specifier = "~=3.4" },
 ]
 

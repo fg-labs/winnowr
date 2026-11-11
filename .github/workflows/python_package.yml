@@ -30,6 +30,11 @@ jobs:
           enable-cache: 'true'
           cache-suffix: ${{ matrix.PYTHON_VERSION }}
 
+      - name: Run the tool without the development dependencies
+        run: |
+          uv sync --locked --no-dev
+          uv run --locked --no-dev winnowr --version
+
       - name: Test the library
         run: |
           uv run --locked poe check-all
