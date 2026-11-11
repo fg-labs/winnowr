@@ -12,7 +12,7 @@ license-files   = ["LICENSE"]
 authors         = [{ name="Fulcrum Genomics LLC", email="contact@fulcrumgenomics.com" }]
 requires-python = ">=3.12"
 dependencies    = [
-    "defopt~=6.4",
+    "defopt>=6.4,<8.0",
     "fgpyo~=1.5",
     "numpy~=2.5",
     "pandas~=3.1",
