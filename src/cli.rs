@@ -33,7 +33,7 @@ use crate::repeat_features::STRLEN_FEATURES;
 use crate::rescore::{Mode, Rule};
 use crate::samples::{PromoteSampleCalls, SampleCalls};
 use crate::scoring::write_scored_vcf;
-use crate::strlen::{StrlenOptions, measure_regions_with, write_strlen_table};
+use crate::strlen::{StrlenOptions, measure_regions, write_strlen_table};
 use crate::stutter::{
     LENGTH_CALL_FEATURES, StutterFit, StutterModel, fit_stutter_from_feature_tables,
 };
@@ -864,32 +864,6 @@ pub(crate) struct StrlenArgs {
     /// in the table; a model scores only tables measured as its training tables were.
     #[arg(long, default_value_t = StrlenOptions::default())]
     pub(crate) reads: StrlenOptions,
-
-    /// Experimental: more tables to write from the same pass over the reads, as SETTINGS=PATH
-    /// (SETTINGS as for --reads).
-    #[arg(long, num_args = 1.., value_name = "SETTINGS=PATH", hide = true)]
-    pub(crate) also: Vec<AlsoOutput>,
-}
-
-/// One more `winnowr strlen` table, given as `SETTINGS=PATH` (see `--also`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AlsoOutput {
-    /// The read settings to measure the table with.
-    reads: StrlenOptions,
-    /// The table to write.
-    path: PathBuf,
-}
-
-impl std::str::FromStr for AlsoOutput {
-    type Err = anyhow::Error;
-
-    /// Parses `SETTINGS=PATH`, splitting at the first `=`.
-    fn from_str(spec: &str) -> Result<Self> {
-        let Ok(NamedPath { name, path }) = spec.parse::<NamedPath>() else {
-            bail!("expected SETTINGS=PATH, got {spec:?}");
-        };
-        Ok(AlsoOutput { reads: name.parse()?, path })
-    }
 }
 
 /// The options of `winnowr pileup`.
@@ -974,23 +948,11 @@ fn strlen(args: &StrlenArgs) -> Result<()> {
     let started = std::time::Instant::now();
     let inputs =
         ReadInputs { vcf: &args.vcf, alignments: &args.alignments, reference: &args.reference };
-    let mut outputs: Vec<(StrlenOptions, PathBuf)> = vec![(args.reads, args.output.clone())];
-    outputs.extend(args.also.iter().map(|also| (also.reads, also.path.clone())));
     check_output_dir("--output", &args.output)?;
-    for (_, path) in &outputs[1..] {
-        check_output_dir("--also", path)?;
-    }
-    // Each table is written in turn, so a repeated path would keep only the last.
-    if let Some(path) = repeated(outputs.iter().map(|(_, path)| path)).first() {
-        bail!("{} is given as more than one strlen output", path.display());
-    }
-    let options: Vec<StrlenOptions> = outputs.iter().map(|(options, _)| *options).collect();
-    let per_option = measure_regions_with(&inputs, &args.regions, &options)?;
-    let n_sites = per_option.first().map_or(0, Vec::len);
-    for ((options, path), sites) in outputs.iter().zip(&per_option) {
-        let n = write_strlen_table(path, sites, *options)?;
-        info!("Wrote {n} sites measured with {options} to {}", path.display());
-    }
+    let sites = measure_regions(&inputs, &args.regions, &args.reads)?;
+    let n_sites = sites.len();
+    let n = write_strlen_table(&args.output, &sites, args.reads)?;
+    info!("Wrote {n} sites measured with {} to {}", args.reads, args.output.display());
     let seconds = started.elapsed().as_secs_f64();
     info!(
         "Measured {n_sites} sites in {seconds:.1} s ({:.2} ms/site)",
@@ -2398,6 +2360,76 @@ mod tests {
             let expected: PileupOptions = "mapq20,bq9,flank5".parse().unwrap();
             assert_eq!(model.info.pileup_settings, Some(expected));
         }
+
+        /// `winnowr strlen` measures with the read settings of --reads and records them.
+        #[test]
+        fn strlen_measures_with_its_read_settings() {
+            use crate::strlen::{StrlenTables, measure_regions, sites_to_rows};
+            use crate::testing::TestRead;
+            let dir = tempfile::TempDir::new().unwrap();
+            // A 10-base A tract at 80 between non-repeating flanks, and a deletion of one A.
+            let left = "CGTC".repeat(20);
+            let reference = format!("{left}{}{}", "A".repeat(10), "GCTG".repeat(20));
+            let fasta = crate::testing::write_fasta(dir.path(), &[("chr1", &reference)]);
+            let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
+            let record = format!("chr1\t{}\t.\tCA\tC\t50\tPASS\t.\tGT\t0/1", left.len());
+            let vcf =
+                crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[&record]);
+            // Two low-MAPQ reads and the two mates of a pair: the settings measure all of them
+            // but count the pair once, so the table differs from one of the defaults.
+            let read = |name, pos, mapq| TestRead {
+                name,
+                pos,
+                cigar: "70M",
+                flag: 0,
+                mapq,
+                qual: 30,
+                bases: None,
+            };
+            let reads = [
+                read("pair", 45, 60),
+                read("ref", 50, 60),
+                read("low1", 50, 5),
+                read("low2", 50, 5),
+                read("pair", 55, 60),
+            ];
+            let bam =
+                crate::testing::write_bam(dir.path(), "reads.bam", reference.len() as u64, &reads);
+            let table = dir.path().join("strlen.tsv.gz");
+            let (vcf, bam, fasta) =
+                (vcf.display().to_string(), bam.display().to_string(), fasta.display().to_string());
+            run(&[
+                "strlen",
+                "--vcf",
+                &vcf,
+                "--alignments",
+                &bam,
+                "--reference",
+                &fasta,
+                "--regions",
+                "chr1",
+                "--reads",
+                "mapq0,mates",
+                "-o",
+                &table.display().to_string(),
+            ]);
+            let options: StrlenOptions = "mapq0,mates".parse().unwrap();
+            let inputs = ReadInputs {
+                vcf: Path::new(&vcf),
+                alignments: Path::new(&bam),
+                reference: Path::new(&fasta),
+            };
+            let measured =
+                |options| sites_to_rows(&measure_regions(&inputs, &["chr1"], options).unwrap());
+            let rows = measured(&options);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].n_spanning, 4);
+            assert_ne!(rows, measured(&StrlenOptions::default()));
+            assert_eq!(
+                read_tables::<StrlenOptions>(&[&table]).unwrap(),
+                StrlenTables { options, rows }
+            );
+        }
     }
 
     #[test]
@@ -2944,20 +2976,10 @@ mod tests {
     }
 
     #[test]
-    fn strlen_rejects_a_repeated_output_before_measuring() {
+    fn strlen_rejects_the_removed_also_option() {
         let args = ["strlen", "--vcf", "v", "--alignments", "a", "--reference", "r", "-o", "a.tsv"];
-        for also in [&["--also", "legacy=a.tsv"][..], &["--also", "legacy=b.tsv", "mapq0=b.tsv"]] {
-            let cli = parse(&[&args[..], also].concat()).unwrap();
-            let Command::Strlen(args) = cli.command else { panic!("not strlen") };
-            let message = strlen(&args).unwrap_err().to_string();
-            let path = also.last().unwrap().split_once('=').unwrap().1;
-            assert_eq!(message, format!("{path} is given as more than one strlen output"));
-        }
-        // A malformed --also fails as the command line is parsed.
-        for bad in ["mapq0", "=b.tsv", "nonsense=b.tsv"] {
-            let error = parse(&[&args[..], &["--also", bad]].concat()).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{bad}");
-        }
+        let error = parse(&[&args[..], &["--also", "legacy=b.tsv"]].concat()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]

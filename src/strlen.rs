@@ -522,7 +522,7 @@ impl TractAccumulator {
 
     /// Counts the next overlapping read (not one with [`crate::read_pass::SKIP_FLAGS`]),
     /// measuring it if it spans the tract. `cigar` caches the read's decoded CIGAR across the
-    /// tracts and options it is added to: it is decoded here the first time it is needed.
+    /// tracts it is added to: it is decoded here the first time it is needed.
     fn add(
         &mut self,
         record: &rust_htslib::bam::Record,
@@ -591,11 +591,10 @@ impl TractAccumulator {
     }
 }
 
-/// Measures tracts on one contig as `measure_tract_with` does for each of `options`, with the
-/// same results, but reads each read once per cluster of nearby tracts rather than once per tract
-/// and option (see [`sweep_clusters`]): each read is counted for every tract (and option) whose
-/// fetch would have returned it (it overlaps the tract's fetch span), in the same order. Returns
-/// the evidence per option, then per tract.
+/// Measures tracts on one contig with `options`, returning the evidence per tract. A tract gets
+/// the reads a fetch of its own span (the tract and its flanks) would return, in the same order,
+/// up to [`MAX_READS`] measured, but each read is read once per cluster of nearby tracts rather
+/// than once per tract (see [`sweep_clusters`]).
 ///
 /// # Errors
 ///
@@ -604,62 +603,34 @@ pub fn measure_tracts(
     reads: &mut rust_htslib::bam::IndexedReader,
     tid: u32,
     tracts: &[RepeatTract],
-    options: &[StrlenOptions],
-) -> Result<Vec<Vec<TractEvidence>>> {
-    // Per option, then tract: the fetch spans and accumulators.
-    let spans: Vec<Vec<(i64, i64)>> = options
-        .iter()
-        .map(|o| tracts.iter().map(|tract| tract_window(tract, o.flank_of(tract)).1).collect())
-        .collect();
-    let accumulators: Vec<Vec<TractAccumulator>> = options
-        .iter()
-        .map(|o| tracts.iter().map(|tract| TractAccumulator::new(tract, o)).collect())
-        .collect();
-    // The union of each tract's spans over the options.
-    let union: Vec<(i64, i64)> = (0..tracts.len())
-        .map(|i| {
-            let beg = spans.iter().map(|s| s[i].0).min().unwrap_or(0);
-            let end = spans.iter().map(|s| s[i].1).max().unwrap_or(0);
-            (beg, end)
-        })
-        .collect();
-    let mut measuring = Measuring { spans: &spans, accumulators };
-    sweep_clusters(reads, tid, &union, &mut measuring)?;
-    Ok(measuring
-        .accumulators
-        .into_iter()
-        .map(|per_tract| per_tract.into_iter().map(TractAccumulator::finish).collect())
-        .collect())
+    options: &StrlenOptions,
+) -> Result<Vec<TractEvidence>> {
+    let spans: Vec<(i64, i64)> =
+        tracts.iter().map(|tract| tract_window(tract, options.flank_of(tract)).1).collect();
+    let accumulators = tracts.iter().map(|tract| TractAccumulator::new(tract, options)).collect();
+    let mut measuring = Measuring { accumulators };
+    sweep_clusters(reads, tid, &spans, &mut measuring)?;
+    Ok(measuring.accumulators.into_iter().map(TractAccumulator::finish).collect())
 }
 
-/// The tracts [`measure_tracts`] measures: per option, then tract, the fetch spans and the
-/// evidence so far.
-struct Measuring<'a> {
-    spans: &'a [Vec<(i64, i64)>],
-    accumulators: Vec<Vec<TractAccumulator>>,
+/// The tracts [`measure_tracts`] measures: per tract, the evidence so far.
+struct Measuring {
+    accumulators: Vec<TractAccumulator>,
 }
 
-impl SweepSites for Measuring<'_> {
-    /// A tract is full once it is full for every option.
+impl SweepSites for Measuring {
     fn is_full(&self, i: usize) -> bool {
-        self.accumulators.iter().all(|per_tract| per_tract[i].is_full())
+        self.accumulators[i].is_full()
     }
 
-    /// Adds the read for each option whose fetch span of the tract it overlaps.
+    /// Adds the read, which overlaps the tract's fetch span.
     fn add(
         &mut self,
         i: usize,
         record: &rust_htslib::bam::Record,
-        start: i64,
-        end: i64,
         cigar: &mut Option<rust_htslib::bam::record::CigarStringView>,
     ) {
-        for (option_spans, per_tract) in self.spans.iter().zip(self.accumulators.iter_mut()) {
-            let (beg, fetch_end) = option_spans[i];
-            if start < fetch_end && end > beg && !per_tract[i].is_full() {
-                per_tract[i].add(record, cigar);
-            }
-        }
+        self.accumulators[i].add(record, cigar);
     }
 }
 
@@ -718,19 +689,25 @@ impl StrlenSite {
     }
 }
 
-/// Measures the records of regions as `measure_regions` does, once for each of `options`, in
-/// one pass over the reads. Returns the sites per option.
+/// Measures the repeat tract of every indel record (any FILTER) whose POS lies in each region,
+/// in region order, then VCF order, with `options`. Records without a pure insertion or deletion
+/// allele are skipped.
+///
+/// Regions are split into shards measured in parallel on the rayon pool, each with its own
+/// readers.
 ///
 /// # Errors
 ///
-/// As `measure_regions`.
-pub fn measure_regions_with<S: AsRef<str>>(
+/// Returns an error if a region is malformed or its contig is not in the VCF header or the
+/// reference, an indel record extends past the end of its contig in the reference, or a file
+/// cannot be read.
+pub fn measure_regions<S: AsRef<str>>(
     inputs: &ReadInputs<'_>,
     regions: &[S],
-    options: &[StrlenOptions],
-) -> Result<Vec<Vec<StrlenSite>>> {
+    options: &StrlenOptions,
+) -> Result<Vec<StrlenSite>> {
     // Ignored for BAM; for CRAM, skips decoding the fields the tract pass does not read.
-    let names = if options.iter().any(|o| o.collapse_mates) { CRAM_READ_NAME } else { 0 };
+    let names = if options.collapse_mates { CRAM_READ_NAME } else { 0 };
     let per_shard = run_shards(inputs, regions, CRAM_REQUIRED_FIELDS | names, |shard| {
         measure_shard(shard, inputs, options)
     })?;
@@ -738,13 +715,7 @@ pub fn measure_regions_with<S: AsRef<str>>(
     if skipped > 0 {
         log::info!("Skipped {skipped} indel records without a pure insertion or deletion allele");
     }
-    let mut per_option: Vec<Vec<StrlenSite>> = vec![Vec::new(); options.len()];
-    for (sites, _) in per_shard {
-        for (all, shard) in per_option.iter_mut().zip(sites) {
-            all.extend(shard);
-        }
-    }
-    Ok(per_option)
+    Ok(per_shard.into_iter().flat_map(|(sites, _)| sites).collect())
 }
 
 /// The htslib CRAM fields the tract pass reads (FLAG, RNAME, POS, MAPQ, CIGAR and QUAL), so CRAM
@@ -759,14 +730,14 @@ const CRAM_READ_NAME: u32 = 0x1;
 fn measure_shard(
     shard: &mut Shard<'_>,
     inputs: &ReadInputs<'_>,
-    options: &[StrlenOptions],
-) -> Result<(Vec<Vec<StrlenSite>>, usize)> {
+    options: &StrlenOptions,
+) -> Result<(Vec<StrlenSite>, usize)> {
     use rust_htslib::bcf::Read as _;
     let (chrom, start, end) = (shard.chrom, shard.start, shard.end);
     // Indel records and their tracts, measured together once all are read; a region without
     // indels needs no reads on its contig.
     let mut pending: Vec<(u64, String, String, RepeatTract)> = Vec::new();
-    let mut sites: Vec<Vec<StrlenSite>> = vec![Vec::new(); options.len()];
+    let mut sites: Vec<StrlenSite> = Vec::new();
     let mut skipped = 0;
     if !shard.fetch_records(inputs.vcf)? {
         return Ok((sites, skipped));
@@ -801,17 +772,8 @@ fn measure_shard(
     let tracts: Vec<RepeatTract> = pending.iter().map(|(.., tract)| tract.clone()).collect();
     let evidence = measure_tracts(shard.reads, tid, &tracts, options)
         .with_context(|| format!("failed to measure {chrom}:{start}-{end}"))?;
-    for (option_sites, option_evidence) in sites.iter_mut().zip(evidence) {
-        for ((pos, reference, alt, tract), evidence) in pending.iter().zip(option_evidence) {
-            option_sites.push(StrlenSite {
-                chrom: chrom.to_string(),
-                pos: *pos,
-                reference: reference.clone(),
-                alt: alt.clone(),
-                tract: tract.clone(),
-                evidence,
-            });
-        }
+    for ((pos, reference, alt, tract), evidence) in pending.into_iter().zip(evidence) {
+        sites.push(StrlenSite { chrom: chrom.to_string(), pos, reference, alt, tract, evidence });
     }
     Ok((sites, skipped))
 }
@@ -868,26 +830,6 @@ mod tests {
     use super::*;
     use crate::evidence::read_tables;
     use crate::model_evidence::check_options;
-
-    /// Measures the repeat tract of every indel record (any FILTER) whose POS lies in each region,
-    /// in region order, then VCF order, with the default [`StrlenOptions`]. Records without a pure insertion or deletion allele are
-    /// skipped.
-    ///
-    /// Regions are split into shards measured in parallel on the rayon pool, each with its own
-    /// readers.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a region is malformed or its contig is not in the VCF header or the
-    /// reference, an indel record extends past the end of its contig in the reference, or a file
-    /// cannot be read.
-    fn measure_regions<S: AsRef<str>>(
-        inputs: &ReadInputs<'_>,
-        regions: &[S],
-    ) -> Result<Vec<StrlenSite>> {
-        let mut per_option = measure_regions_with(inputs, regions, &[StrlenOptions::default()])?;
-        Ok(per_option.pop().unwrap_or_default())
-    }
 
     /// Measures a tract as [`measure_tract`] does, with other [`StrlenOptions`].
     ///
@@ -1253,10 +1195,7 @@ mod tests {
         tracts.push(RepeatTract { end: 5_200, ..a_tract(5_000) }); // longer than the reads
         tracts.push(a_tract(5_040)); // a repeat of a tract
         let mut reader = rust_htslib::bam::IndexedReader::from_path(&bam).unwrap();
-        let together = measure_tracts(&mut reader, 0, &tracts, &[StrlenOptions::default()])
-            .unwrap()
-            .pop()
-            .unwrap();
+        let together = measure_tracts(&mut reader, 0, &tracts, &StrlenOptions::default()).unwrap();
         let each: Vec<TractEvidence> =
             tracts.iter().map(|tract| measure_tract(&mut reader, 0, tract).unwrap()).collect();
         assert_eq!(together, each);
@@ -1332,17 +1271,13 @@ mod tests {
         // The default: MAPQ 20 and 5 flank bases.
         let default = measure(&mut reader, "default");
         assert_eq!((default.n_spanning, default.frac_mapq_lt20), (3, Some(0.25)));
-        // Measured together in one pass, each setting gives what it gives alone.
-        let options: Vec<StrlenOptions> =
-            ["legacy", "legacy,mapq20", "mates", "default", "legacy,mapq20,mates"]
-                .iter()
-                .map(|s| s.parse().unwrap())
-                .collect();
-        let together =
-            measure_tracts(&mut reader, 0, std::slice::from_ref(&tract), &options).unwrap();
-        for (option, evidence) in options.iter().zip(together) {
-            let alone = measure_tract_with(&mut reader, 0, &tract, option).unwrap();
-            assert_eq!(evidence, vec![alone], "{option:?}");
+        // Measured in a sweep, each setting gives what the tract's own fetch gives.
+        for settings in ["legacy", "legacy,mapq20", "mates", "default", "legacy,mapq20,mates"] {
+            let option: StrlenOptions = settings.parse().unwrap();
+            let swept =
+                measure_tracts(&mut reader, 0, std::slice::from_ref(&tract), &option).unwrap();
+            let alone = measure_tract_with(&mut reader, 0, &tract, &option).unwrap();
+            assert_eq!(swept, vec![alone], "{settings}");
         }
     }
 
@@ -1396,15 +1331,19 @@ mod tests {
             &[read("ref", 50, "70M")],
         );
         let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
-        let sites = measure_regions(&inputs, &["chr1", "chr2"]).unwrap();
+        let sites = measure_regions(&inputs, &["chr1", "chr2"], &StrlenOptions::default()).unwrap();
         // The SNP is not measured; the insertion has an empty tract (no T next to it).
         assert_eq!(
             sites.iter().map(|s| s.pos).collect::<Vec<_>>(),
             [start as u64, start as u64 + 20]
         );
         assert_eq!(sites[0].evidence.histogram.get(&0), Some(&1));
-        let only_snp =
-            measure_regions(&inputs, &[format!("chr1:{}-{}", start + 1, start + 15)]).unwrap();
+        let only_snp = measure_regions(
+            &inputs,
+            &[format!("chr1:{}-{}", start + 1, start + 15)],
+            &StrlenOptions::default(),
+        )
+        .unwrap();
         assert!(only_snp.is_empty());
 
         let table = dir.path().join("strlen.tsv.gz");
@@ -1413,9 +1352,14 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].length_histogram, "0:1");
         // A region past the contig end is capped to it.
-        let capped = measure_regions(&inputs, &["chr1:1-18446744073709551000"]).unwrap();
+        let capped =
+            measure_regions(&inputs, &["chr1:1-18446744073709551000"], &StrlenOptions::default())
+                .unwrap();
         assert_eq!(capped.len(), 2);
-        let message = format!("{:#}", measure_regions(&inputs, &["chrX"]).unwrap_err());
+        let message = format!(
+            "{:#}",
+            measure_regions(&inputs, &["chrX"], &StrlenOptions::default()).unwrap_err()
+        );
         assert!(
             message.contains("contig chrX of region chrX is not in the VCF header"),
             "{message}"
@@ -1426,7 +1370,7 @@ mod tests {
             (["chr1:10-20", "chr1:20-30"], "regions chr1:10-20 and chr1:20-30 overlap"),
             (["chr2", "chr1:100-200"], ""),
         ] {
-            let measured = measure_regions(&inputs, &regions);
+            let measured = measure_regions(&inputs, &regions, &StrlenOptions::default());
             if expected.is_empty() {
                 assert!(measured.is_ok());
             } else {
@@ -1453,7 +1397,10 @@ mod tests {
         let vcf = crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[record]);
         let bam = crate::testing::write_bam(dir.path(), "reads.bam", reference.len() as u64, &[]);
         let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
-        let message = format!("{:#}", measure_regions(&inputs, &["chr2"]).unwrap_err());
+        let message = format!(
+            "{:#}",
+            measure_regions(&inputs, &["chr2"], &StrlenOptions::default()).unwrap_err()
+        );
         assert!(message.contains("extends past the end of chr2 (4 bp)"), "{message}");
     }
 }

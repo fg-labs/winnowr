@@ -19,7 +19,7 @@ use crate::policy::{
 };
 use crate::read_pass::ReadInputs;
 use crate::repeat_features::add_strlen_features;
-use crate::strlen::{StrlenOptions, StrlenRow, StrlenTables, measure_regions_with, sites_to_rows};
+use crate::strlen::{StrlenOptions, StrlenRow, StrlenTables, measure_regions, sites_to_rows};
 use crate::table::{FeatureTable, FeatureTableInfo};
 
 /// Checks that evidence measured with `measured` (from `source`) can feed a model trained on
@@ -308,8 +308,8 @@ pub fn measure_and_decide(
             let inputs = ReadInputs { vcf: &vcf, alignments: &alignments, reference: &reference };
             let strlen_rows = strlen
                 .map(|options| {
-                    let mut sites = measure_regions_with(&inputs, &contigs, &[options])?;
-                    Ok::<_, anyhow::Error>(sites_to_rows(&sites.pop().unwrap_or_default()))
+                    let sites = measure_regions(&inputs, &contigs, &options)?;
+                    Ok::<_, anyhow::Error>(sites_to_rows(&sites))
                 })
                 .transpose()?;
             let pileup = pileup

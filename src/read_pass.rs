@@ -94,15 +94,12 @@ pub trait SweepSites {
     /// True once site `i` takes no more reads.
     fn is_full(&self, i: usize) -> bool;
 
-    /// Adds a read whose alignment, from 0-based `start` to `end` (see [`alignment_end`]),
-    /// overlaps site `i`'s span. `cigar` caches the read's decoded CIGAR across the sites it is
-    /// added to: it is decoded the first time a site needs it.
+    /// Adds a read that overlaps site `i`'s span. `cigar` caches the read's decoded CIGAR across
+    /// the sites it is added to: it is decoded the first time a site needs it.
     fn add(
         &mut self,
         i: usize,
         record: &rust_htslib::bam::Record,
-        start: i64,
-        end: i64,
         cigar: &mut Option<rust_htslib::bam::record::CigarStringView>,
     );
 }
@@ -161,7 +158,7 @@ pub fn sweep_clusters<S: SweepSites>(
             for &i in &open {
                 let (beg, site_end) = spans[i];
                 if start < site_end && end > beg {
-                    sites.add(i, &record, start, end, &mut cigar);
+                    sites.add(i, &record, &mut cigar);
                 }
             }
         }

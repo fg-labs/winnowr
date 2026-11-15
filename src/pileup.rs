@@ -507,8 +507,6 @@ impl SweepSites for Counting<'_> {
         &mut self,
         i: usize,
         record: &rust_htslib::bam::Record,
-        _start: i64,
-        _end: i64,
         cigar: &mut Option<rust_htslib::bam::record::CigarStringView>,
     ) {
         let accumulator = &mut self.accumulators[i];
