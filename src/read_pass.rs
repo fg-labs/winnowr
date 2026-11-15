@@ -76,6 +76,14 @@ pub(crate) fn anchored_length(
     Some((first_query, last_query, observed))
 }
 
+/// The most reads measured at a site (a strlen tract or a pileup call): a site is read until
+/// more than this many reads overlap it, so its count of overlapping reads is capped at
+/// `MAX_READS + 1`.
+///
+/// Neither strlen nor pileup tables record it, so changing it changes the evidence that models
+/// were trained on without changing their recorded settings.
+pub const MAX_READS: u64 = 600;
+
 /// Sites whose spans are at most this far apart are read from one fetch.
 pub(crate) const CLUSTER_GAP: i64 = 10_000;
 

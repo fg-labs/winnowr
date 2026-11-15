@@ -1,11 +1,11 @@
 //! F1 reports for a model's decisions on a labelled sample.
 
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::common::NEVER;
+use crate::io::write_tsv;
 use crate::labels::Label;
 use crate::numeric::metric_float;
 use crate::policy::withhold_promotions;
@@ -380,14 +380,7 @@ pub const POLICY_METRIC_COLUMNS: [&str; 25] = [
 ///
 /// Returns an error if the file cannot be written.
 pub fn write_policy_metrics(path: &Path, metrics: &[PolicyMetric]) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut out = std::io::BufWriter::new(file);
-    writeln!(out, "{}", POLICY_METRIC_COLUMNS.join("\t"))?;
-    for metric in metrics {
-        writeln!(out, "{}", metric.formatted_values().join("\t"))?;
-    }
-    out.flush().with_context(|| format!("failed to write {}", path.display()))
+    write_tsv(path, &POLICY_METRIC_COLUMNS, metrics.iter().map(PolicyMetric::formatted_values))
 }
 
 #[cfg(test)]

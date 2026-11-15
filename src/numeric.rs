@@ -1,8 +1,17 @@
-//! Floating-point sums in the same order as the Python version's, so results match it bit for
-//! bit: NumPy's pairwise `ndarray.sum()` and Python's compensated built-in `sum()`.
+//! Floating-point sums and number formatting, in the orders and forms winnowr's results were first
+//! defined with (those of the Python version, NumPy's pairwise `ndarray.sum()` and Python's
+//! compensated built-in `sum()` and `str()`).
+//!
+//! Matching the Python version is no longer a goal, but these stay. The sums feed features
+//! (repeat-length and stutter features) and threshold searches: summing in another order changes
+//! features by a few ULPs, which can move a call across a tree split of an existing model, and
+//! changes exact ties between thresholds or genotypes. Features also stay consistent with those in
+//! feature tables the Python version wrote, which training can still read. The formatting is the
+//! text of the `evaluate` and `stratify` metrics files, which downstream parsers and comparisons
+//! read.
 
-/// Sums values in NumPy's order (pairwise, in blocks of eight), so that sums match the Python
-/// version's bit for bit.
+/// Sums values in NumPy's order (pairwise, in blocks of eight), so that features are the same bit
+/// for bit for existing models (see the module docs).
 #[must_use]
 pub fn numpy_sum(values: &[f64]) -> f64 {
     const BLOCK: usize = 128;
@@ -87,8 +96,9 @@ pub fn python_float(value: f64) -> String {
     }
 }
 
-/// Formats a metric value as the Python version's metrics files do: Python's `str(round(value,
-/// 5))`. Both round the double's exact value to five decimals, ties to even.
+/// Formats a metric value as metrics files write it: Python's `str(round(value, 5))`, as the Python
+/// version's did (see the module docs). Both round the double's exact value to five decimals, ties
+/// to even.
 #[must_use]
 pub fn metric_float(value: f64) -> String {
     let rounded: f64 = format!("{value:.5}").parse().unwrap_or(value);

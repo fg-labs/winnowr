@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::evidence::{Evidence, EvidenceTables, write_table};
 use crate::read_pass::{
-    ReadInputs, Shard, SweepSites, anchored_length, run_shards, sweep_clusters,
+    MAX_READS, ReadInputs, Shard, SweepSites, anchored_length, run_shards, sweep_clusters,
 };
 
 /// Reads per length difference (bp, observed minus reference tract length), in increasing order
@@ -153,10 +153,8 @@ fn parse_row(line: &str) -> Result<StrlenRow> {
         })
     };
     let float = |index: usize| -> Result<f64> {
+        // `nan` (a missing value) parses as NaN.
         let value = fields[index];
-        if value == "nan" {
-            return Ok(f64::NAN);
-        }
         value
             .parse()
             .with_context(|| format!("{} is not a number: {value:?}", STRLEN_COLUMNS[index]))
@@ -319,9 +317,6 @@ impl<'de> serde::Deserialize<'de> for StrlenOptions {
 
 /// Reference bases fetched on each side of a record to find its tract.
 pub const CONTEXT: u64 = 600;
-
-/// Stop reading a site after this many overlapping reads.
-pub const MAX_READS: u64 = 600;
 
 /// The smallest `k` such that `seq` is periodic with period `k` (`seq.len()` if aperiodic).
 #[must_use]
@@ -514,7 +509,8 @@ impl TractAccumulator {
         }
     }
 
-    /// True once [`MAX_READS`] reads have been counted: later reads are not read.
+    /// True once more than [`MAX_READS`] reads have been counted (the last is not measured):
+    /// later reads are not read.
     fn is_full(&self) -> bool {
         self.n_overlap > MAX_READS
     }
@@ -917,8 +913,8 @@ mod tests {
     /// MAPQ summaries but not measured. Its observed tract length is the number of query bases
     /// between the anchors.
     ///
-    /// The reads are those a fetch of the tract and its flanks returns, in order, up to
-    /// [`MAX_READS`]. [`measure_tracts`] measures many tracts with the same result, faster.
+    /// The reads are those a fetch of the tract and its flanks returns, in order, of which at
+    /// most [`MAX_READS`] are measured. [`measure_tracts`] measures many tracts with the same result, faster.
     ///
     /// # Errors
     ///

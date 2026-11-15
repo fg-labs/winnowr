@@ -739,30 +739,7 @@ impl StratifiedReport {
         self.outcome_rows()
             .into_iter()
             .map(|(truth, vt, stratum, o)| {
-                let (before, after) = (o.before, o.after());
-                format!(
-                    "{} {:5} {:12} {:5} labelled={} drop={} (TP {}) flip={} (fixed {}, broke {}) \
-                     regenotype={} (fixed {}, broke {}) promote={} (correct {}) F1 {:.5} -> {:.5} \
-                     ({:+.5})",
-                    self.sample,
-                    self.names[truth],
-                    stratum,
-                    vt,
-                    o.labelled,
-                    o.dropped,
-                    o.dropped_tp,
-                    o.flipped,
-                    o.flips_fixed,
-                    o.flips_broke_tp,
-                    o.regenotyped,
-                    o.regenotypes_fixed,
-                    o.regenotypes_broke_tp,
-                    o.promoted,
-                    o.promoted_correct,
-                    before.f1(),
-                    after.f1(),
-                    after.f1() - before.f1()
-                )
+                summary_line(&self.sample, &self.names[truth], &stratum, 12, vt, &o, false)
             })
             .collect()
     }
@@ -936,34 +913,45 @@ impl RegionReport {
         self.outcome_rows()
             .into_iter()
             .map(|(truth, vt, region, o)| {
-                let (before, after) = (o.before, o.after());
-                format!(
-                    "{} {:5} {:38} {:5} labelled={} drop={} (TP {}) flip={} (fixed {}, broke {}) \
-                     regenotype={} (fixed {}, broke {}) promote={} (correct {}) FN={} F1 {:.5} -> \
-                     {:.5} ({:+.5})",
-                    self.sample,
-                    self.names[truth],
-                    region,
-                    vt,
-                    o.labelled,
-                    o.dropped,
-                    o.dropped_tp,
-                    o.flipped,
-                    o.flips_fixed,
-                    o.flips_broke_tp,
-                    o.regenotyped,
-                    o.regenotypes_fixed,
-                    o.regenotypes_broke_tp,
-                    o.promoted,
-                    o.promoted_correct,
-                    before.fn_,
-                    before.f1(),
-                    after.f1(),
-                    after.f1() - before.f1()
-                )
+                summary_line(&self.sample, &self.names[truth], &region, 38, vt, &o, true)
             })
             .collect()
     }
+}
+
+/// A log line of an outcome row: the sample, truth set, group (stratum or region, padded to
+/// `width`) and variant type, then the actions, their outcomes and the F1 change, with the truth
+/// FNs when `with_fn`.
+fn summary_line(
+    sample: &str,
+    truth: &str,
+    group: &dyn std::fmt::Display,
+    width: usize,
+    vt: VariantType,
+    o: &Outcome,
+    with_fn: bool,
+) -> String {
+    let (before, after) = (o.before, o.after());
+    let fns = if with_fn { format!("FN={} ", before.fn_) } else { String::new() };
+    format!(
+        "{sample} {truth:5} {group:width$} {vt} labelled={} drop={} (TP {}) flip={} (fixed {}, \
+         broke {}) regenotype={} (fixed {}, broke {}) promote={} (correct {}) {fns}F1 {:.5} -> \
+         {:.5} ({:+.5})",
+        o.labelled,
+        o.dropped,
+        o.dropped_tp,
+        o.flipped,
+        o.flips_fixed,
+        o.flips_broke_tp,
+        o.regenotyped,
+        o.regenotypes_fixed,
+        o.regenotypes_broke_tp,
+        o.promoted,
+        o.promoted_correct,
+        before.f1(),
+        after.f1(),
+        after.f1() - before.f1()
+    )
 }
 
 /// An outcome row: the sample, truth set, group (stratum or region), variant type and mode, then
@@ -1550,6 +1538,26 @@ mod tests {
         assert_eq!([stratum.has_truth(0), stratum.has_truth(1)], covered);
     }
 
+    #[test]
+    fn summary_lines_pad_the_group_and_add_the_fns_on_request() {
+        let outcome = Outcome {
+            labelled: 4,
+            dropped: 1,
+            before: Counts { tp: 3, fp: 1, fn_: 2 },
+            delta: Counts { tp: 0, fp: -1, fn_: 0 },
+            ..Outcome::default()
+        };
+        assert_eq!(
+            summary_line("S", "v5", &"both", 6, VariantType::Snp, &outcome, false),
+            "S v5    both   snp labelled=4 drop=1 (TP 0) flip=0 (fixed 0, broke 0) regenotype=0 \
+             (fixed 0, broke 0) promote=0 (correct 0) F1 0.66667 -> 0.75000 (+0.08333)"
+        );
+        assert_eq!(
+            summary_line("S", "v5", &"MHC", 5, VariantType::Indel, &outcome, true),
+            "S v5    MHC   indel labelled=4 drop=1 (TP 0) flip=0 (fixed 0, broke 0) regenotype=0 \
+             (fixed 0, broke 0) promote=0 (correct 0) FN=2 F1 0.66667 -> 0.75000 (+0.08333)"
+        );
+    }
     #[test]
     fn table_strata_use_the_ref_span() {
         // v421 covers chr1 [0, 100); v5q covers chr1 [50, 200).

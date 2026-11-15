@@ -30,7 +30,8 @@ use crate::alleles::{length_change, variant_type_of};
 use crate::common::VariantType;
 use crate::evidence::{Evidence, EvidenceTables, write_table};
 use crate::read_pass::{
-    ReadInputs, SweepSites, anchored_length, query_position_at, run_shards, sweep_clusters,
+    MAX_READS, ReadInputs, SweepSites, anchored_length, query_position_at, run_shards,
+    sweep_clusters,
 };
 use crate::strlen::{tract_of_record, tract_window};
 
@@ -55,11 +56,6 @@ pub const PILEUP_COLUMNS: [&str; 14] = [
 /// The prefix of the pileup table line that records its read settings, before the column header
 /// (e.g. `##pileup_settings=mapq20,bq10,flank5`).
 pub const SETTINGS_PREFIX: &str = "##pileup_settings=";
-
-/// Stop counting a site's reads after this many overlapping reads (as `winnowr strlen` stops
-/// measuring a tract after as many). Pileup tables do not record it, so changing it changes the
-/// counts that models were trained on without changing their settings.
-pub const MAX_READS: u64 = 600;
 
 /// The MAPQ from which a read is in the high-MAPQ bin (by default).
 pub const HIGH_MAPQ: u8 = 20;
@@ -443,7 +439,8 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    /// True once [`MAX_READS`] reads have been counted: later reads are not read.
+    /// True once more than [`MAX_READS`] reads have been counted (the last is not counted at
+    /// its alleles): later reads are not read.
     fn is_full(&self) -> bool {
         self.n_reads > MAX_READS
     }
@@ -475,8 +472,8 @@ fn allele_of(
 }
 
 /// Counts reads at sites on one contig: each read (see [`sweep_clusters`]) is counted at every
-/// site whose span it overlaps, up to [`MAX_READS`] reads per site. Overlapping mates are both
-/// counted.
+/// site whose span it overlaps, until the site is full: at most [`MAX_READS`] reads are counted
+/// at a site's alleles. Overlapping mates are both counted.
 fn count_sites(
     reads: &mut rust_htslib::bam::IndexedReader,
     tid: u32,
