@@ -50,7 +50,7 @@ pub fn check_options<E: Evidence>(
 
 /// A kind of read evidence as models use it: which models and feature tables have it, and with
 /// what settings.
-pub(crate) trait ModelEvidence: Evidence {
+pub trait ModelEvidence: Evidence {
     /// The features that use the evidence, in messages (e.g. `repeat-length features`).
     const FEATURES: &'static str;
     /// What training with the features needs, in messages (e.g. `repeat-length features need`).
@@ -100,7 +100,7 @@ impl ModelEvidence for PileupOptions {
 /// # Errors
 ///
 /// Returns an error if a table has no evidence, or two were measured differently.
-pub(crate) fn shared_options<E: ModelEvidence>(infos: &[&FeatureTableInfo]) -> Result<E> {
+pub fn shared_options<E: ModelEvidence>(infos: &[&FeatureTableInfo]) -> Result<E> {
     let mut shared: Option<(E, &str)> = None;
     for info in infos {
         let Some(options) = E::of_table(info) else {
@@ -135,7 +135,7 @@ pub(crate) fn shared_options<E: ModelEvidence>(infos: &[&FeatureTableInfo]) -> R
 ///
 /// Returns an error if the settings differ, or the table lacks evidence a model needs and
 /// [`ModelEvidence::TABLE_MUST_HAVE`].
-pub(crate) fn check_table<E: ModelEvidence>(
+pub fn check_table<E: ModelEvidence>(
     table: &Path,
     info: &FeatureTableInfo,
     models: &[WinnowrModel],
@@ -162,10 +162,7 @@ pub(crate) fn check_table<E: ModelEvidence>(
 }
 
 /// The models (by path) that use the evidence.
-pub(crate) fn models_using<E: ModelEvidence>(
-    models: &[WinnowrModel],
-    paths: &[PathBuf],
-) -> Vec<String> {
+pub fn models_using<E: ModelEvidence>(models: &[WinnowrModel], paths: &[PathBuf]) -> Vec<String> {
     paths
         .iter()
         .zip(models)
@@ -180,7 +177,7 @@ pub(crate) fn models_using<E: ModelEvidence>(
 /// # Errors
 ///
 /// Returns an error if models use the evidence and neither tables nor reads are given.
-pub(crate) fn check_supplied<E: ModelEvidence>(
+pub fn check_supplied<E: ModelEvidence>(
     users: &[String],
     tables: &[PathBuf],
     alignments: bool,
@@ -205,7 +202,7 @@ pub(crate) fn check_supplied<E: ModelEvidence>(
 /// # Errors
 ///
 /// Returns an error if two models need it measured differently.
-pub(crate) fn models_options<E: ModelEvidence>(
+pub fn models_options<E: ModelEvidence>(
     models: &[WinnowrModel],
     paths: &[PathBuf],
 ) -> Result<Option<E>> {
@@ -232,7 +229,7 @@ pub(crate) fn models_options<E: ModelEvidence>(
 /// # Errors
 ///
 /// Returns an error if a table cannot be read, or its settings differ from a model's.
-pub(crate) fn read_for_models<E: ModelEvidence>(
+pub fn read_for_models<E: ModelEvidence>(
     tables: &[PathBuf],
     models: &[WinnowrModel],
     paths: &[PathBuf],
@@ -251,7 +248,7 @@ pub(crate) fn read_for_models<E: ModelEvidence>(
 }
 
 /// What `score --alignments` measures: the reads, the settings and the contigs.
-pub(crate) struct Measuring<'a> {
+pub struct Measuring<'a> {
     /// The calls, reads and reference.
     pub inputs: &'a ReadInputs<'a>,
     /// The read settings of the repeat-length evidence the models need, if any.
@@ -281,7 +278,7 @@ impl Measuring<'_> {
 /// # Errors
 ///
 /// Returns an error if the reads cannot be measured or a model cannot score the calls.
-pub(crate) fn measure_and_decide(
+pub fn measure_and_decide(
     table: FeatureTable,
     models: &[WinnowrModel],
     policy: &Policy,

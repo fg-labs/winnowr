@@ -175,11 +175,11 @@ impl<'de> serde::Deserialize<'de> for PileupOptions {
 pub type AlleleCounts = [[u64; 3]; 3];
 
 /// The allele of a read: the index into [`AlleleCounts`].
-pub(crate) const REF: usize = 0;
+pub const REF: usize = 0;
 /// See [`REF`].
-pub(crate) const ALT: usize = 1;
+pub const ALT: usize = 1;
 /// See [`REF`].
-pub(crate) const OTHER: usize = 2;
+pub const OTHER: usize = 2;
 
 /// One record of a pileup table: a SNP or indel record's allele read counts.
 #[derive(Debug, Clone, PartialEq, Eq)]

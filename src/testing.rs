@@ -7,7 +7,7 @@ use rust_htslib::bcf::index::{self, Type};
 use rust_htslib::bgzf;
 
 /// The INFO and FORMAT declarations of a HaplotypeCaller VCF, without the raw annotations.
-pub(crate) const CALL_FIELDS: &str = "\
+pub const CALL_FIELDS: &str = "\
 ##FILTER=<ID=PASS,Description=\"All filters passed\">
 ##FILTER=<ID=LowQual,Description=\"Low quality\">
 ##FILTER=<ID=RefCall,Description=\"Reference call\">
@@ -25,7 +25,7 @@ pub(crate) const CALL_FIELDS: &str = "\
 ";
 
 /// The INFO declarations of the raw annotations, as in a reblocked gVCF.
-pub(crate) const RAW_FIELDS: &str = "\
+pub const RAW_FIELDS: &str = "\
 ##INFO=<ID=RAW_MQandDP,Number=2,Type=Integer,Description=\"Raw MQ and DP\">
 ##INFO=<ID=QUALapprox,Number=1,Type=Integer,Description=\"Approximate QUAL\">
 ##INFO=<ID=VarDP,Number=1,Type=Integer,Description=\"Variant depth\">
@@ -34,7 +34,7 @@ pub(crate) const RAW_FIELDS: &str = "\
 
 /// A complete VCF header with contigs `chr1` and `chr2`, the given field declarations, and the
 /// given samples.
-pub(crate) fn vcf_header(fields: &[&str], samples: &[&str]) -> String {
+pub fn vcf_header(fields: &[&str], samples: &[&str]) -> String {
     let mut header = String::from(
         "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100000>\n##contig=<ID=chr2,length=100000>\n",
     );
@@ -55,7 +55,7 @@ pub(crate) fn vcf_header(fields: &[&str], samples: &[&str]) -> String {
 
 /// Writes a bgzipped, tabix-indexed VCF of `header` and `records` (one tab-separated line each,
 /// sorted) to `dir/name`.
-pub(crate) fn write_indexed_vcf(dir: &Path, name: &str, header: &str, records: &[&str]) -> PathBuf {
+pub fn write_indexed_vcf(dir: &Path, name: &str, header: &str, records: &[&str]) -> PathBuf {
     let path = dir.join(name);
     let mut writer = bgzf::Writer::from_path(&path).unwrap();
     writer.write_all(header.as_bytes()).unwrap();
@@ -69,7 +69,7 @@ pub(crate) fn write_indexed_vcf(dir: &Path, name: &str, header: &str, records: &
 }
 
 /// Writes `dir/ref.fa`, with 4 bases per line, and its `.fai` index.
-pub(crate) fn write_fasta(dir: &Path, sequences: &[(&str, &str)]) -> PathBuf {
+pub fn write_fasta(dir: &Path, sequences: &[(&str, &str)]) -> PathBuf {
     let path = dir.join("ref.fa");
     let (mut text, mut fai) = (String::new(), String::new());
     for (name, sequence) in sequences {
@@ -87,7 +87,7 @@ pub(crate) fn write_fasta(dir: &Path, sequences: &[(&str, &str)]) -> PathBuf {
 }
 
 /// A read to write to a test BAM.
-pub(crate) struct TestRead<'a> {
+pub struct TestRead<'a> {
     /// The read name.
     pub name: &'a str,
     /// The 0-based alignment start.
@@ -105,7 +105,7 @@ pub(crate) struct TestRead<'a> {
 }
 
 /// Writes a coordinate-sorted, indexed BAM of reads on `chr1` (of `length` bases) to `dir/name`.
-pub(crate) fn write_bam(dir: &Path, name: &str, length: u64, reads: &[TestRead<'_>]) -> PathBuf {
+pub fn write_bam(dir: &Path, name: &str, length: u64, reads: &[TestRead<'_>]) -> PathBuf {
     use rust_htslib::bam::{self, header::HeaderRecord, record::CigarString};
     let path = dir.join(name);
     let mut header = bam::Header::new();
@@ -141,10 +141,10 @@ pub(crate) fn write_bam(dir: &Path, name: &str, length: u64, reads: &[TestRead<'
 
 /// One call of a [`call_table`]: chrom, pos, ref, alt, filter, variant type, genotype and
 /// whether it overlaps a PASS call.
-pub(crate) type CallRow<'a> = (&'a str, i64, &'a str, &'a str, &'a str, &'a str, &'a str, bool);
+pub type CallRow<'a> = (&'a str, i64, &'a str, &'a str, &'a str, &'a str, &'a str, bool);
 
 /// A feature table with only the key columns of calls (enough for labelling).
-pub(crate) fn call_table(rows: &[CallRow<'_>]) -> crate::table::FeatureTable {
+pub fn call_table(rows: &[CallRow<'_>]) -> crate::table::FeatureTable {
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
@@ -187,12 +187,12 @@ pub(crate) fn call_table(rows: &[CallRow<'_>]) -> crate::table::FeatureTable {
 }
 
 /// The probability a [`separable_model`] gives the class its feature `x` names, at least.
-pub(crate) const SEPARABLE_P: f64 = 0.9;
+pub const SEPARABLE_P: f64 = 0.9;
 
 /// A three-class model of one feature, `x`, trained so that a call with `x` = k (0, 1 or 2) gets
 /// class k with a probability of at least [`SEPARABLE_P`], with thresholds of 0.5 (t_drop and
 /// t_flip of a genotype model in every mode; t_promote and t_flip of a promote model).
-pub(crate) fn separable_model(
+pub fn separable_model(
     task: crate::common::Task,
     variant_type: crate::common::VariantType,
 ) -> crate::model::WinnowrModel {
@@ -201,7 +201,7 @@ pub(crate) fn separable_model(
 
 /// A [`separable_model`] of the one feature `feature` rather than `x`; a pileup feature's model
 /// has the default pileup settings.
-pub(crate) fn separable_model_of(
+pub fn separable_model_of(
     task: crate::common::Task,
     variant_type: crate::common::VariantType,
     feature: &str,
@@ -266,8 +266,6 @@ pub(crate) fn separable_model_of(
 /// Fits a stutter model with the default [`crate::stutter::StutterFit`] settings (see
 /// [`crate::stutter::fit_stutter_model_with`]).
 #[must_use]
-pub(crate) fn fit_stutter_model(
-    sites: &[crate::stutter::StutterSite],
-) -> crate::stutter::StutterModel {
+pub fn fit_stutter_model(sites: &[crate::stutter::StutterSite]) -> crate::stutter::StutterModel {
     crate::stutter::fit_stutter_model_with(sites, crate::stutter::StutterFit::default())
 }

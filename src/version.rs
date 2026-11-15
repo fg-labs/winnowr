@@ -25,7 +25,7 @@ pub static XGBOOST_VERSION: LazyLock<String> = LazyLock::new(|| {
 /// suffix, so the same release built from a git checkout and from a source tarball or crates.io
 /// compare equal.
 #[must_use]
-pub(crate) fn package_version(version: &str) -> &str {
+pub fn package_version(version: &str) -> &str {
     let without_dirty = version.strip_suffix("-dirty").unwrap_or(version);
     match without_dirty.rsplit_once('-') {
         Some((package, hash))

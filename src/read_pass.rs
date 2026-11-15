@@ -11,11 +11,11 @@ use anyhow::{Context, Result, bail};
 use crate::shards::ReaderPool;
 
 /// Unmapped, secondary, QC-fail, duplicate and supplementary reads are skipped.
-pub(crate) const SKIP_FLAGS: u16 = 0x4 | 0x100 | 0x200 | 0x400 | 0x800;
+pub const SKIP_FLAGS: u16 = 0x4 | 0x100 | 0x200 | 0x400 | 0x800;
 
 /// The query position aligned (M/=/X) at a reference position, or `None` (deleted or
 /// unaligned).
-pub(crate) fn query_position_at(
+pub fn query_position_at(
     cigar: &[rust_htslib::bam::record::Cigar],
     reference_start: u64,
     target: u64,
@@ -47,7 +47,7 @@ pub(crate) fn query_position_at(
 
 /// The end of a read's alignment as htslib computes it to decide whether a read overlaps a
 /// fetched region: its start plus the reference length of its CIGAR, and at least one base.
-pub(crate) fn alignment_end(record: &rust_htslib::bam::Record) -> i64 {
+pub fn alignment_end(record: &rust_htslib::bam::Record) -> i64 {
     // CIGAR operations consuming the reference: M, D, N, = and X.
     let reference_length: i64 = record
         .raw_cigar()
@@ -62,7 +62,7 @@ pub(crate) fn alignment_end(record: &rust_htslib::bam::Record) -> i64 {
 /// `first` and `last` (0-based, inclusive: the flank bases outside each end of the tract, with
 /// `flank` bases on each side) and the query bases between the flanks (the observed tract
 /// length), or `None` if the read starts after `first` or is not aligned at both anchors.
-pub(crate) fn anchored_length(
+pub fn anchored_length(
     cigar: &[rust_htslib::bam::record::Cigar],
     start: i64,
     first: i64,
@@ -87,10 +87,10 @@ pub(crate) fn anchored_length(
 pub const MAX_READS: u64 = 600;
 
 /// Sites whose spans are at most this far apart are read from one fetch.
-pub(crate) const CLUSTER_GAP: i64 = 10_000;
+pub const CLUSTER_GAP: i64 = 10_000;
 
 /// The sites of one contig that [`sweep_clusters`] adds reads to, with the state they accumulate.
-pub(crate) trait SweepSites {
+pub trait SweepSites {
     /// True once site `i` takes no more reads.
     fn is_full(&self, i: usize) -> bool;
 
@@ -115,7 +115,7 @@ pub(crate) trait SweepSites {
 /// # Errors
 ///
 /// Returns an error if the reads cannot be fetched or read.
-pub(crate) fn sweep_clusters<S: SweepSites>(
+pub fn sweep_clusters<S: SweepSites>(
     reads: &mut rust_htslib::bam::IndexedReader,
     tid: u32,
     spans: &[(i64, i64)],
@@ -314,7 +314,7 @@ fn plan_shards<S: AsRef<str>>(
 }
 
 /// One shard of a region being measured, with readers open on its contig.
-pub(crate) struct Shard<'r> {
+pub struct Shard<'r> {
     /// The contig.
     pub chrom: &'r str,
     /// The 1-based, inclusive start of the records to measure.
@@ -336,7 +336,7 @@ impl Shard<'_> {
     /// # Errors
     ///
     /// Returns an error if the fetch fails otherwise.
-    pub(crate) fn fetch_records(&mut self, vcf_path: &Path) -> Result<bool> {
+    pub fn fetch_records(&mut self, vcf_path: &Path) -> Result<bool> {
         use rust_htslib::bcf::Read as _;
         let rid = self.vcf.header().name2rid(self.chrom.as_bytes())?;
         match self.vcf.fetch(rid, self.start - 1, Some(self.end - 1)) {
@@ -359,7 +359,7 @@ impl Shard<'_> {
     /// # Errors
     ///
     /// Returns an error, suggesting the VCF was called against another reference, if not.
-    pub(crate) fn check_record_end(&self, pos: u64, reference: &[u8], fasta: &Path) -> Result<()> {
+    pub fn check_record_end(&self, pos: u64, reference: &[u8], fasta: &Path) -> Result<()> {
         if pos - 1 + reference.len() as u64 > self.contig.len() as u64 {
             bail!(
                 "the record at {chrom}:{pos} extends past the end of {chrom} ({} bp) in {}: was \
@@ -377,7 +377,7 @@ impl Shard<'_> {
     /// # Errors
     ///
     /// Returns an error if the contig is not in the reads' header.
-    pub(crate) fn tid(&self, alignments: &Path) -> Result<u32> {
+    pub fn tid(&self, alignments: &Path) -> Result<u32> {
         use rust_htslib::bam::Read as _;
         self.reads.header().tid(self.chrom.as_bytes()).with_context(|| {
             format!("contig {} is not in the header of {}", self.chrom, alignments.display())
@@ -393,7 +393,7 @@ impl Shard<'_> {
 ///
 /// Returns an error if the regions are malformed (see [`plan_shards`]), a file cannot be opened,
 /// or `measure` fails.
-pub(crate) fn run_shards<S, T, F>(
+pub fn run_shards<S, T, F>(
     inputs: &ReadInputs<'_>,
     regions: &[S],
     cram_fields: u32,

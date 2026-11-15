@@ -297,7 +297,7 @@ impl HappyLabels {
 }
 
 /// The variant type of a hap.py BVT, if it is SNP or INDEL.
-pub(crate) fn variant_type_of_bvt(bvt: &str) -> Option<VariantType> {
+pub fn variant_type_of_bvt(bvt: &str) -> Option<VariantType> {
     match bvt {
         "SNP" => Some(VariantType::Snp),
         "INDEL" => Some(VariantType::Indel),
@@ -413,7 +413,7 @@ fn finish_happy_labels(
 
 /// A truth FN record of a hap.py output VCF.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HappyFn {
+pub struct HappyFn {
     /// The contig.
     pub chrom: String,
     /// The variant type (from the TRUTH BVT).
@@ -428,7 +428,7 @@ pub(crate) struct HappyFn {
 /// # Errors
 ///
 /// Returns an error if the VCF cannot be read or is not hap.py output.
-pub(crate) fn read_happy_fns<F: Fn(&str) -> bool>(
+pub fn read_happy_fns<F: Fn(&str) -> bool>(
     path: &Path,
     on: F,
 ) -> Result<impl Iterator<Item = Result<HappyFn>>> {

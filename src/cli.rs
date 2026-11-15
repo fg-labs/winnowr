@@ -1,46 +1,51 @@
 //! The command-line interface: global options, the subcommands, and dispatch.
 
+// The doc comments of the options are their `--help` text, where `<output>`-style placeholders
+// are literal, not HTML.
+#![allow(rustdoc::invalid_html_tags)]
+
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use log::info;
-use winnowr::common::{AUTOSOMES, PhaseTimer, Task, VariantType, repeated};
-use winnowr::evidence::read_tables;
-use winnowr::extraction::{TableInputs, TruthInputs, build_feature_table};
-use winnowr::features::feature_names;
-use winnowr::labels::UnfixableFlips;
-use winnowr::model::{CvFolds, MODEL_SUFFIX, TrainingParams, WinnowrModel, check_reference};
-use winnowr::model_evidence::{
+
+use crate::common::{AUTOSOMES, PhaseTimer, Task, VariantType, repeated};
+use crate::evidence::read_tables;
+use crate::extraction::{TableInputs, TruthInputs, build_feature_table};
+use crate::features::feature_names;
+use crate::labels::UnfixableFlips;
+use crate::model::{CvFolds, MODEL_SUFFIX, TrainingParams, WinnowrModel, check_reference};
+use crate::model_evidence::{
     Measuring, check_supplied, check_table, measure_and_decide, models_options, models_using,
     read_for_models, shared_options,
 };
-use winnowr::pileup::{PileupOptions, measure_pileup, write_pileup_table};
-use winnowr::pileup_features::PILEUP_FEATURES;
-use winnowr::policy::{
+use crate::pileup::{PileupOptions, measure_pileup, write_pileup_table};
+use crate::pileup_features::PILEUP_FEATURES;
+use crate::policy::{
     Abstention, CONFIDENT_REGIONS, DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP, Policy,
     decide_calls,
 };
-use winnowr::read_pass::ReadInputs;
-use winnowr::regions::{NamedBed, NamedPath, RegionSet, read_region_sets};
-use winnowr::repeat_features::STRLEN_FEATURES;
-use winnowr::rescore::{Mode, Rule};
-use winnowr::samples::{PromoteSampleCalls, SampleCalls};
-use winnowr::scoring::write_scored_vcf;
-use winnowr::strlen::{StrlenOptions, measure_regions_with, write_strlen_table};
-use winnowr::stutter::{
+use crate::read_pass::ReadInputs;
+use crate::regions::{NamedBed, NamedPath, RegionSet, read_region_sets};
+use crate::repeat_features::STRLEN_FEATURES;
+use crate::rescore::{Mode, Rule};
+use crate::samples::{PromoteSampleCalls, SampleCalls};
+use crate::scoring::write_scored_vcf;
+use crate::strlen::{StrlenOptions, measure_regions_with, write_strlen_table};
+use crate::stutter::{
     LENGTH_CALL_FEATURES, StutterFit, StutterModel, fit_stutter_from_feature_tables,
 };
-use winnowr::subset::restrict_table;
-use winnowr::table::{FeatureTable, FeatureTableInfo, TableSelection};
-use winnowr::thresholds::{DEFAULT_GRID, DEFAULT_PROMOTE_FLIP_GRID, DEFAULT_PROMOTE_GRID};
-use winnowr::training::{
+use crate::subset::restrict_table;
+use crate::table::{FeatureTable, FeatureTableInfo, TableSelection};
+use crate::thresholds::{DEFAULT_GRID, DEFAULT_PROMOTE_FLIP_GRID, DEFAULT_PROMOTE_GRID};
+use crate::training::{
     FoldTraining, TrainingSpec, fit_fold_stutter, group_samples, table_columns, train_model,
     train_promote_model,
 };
-use winnowr::vcf::VcfSummary;
-use winnowr::version::{LONG_VERSION, VERSION};
+use crate::vcf::VcfSummary;
+use crate::version::{LONG_VERSION, VERSION};
 
 /// The widest the help is wrapped to (narrower terminals wrap it narrower); the user guide's
 /// command reference shows the help at this width.
@@ -333,7 +338,7 @@ pub(crate) struct TrainArgs {
     /// Refit the final model on all its training calls, those held out for early stopping
     /// included, for the rounds its early stopping chose. Has no effect without early stopping
     /// (a zero --validation-fraction). Recorded in the model.
-    #[arg(long, default_value_t = winnowr::model::DEFAULT_REFIT_FINAL, num_args = 0..=1,
+    #[arg(long, default_value_t = crate::model::DEFAULT_REFIT_FINAL, num_args = 0..=1,
           default_missing_value = "true", action = clap::ArgAction::Set)]
     pub(crate) refit_final: bool,
 
@@ -1368,7 +1373,7 @@ fn log_samples(samples: &[SampleCalls], args: &TrainArgs) {
 
 /// Runs `winnowr evaluate`.
 fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
-    use winnowr::evaluation::{
+    use crate::evaluation::{
         EvaluationPolicy, baseline_metric, evaluate_model, evaluate_promote_model,
         write_policy_metrics,
     };
@@ -1445,7 +1450,7 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
         metrics.extend(promoted);
     }
     for m in &metrics {
-        let promoted = if m.t_promote < winnowr::common::NEVER {
+        let promoted = if m.t_promote < crate::common::NEVER {
             format!(
                 " t_promote={} t_promote_flip={} promoted={} (correct {}, flipped {})",
                 m.t_promote, m.t_promote_flip, m.promoted, m.promoted_correct, m.promoted_flipped
@@ -1569,9 +1574,9 @@ fn warn_policy_only_regions(regions: &[NamedBed]) {
 
 /// Runs `winnowr stratify`.
 fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
-    use winnowr::regions::RegionSet;
-    use winnowr::regions::read_stratification_manifest;
-    use winnowr::strata::{
+    use crate::regions::RegionSet;
+    use crate::regions::read_stratification_manifest;
+    use crate::strata::{
         CALL_KEY_COLUMNS, CallOutputs, TRUTH_LABEL_COLUMNS, TruthSets, check_region_names, stratify,
     };
     check_output_dir("--output", &args.output)?;
@@ -1685,7 +1690,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
 
 /// Runs `winnowr subset`.
 fn subset(args: &SubsetArgs) -> Result<()> {
-    use winnowr::regions::RegionSet;
+    use crate::regions::RegionSet;
     check_output_dir("--output", &args.output)?;
     let table = FeatureTable::read_parquet(&args.table)?;
     let contigs =
@@ -2290,7 +2295,7 @@ mod tests {
             assert_eq!(info.params.cv_folds, CvFolds::Samples);
             for thresholds in info.thresholds.values() {
                 for t in [thresholds.t_drop, thresholds.t_flip] {
-                    assert!([0.3, 0.5, 0.7, winnowr::common::NEVER].contains(&t), "{t}");
+                    assert!([0.3, 0.5, 0.7, crate::common::NEVER].contains(&t), "{t}");
                 }
             }
 
@@ -2496,7 +2501,7 @@ mod tests {
 
     #[test]
     fn the_default_policy_keeps_the_fallback_for_indels_and_an_outside_drop_threshold() {
-        use winnowr::policy::{DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP};
+        use crate::policy::{DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP};
         // Without the confident regions: the indel keep fallback only.
         let policy = score_policy(&[], &[]).unwrap();
         let expected: Vec<(VariantType, Rule)> =

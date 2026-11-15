@@ -453,7 +453,7 @@ pub struct TractEvidence {
 /// # Errors
 ///
 /// Returns an error if it is not.
-pub(crate) fn check_flank(flank: u64) -> Result<()> {
+pub fn check_flank(flank: u64) -> Result<()> {
     if !(1..=MAX_FLANK).contains(&flank) {
         bail!("the flank must be between 1 and {MAX_FLANK}, got {flank}");
     }
@@ -463,7 +463,7 @@ pub(crate) fn check_flank(flank: u64) -> Result<()> {
 /// The 0-based, half-open span a read must overlap to count for a tract: the tract with `flank`
 /// bases on each side. Returns `(first, last)` (the anchors, inclusive; `first` may be negative)
 /// and the fetch span `(beg, end)`.
-pub(crate) fn tract_window(tract: &RepeatTract, flank: u64) -> ((i64, i64), (i64, i64)) {
+pub fn tract_window(tract: &RepeatTract, flank: u64) -> ((i64, i64), (i64, i64)) {
     let first = tract.start as i64 - flank as i64;
     let last = (tract.end + flank - 1) as i64;
     ((first, last), (first.max(0), last + 1))
