@@ -250,7 +250,6 @@ When the `publish` workflow runs, it recognizes that the PR being merged is a re
 * Publishes `winnowr-xgboost` and then `winnowr` to [`crates.io`](https://crates.io/).
 * Creates a new `vX.Y.Z` tag with the release version.
 
-
 The creation of the version tag triggers the [`release`](../.github/workflows/release.yml) workflow, which does the following:
 
 * Creates a new [GitHub release](https://github.com/fg-labs/winnowr/releases) with changes from the (automatically updated) changelog.
@@ -265,6 +264,22 @@ sha256sum winnowr-<version>-src.tar.gz > winnowr-<version>-src.tar.gz.sha256
 gh release upload v<version> winnowr-<version>-src.tar.gz winnowr-<version>-src.tar.gz.sha256 --repo fg-labs/winnowr
 ```
 
+### Release credentials
+
+The `publish` workflow needs:
+
+* The `RELEASE_PLZ_TOKEN` repository secret: a personal access token that release-plz opens the release PR and pushes the tag with. The workflow's built-in `GITHUB_TOKEN` would not run CI on the release PR or trigger the `release` workflow on the tag. A fine-grained token for `fg-labs/winnowr` needs *Contents: read and write* and *Pull requests: read and write* (the `fg-labs` organization must allow fine-grained tokens); a classic token needs the `repo` scope.
+* crates.io [trusted publishing](https://crates.io/docs/trusted-publishing) for both crates, with no registry token: on each crate's *Settings* page on crates.io, add a GitHub trusted publisher with owner `fg-labs`, repository `winnowr`, workflow `publish.yml` and no environment. The `release` job requests an OIDC token (`id-token: write`), which release-plz exchanges for a short-lived crates.io token when a crate needs publishing.
+
+### The first crates.io release (0.1.1)
+
+A crate's first version cannot be published with trusted publishing, and release-plz neither publishes nor tags a version that is already on crates.io. So the first crates.io version, 0.1.1, is released by hand (`v0.1.0` was released on GitHub only):
+
+1. Merge a PR that bumps the version to 0.1.1 (in `[workspace.package]` and in `winnowr`'s `winnowr-xgboost` dependency, plus `Cargo.lock` and `CHANGELOG.md`). It must not be a release-plz PR, so the `publish` workflow publishes and tags nothing.
+2. Tag that commit `v0.1.1`, without pushing the tag yet.
+3. From a clean checkout of the commit tagged `v0.1.1`, publish `winnowr-xgboost` first: `cargo publish -p winnowr-xgboost`, then `cargo publish -p winnowr`.
+4. Push the tag by hand (`git push origin v0.1.1`). release-plz will not create it for a version it did not publish, and the tag is what runs the `release` workflow (binaries and GitHub release).
+5. Add the trusted publisher to both crates, as above. Later releases go through the release PR.
 
 ### Regenerating the release workflow
 

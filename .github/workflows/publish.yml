@@ -1,9 +1,12 @@
 name: Manage Release PRs and Publish Crates
 
-# Both jobs act with RELEASE_PLZ_TOKEN (a personal access token, so that the tag it pushes
-# triggers the release workflow), not the workflow's GITHUB_TOKEN, which only needs to read.
-# The checkout keeps that token in the git config: release-plz pushes the release PR's branch and
-# the tag with it.
+# Both jobs act on GitHub with RELEASE_PLZ_TOKEN (a personal access token, so that the release
+# PR it opens runs CI and the tag it pushes triggers the release workflow), not the workflow's
+# GITHUB_TOKEN, which only needs to read. The checkout keeps that token in the git config:
+# release-plz pushes the release PR's branch and the tag with it.
+#
+# Crates are published with crates.io trusted publishing, which names this file (publish.yml):
+# see "Release credentials" in docs/DEVELOPING.md.
 permissions:
   contents: read
 
@@ -43,6 +46,12 @@ jobs:
   # triggers the dist release workflow (binaries and GitHub release).
   release:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # Trusted publishing: lets release-plz request the OIDC token it exchanges with crates.io
+      # for a short-lived publish token (revoked once every crate is published, otherwise left
+      # to expire).
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,4 +69,6 @@ jobs:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # No CARGO_REGISTRY_TOKEN: when it is unset, release-plz uses trusted publishing (it
+          # implements rust-lang/crates-io-auth-action's token exchange itself, and its docs say
+          # not to combine the two).
