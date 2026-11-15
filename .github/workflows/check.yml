@@ -61,12 +61,7 @@ jobs:
           cargo build --release --locked
           binary=target/release/winnowr
           "$binary" --version
-          if [ "$RUNNER_OS" = macOS ]; then libs=$(otool -L "$binary"); else libs=$(ldd "$binary"); fi
-          echo "$libs"
-          if grep -E 'xgboost|omp|hts|bz2|lzma|deflate' <<< "$libs"; then
-            echo "::error::winnowr links XGBoost, OpenMP or htslib and its codecs dynamically"
-            exit 1
-          fi
+          .github/scripts/check-static-link.sh "$binary"
 
   # Builds and tests in Debian 12 (bookworm), with only the packages a Debian image needs to
   # build winnowr (see docs/Dockerfile.bookworm), on x86_64 and aarch64. Debian's GCC and its
@@ -106,12 +101,7 @@ jobs:
           cargo build --release --locked
           binary=target/release/winnowr
           "$binary" --version
-          libs=$(ldd "$binary")
-          echo "$libs"
-          if grep -E 'xgboost|omp|hts|bz2|lzma|deflate' <<< "$libs"; then
-            echo "::error::winnowr links XGBoost, OpenMP or htslib and its codecs dynamically"
-            exit 1
-          fi
+          .github/scripts/check-static-link.sh "$binary"
 
   # Builds and tests on the oldest supported Rust (Cargo.toml `rust-version`), so that a change
   # using a newer API can't silently break `cargo install` for users on that version.
