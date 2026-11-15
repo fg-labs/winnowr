@@ -1,0 +1,124 @@
+name: Source tarball
+
+# Attaches a full source tarball, winnowr-<version>-src.tar.gz, and its sha256 to each GitHub
+# release. GitHub's archive/<tag>.tar.gz and dist's source.tar.gz leave out the vendored XGBoost (a
+# submodule), so they cannot be built; docs/Dockerfile.bookworm builds from this tarball.
+#
+# The release workflow creates the release with the workflow token, which does not trigger
+# `release` events, so this runs when that workflow completes. It can also be run by hand for a tag.
+# The job runs only for a Release run of a tag pushed to this repository, and checks out only that
+# tag, never a pull request's code.
+
+on: # zizmor: ignore[dangerous-triggers]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release tag, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  source-tarball:
+    # Only a Release run for a pushed tag in this repository (not a pull request's, or a fork's,
+    # whose head branch could look like a tag) makes a release.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_branch }}
+    # One run per tag at a time, so two runs cannot attach a tarball and a sha256 of different
+    # builds.
+    concurrency:
+      group: source-tarball-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    steps:
+      # release-plz tags vX.Y.Z, but the release workflow also runs for the other tag shapes dist
+      # releases this package from (X.Y.Z, winnowr-vX.Y.Z, winnowr/X.Y.Z, with an optional
+      # pre-release and build suffix), so those are accepted too.
+      - name: Check the tag
+        id: tag
+        run: |
+          if [[ ! "$TAG" =~ ^(winnowr[-/])?v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$TAG' is not a release tag (vX.Y.Z, X.Y.Z, winnowr-vX.Y.Z or winnowr/X.Y.Z)"
+            exit 1
+          fi
+          version=${TAG#winnowr[-/]}
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
+
+      # After a Release run, the commit it built (so the tarball matches the binaries even if the
+      # tag has since moved); when run by hand, the tag.
+      - name: Checkout the release commit with its submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || format('refs/tags/{0}', env.TAG) }}
+          submodules: recursive
+          path: winnowr-${{ steps.tag.outputs.version }}
+          persist-credentials: false
+
+      - name: Make the tarball and its sha256
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="winnowr-${VERSION}"
+          # Only the git metadata is left out (.git directories, and the .git files of submodule
+          # checkouts); .gitmodules and the like stay.
+          tar --exclude=.git -czf "${name}-src.tar.gz" "${name}"
+          sha256sum "${name}-src.tar.gz" > "${name}-src.tar.gz.sha256"
+          cat "${name}-src.tar.gz.sha256"
+          # What xgboost/build.rs needs to build the vendored XGBoost must be in it.
+          tar -tzf "${name}-src.tar.gz" > listing.txt
+          for path in xgboost/vendor/xgboost/CMakeLists.txt xgboost/vendor/xgboost/src/ \
+              xgboost/vendor/xgboost/dmlc-core/CMakeLists.txt xgboost/patches/; do
+            if ! grep -q "^${name}/${path}" listing.txt; then
+              echo "::error::the tarball has no ${path}: are the submodules checked out?"
+              exit 1
+            fi
+          done
+
+      - name: Attach them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="winnowr-${VERSION}-src.tar.gz"
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | [.name, .state] | @tsv')
+          # An upload that failed partway can leave an asset whose state is not "uploaded" (e.g.
+          # "starter"). Delete such a tarball or sha256 so it is uploaded again below.
+          while IFS=$'\t' read -r asset state; do
+            if [[ ( "$asset" == "$name" || "$asset" == "$name.sha256" ) && "$state" != uploaded ]]; then
+              echo "::warning::deleting $asset, whose upload did not complete (state: $state)"
+              gh release delete-asset "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+            fi
+          done <<< "$assets"
+          has() { grep -qxF "$1"$'\t'uploaded <<< "$assets"; }
+          # A tarball already attached is kept: its sha256 may be pinned downstream, and a new
+          # tarball of the same tag has a different one (gzip records the time). A missing sha256
+          # (e.g. an upload that failed halfway) is made from the attached tarball.
+          if has "$name" && has "$name.sha256"; then
+            echo "::notice::$TAG already has $name and its sha256; keeping them"
+          elif has "$name"; then
+            mkdir attached
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir attached
+            (cd attached && sha256sum "$name" > "$name.sha256" && cat "$name.sha256")
+            gh release upload "$TAG" "attached/$name.sha256" --repo "$GITHUB_REPOSITORY"
+          elif has "$name.sha256"; then
+            echo "::error::$TAG has $name.sha256 but not $name: delete the sha256 and run again"
+            exit 1
+          else
+            # The tarball first: if its upload fails, nothing is attached and a rerun uploads both.
+            gh release upload "$TAG" "$name" --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" "$name.sha256" --repo "$GITHUB_REPOSITORY"
+          fi
