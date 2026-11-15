@@ -256,13 +256,14 @@ The creation of the version tag triggers the [`release`](../.github/workflows/re
 * Creates a new [GitHub release](https://github.com/fg-labs/winnowr/releases) with changes from the (automatically updated) changelog.
 * Builds binaries for the most commonly used platforms and attaches them to the GitHub release.
 
-The release also carries a full source tarball, `winnowr-<version>-src.tar.gz`, with its sha256 in `winnowr-<version>-src.tar.gz.sha256`. GitHub's automatic `archive/<tag>.tar.gz` and dist's `source.tar.gz` leave out the vendored XGBoost (a submodule), so they cannot be built; [`docs/Dockerfile.bookworm`](Dockerfile.bookworm) builds from this tarball instead. No workflow makes it: once the release workflow has created the GitHub release, make it by hand from the tag and attach both files:
+The release also carries a full source tarball, `winnowr-<version>-src.tar.gz`, with its sha256 in `winnowr-<version>-src.tar.gz.sha256`. GitHub's automatic `archive/<tag>.tar.gz` and dist's `source.tar.gz` leave out the vendored XGBoost (a submodule), so they cannot be built; [`docs/Dockerfile.bookworm`](Dockerfile.bookworm) builds from this tarball instead. The [`source-tarball`](../.github/workflows/source-tarball.yml) workflow makes it from the tag and attaches both files once the release workflow has succeeded for a pushed tag, from the commit that run built. If that run failed, or to redo it for a tag, run the workflow by hand (`gh workflow run source-tarball.yml -f tag=v<version>`). It keeps a tarball that is already attached, since its sha256 may be pinned downstream, and makes a missing `.sha256` from the attached tarball. An upload that did not complete (an asset whose state is not `uploaded`) is deleted and redone. Without the workflow, the same steps by hand (for a release that has neither file; `gh release upload` refuses a name that is already attached) are:
 
 ```console
 git clone --recursive --branch v<version> https://github.com/fg-labs/winnowr.git winnowr-<version>
-tar --exclude-vcs -czf winnowr-<version>-src.tar.gz winnowr-<version>
+tar --exclude=.git -czf winnowr-<version>-src.tar.gz winnowr-<version>
 sha256sum winnowr-<version>-src.tar.gz > winnowr-<version>-src.tar.gz.sha256
-gh release upload v<version> winnowr-<version>-src.tar.gz winnowr-<version>-src.tar.gz.sha256 --repo fg-labs/winnowr
+gh release upload v<version> winnowr-<version>-src.tar.gz --repo fg-labs/winnowr
+gh release upload v<version> winnowr-<version>-src.tar.gz.sha256 --repo fg-labs/winnowr
 ```
 
 
