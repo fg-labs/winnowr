@@ -64,13 +64,19 @@ mod libgomp {
     }
 }
 
-/// Measures how much work other processes give the machine's cores.
+/// Measures how much work other processes give the cores this process may use.
 ///
 /// The CPU time counters, sampled over a short window, say how many cores are busy now, but
 /// cannot see past every core being busy. The load average (runnable threads) can, but it trails
 /// the machine's load by about a minute: right after one training run ends it still counts that
 /// run's threads, and the next run would take an idle machine for a busy one. So the load
 /// average is used only when the counters show every core busy.
+///
+/// On Linux the counters are read for the CPUs the process may run on (its affinity, e.g. a
+/// cpuset or SLURM binding), and the result is scaled to the cores it is allowed
+/// (`available_parallelism`, which also applies a cgroup CPU quota, e.g. a container's CPU
+/// limit), assuming the other work is spread evenly over the CPUs. The load average counts the
+/// whole machine, so it is scaled from the machine's CPUs to the allowed cores the same way.
 mod cpu_usage {
     use std::ffi::c_int;
     use std::time::Duration;
@@ -83,46 +89,135 @@ mod cpu_usage {
     /// How long the CPU time counters are sampled over.
     const WINDOW: Duration = Duration::from_millis(250);
 
-    /// How many cores' worth of work other processes have, while this process is idle (it calls
-    /// this before starting any work), or `None` if the counters cannot be read.
-    pub fn busy_cores() -> Option<f64> {
-        let (busy0, total0, cpus) = cpu_ticks()?;
+    /// Busy and total CPU time (in ticks, summed over the CPUs measured), the ids of the CPUs
+    /// measured, and the machine's CPU count.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Ticks {
+        pub busy: u64,
+        pub total: u64,
+        pub cpu_ids: Vec<usize>,
+        pub host_cpus: usize,
+    }
+
+    /// How many of its `cores` cores' worth of work other processes have, while this process is
+    /// idle (it calls this before starting any work), or `None` if the counters cannot be read.
+    pub fn busy_cores(cores: usize) -> Option<f64> {
+        let before = cpu_ticks()?;
         std::thread::sleep(WINDOW);
-        let (busy1, total1, _) = cpu_ticks()?;
-        let total = total1.checked_sub(total0).filter(|&t| t > 0)?;
-        let busy = busy1.checked_sub(busy0)?.min(total);
-        let busy = cpus as f64 * busy as f64 / total as f64;
-        if busy < cpus as f64 - 0.5 {
-            return Some(busy);
-        }
+        let after = cpu_ticks()?;
         let mut load = [0.0f64; 1];
         // SAFETY: the pointer is valid for writing the one requested value.
         let read = unsafe { getloadavg(load.as_mut_ptr(), 1) } == 1;
-        Some(if read && load[0].is_finite() { busy.max(load[0]) } else { busy })
+        busy_between(before, after, cores, read.then_some(load[0]))
     }
 
-    /// The machine's busy and total CPU time (in ticks, summed over CPUs), and its CPU count,
-    /// from `/proc/stat`.
+    /// The other work on `cores` cores between two readings of the counters, falling back to the
+    /// (machine-wide) load average when every CPU measured was busy.
+    pub(crate) fn busy_between(
+        before: Ticks,
+        after: Ticks,
+        cores: usize,
+        load: Option<f64>,
+    ) -> Option<f64> {
+        // The CPUs measured changed (e.g. the affinity), even if not their number.
+        if before.cpu_ids != after.cpu_ids {
+            return None;
+        }
+        let total = after.total.checked_sub(before.total).filter(|&t| t > 0)?;
+        let busy = after.busy.checked_sub(before.busy)?.min(total);
+        let cpus = after.cpu_ids.len() as f64;
+        let busy = cpus * busy as f64 / total as f64;
+        // From the CPUs measured to the cores allowed (fewer under a CPU quota).
+        let scale = (cores as f64 / cpus).min(1.0);
+        // Every CPU is busy when the busy count rounds up to them all and is at least 90% of
+        // them (so that half of a single CPU is not).
+        if busy < (cpus - 0.5).max(0.9 * cpus) {
+            return Some(busy * scale);
+        }
+        let load = load
+            .filter(|load| load.is_finite())
+            .map(|load| load * (cores as f64 / after.host_cpus.max(1) as f64).min(1.0));
+        Some(load.map_or(busy * scale, |load| (busy * scale).max(load)))
+    }
+
+    /// The busy and total CPU time of the CPUs the process may run on (all of them if its
+    /// affinity cannot be read), from `/proc/stat` and `/proc/self/status`.
     #[cfg(target_os = "linux")]
-    fn cpu_ticks() -> Option<(u64, u64, usize)> {
+    fn cpu_ticks() -> Option<Ticks> {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
-        let first = stat.lines().next()?.strip_prefix("cpu ")?;
+        let allowed = std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                .and_then(|list| parse_cpu_list(list.trim()))
+        });
+        stat_ticks(&stat, allowed.as_deref())
+    }
+
+    /// The busy and total CPU time in a `/proc/stat`, of the CPUs `allowed` (all if `None`).
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn stat_ticks(stat: &str, allowed: Option<&[usize]>) -> Option<Ticks> {
         // user nice system idle iowait irq softirq steal (guest time is counted in user).
-        let ticks: Vec<u64> =
-            first.split_whitespace().take(8).map(str::parse).collect::<Result<_, _>>().ok()?;
-        let (total, idle) = (ticks.iter().sum::<u64>(), ticks.get(3)? + ticks.get(4)?);
-        let is_cpu = |line: &str| {
-            line.strip_prefix("cpu")
-                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        let busy_total = |fields: &str| -> Option<(u64, u64)> {
+            let ticks: Vec<u64> =
+                fields.split_whitespace().take(8).map(str::parse).collect::<Result<_, _>>().ok()?;
+            let (total, idle) = (ticks.iter().sum::<u64>(), ticks.get(3)? + ticks.get(4)?);
+            Some((total.checked_sub(idle)?, total))
         };
-        let cpus = stat.lines().filter(|line| is_cpu(line)).count();
-        Some((total - idle, total, cpus.max(1)))
+        let per_cpu: Vec<(usize, &str)> = stat
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("cpu")?;
+                let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+                Some((rest[..digits].parse().ok()?, &rest[digits..]))
+            })
+            .collect();
+        let host_cpus = per_cpu.len().max(1);
+        // The whole machine: with no affinity, or one naming none of the CPUs listed (e.g. a
+        // container whose /proc/stat numbers its CPUs from 0).
+        let whole = || {
+            let first = stat.lines().next()?.strip_prefix("cpu ")?;
+            let (busy, total) = busy_total(first)?;
+            let cpu_ids = per_cpu.iter().map(|(cpu, _)| *cpu).collect();
+            Some(Ticks { busy, total, cpu_ids, host_cpus })
+        };
+        let Some(allowed) = allowed.filter(|allowed| !allowed.is_empty()) else { return whole() };
+        let (mut busy, mut total, mut cpu_ids) = (0u64, 0u64, Vec::new());
+        for (cpu, fields) in per_cpu.iter().filter(|(cpu, _)| allowed.contains(cpu)) {
+            let (cpu_busy, cpu_total) = busy_total(fields)?;
+            busy += cpu_busy;
+            total += cpu_total;
+            cpu_ids.push(*cpu);
+        }
+        if cpu_ids.is_empty() {
+            return whole();
+        }
+        Some(Ticks { busy, total, cpu_ids, host_cpus })
+    }
+
+    /// Parses a Linux CPU list, e.g. `0-3,8,10-11`.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+        let mut cpus = Vec::new();
+        for part in list.split(',').filter(|part| !part.is_empty()) {
+            match part.split_once('-') {
+                Some((first, last)) => {
+                    let (first, last): (usize, usize) = (first.parse().ok()?, last.parse().ok()?);
+                    if last < first || last - first > 1 << 16 {
+                        return None;
+                    }
+                    cpus.extend(first..=last);
+                }
+                None => cpus.push(part.parse().ok()?),
+            }
+        }
+        Some(cpus)
     }
 
     /// The machine's busy and total CPU time (in ticks, summed over CPUs), and its CPU count,
     /// from the Mach host statistics.
     #[cfg(target_os = "macos")]
-    fn cpu_ticks() -> Option<(u64, u64, usize)> {
+    fn cpu_ticks() -> Option<Ticks> {
         unsafe extern "C" {
             fn mach_host_self() -> u32;
             fn host_statistics(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
@@ -145,11 +240,16 @@ mod cpu_usage {
         }
         let [user, system, idle, nice] = ticks.map(u64::from);
         let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        Some((user + system + nice, user + system + idle + nice, cpus))
+        Some(Ticks {
+            busy: user + system + nice,
+            total: user + system + idle + nice,
+            cpu_ids: (0..cpus).collect(),
+            host_cpus: cpus,
+        })
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn cpu_ticks() -> Option<(u64, u64, usize)> {
+    fn cpu_ticks() -> Option<Ticks> {
         None
     }
 }
@@ -245,8 +345,9 @@ const WAIT_VARIABLES: [&str; 2] = ["OMP_WAIT_POLICY", "GOMP_SPINCOUNT"];
 /// but when other work wants their cores, spinning threads take time from the threads doing the
 /// work, and training slows down many times over (about 100 times on an M5 with four times as
 /// much work as cores; over 10 times on Linux with one thread more than cores). So the policy
-/// follows the other work on the machine: the cores busy over 250 ms, from the CPU time
-/// counters, or the load average when every core is busy. With `threads` plus that work
+/// follows the other work on the CPUs this process may use: the cores busy over 250 ms, from the
+/// CPU time counters, or the load average when every core is busy (on Linux, measured on the
+/// process's affinity and scaled to its allowed cores). With `threads` plus that work
 /// (rounded) at most the available cores, threads spin for long; at most twice the cores,
 /// briefly; above that, they sleep at once.
 ///
@@ -271,7 +372,7 @@ pub fn wait_between_parallel_regions(threads: NonZeroUsize) -> WaitChoice {
     if let Some(var) = WAIT_VARIABLES.into_iter().find(|v| std::env::var_os(v).is_some()) {
         return WaitChoice { wait: OpenMpWait::FromEnvironment(var), threads, cores, busy: None };
     }
-    let busy = cpu_usage::busy_cores();
+    let busy = cpu_usage::busy_cores(cores);
     let wait = set_wait(OpenMpWait::for_load(threads, cores, busy));
     WaitChoice { wait, threads, cores, busy }
 }
@@ -1383,8 +1484,110 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn measures_the_other_work() {
-        let busy = cpu_usage::busy_cores().expect("the CPU time counters are readable");
+        let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let busy = cpu_usage::busy_cores(cores).expect("the CPU time counters are readable");
         assert!(busy.is_finite() && busy >= 0.0, "{busy}");
+    }
+
+    /// A `/proc/stat` of four CPUs, each with `busy` busy and 100 total ticks.
+    fn proc_stat(busy: [u64; 4]) -> String {
+        let line = |name: &str, busy: u64, total: u64| {
+            format!("{name} {busy} 0 0 {} 0 0 0 0 0 0\n", total - busy)
+        };
+        let mut stat = line("cpu ", busy.iter().sum(), 400);
+        for (cpu, busy) in busy.iter().enumerate() {
+            stat.push_str(&line(&format!("cpu{cpu}"), *busy, 100));
+        }
+        stat.push_str("intr 0\nctxt 0\n");
+        stat
+    }
+
+    #[test]
+    fn parses_cpu_lists() {
+        assert_eq!(cpu_usage::parse_cpu_list("0-3,8,10-11"), Some(vec![0, 1, 2, 3, 8, 10, 11]));
+        assert_eq!(cpu_usage::parse_cpu_list("5"), Some(vec![5]));
+        assert_eq!(cpu_usage::parse_cpu_list("3-1"), None);
+        assert_eq!(cpu_usage::parse_cpu_list("a"), None);
+    }
+
+    #[test]
+    fn measures_the_allowed_cpus() {
+        use cpu_usage::{Ticks, stat_ticks};
+        let stat = proc_stat([100, 100, 0, 50]);
+        let all = Ticks { busy: 250, total: 400, cpu_ids: vec![0, 1, 2, 3], host_cpus: 4 };
+        assert_eq!(stat_ticks(&stat, None), Some(all.clone()));
+        let two = Ticks { busy: 50, total: 200, cpu_ids: vec![2, 3], host_cpus: 4 };
+        assert_eq!(stat_ticks(&stat, Some(&[2, 3])), Some(two.clone()));
+        // CPUs the file does not list are ignored; with none listed, or no affinity, the whole
+        // machine is measured.
+        assert_eq!(stat_ticks(&stat, Some(&[2, 3, 9])), Some(two));
+        assert_eq!(stat_ticks(&stat, Some(&[9])), Some(all.clone()));
+        assert_eq!(stat_ticks(&stat, Some(&[])), Some(all));
+    }
+
+    #[rstest]
+    // Other work on half of 96 CPUs: half of an 8-core quota's share.
+    #[case::quota(96, 96, 8, 0.5, None, 4.0)]
+    // A cpuset of 8 CPUs with 2 of them busy.
+    #[case::cpuset(8, 96, 8, 0.25, None, 2.0)]
+    // Every allowed CPU busy: the load average, scaled from the machine's 96 CPUs to 8 cores.
+    #[case::load_average(8, 96, 8, 1.0, Some(192.0), 16.0)]
+    #[case::load_below_the_counters(8, 96, 8, 1.0, Some(24.0), 8.0)]
+    #[case::load_unreadable(8, 96, 8, 1.0, Some(f64::NAN), 8.0)]
+    // Half of one allowed CPU busy is not every CPU busy: the load average is not used.
+    #[case::half_of_one_cpu(1, 8, 1, 0.5, Some(24.0), 0.5)]
+    fn scales_the_other_work_to_the_allowed_cores(
+        #[case] cpus: usize,
+        #[case] host_cpus: usize,
+        #[case] cores: usize,
+        #[case] busy_fraction: f64,
+        #[case] load: Option<f64>,
+        #[case] expected: f64,
+    ) {
+        use cpu_usage::{Ticks, busy_between};
+        let before = Ticks { busy: 0, total: 0, cpu_ids: (0..cpus).collect(), host_cpus };
+        let total = 100 * cpus as u64;
+        let busy = (busy_fraction * total as f64) as u64;
+        let after = Ticks { busy, total, ..before.clone() };
+        let got = busy_between(before, after, cores, load).unwrap();
+        assert!((got - expected).abs() < 1e-9, "{got} != {expected}");
+    }
+
+    /// One thread on one allowed CPU of eight, half busy, under a load average of 24: the
+    /// counters, not the stale machine-wide load, choose the policy.
+    #[test]
+    fn a_half_busy_single_cpu_spins_briefly() {
+        use cpu_usage::{Ticks, busy_between};
+        let before = Ticks { busy: 0, total: 0, cpu_ids: vec![0], host_cpus: 8 };
+        let after = Ticks { busy: 50, total: 100, ..before.clone() };
+        let busy = busy_between(before, after, 1, Some(24.0));
+        assert_eq!(OpenMpWait::for_load(1, 1, busy), OpenMpWait::SpinBriefly);
+    }
+
+    #[test]
+    fn the_other_work_is_unknown_without_two_comparable_readings() {
+        use cpu_usage::{Ticks, busy_between};
+        let before = Ticks { busy: 10, total: 100, cpu_ids: (0..8).collect(), host_cpus: 8 };
+        // The CPUs measured changed between the readings.
+        let after = Ticks { busy: 20, total: 200, cpu_ids: (0..4).collect(), ..before.clone() };
+        assert_eq!(busy_between(before.clone(), after, 8, None), None);
+        // No time passed, or the counters went backwards.
+        assert_eq!(busy_between(before.clone(), before.clone(), 8, None), None);
+        let backwards = Ticks { total: 50, ..before.clone() };
+        assert_eq!(busy_between(before, backwards, 8, None), None);
+    }
+
+    /// The affinity moved from CPU 0 to CPU 1 between the readings: the counters of two CPUs
+    /// are not comparable, though their number is the same.
+    #[test]
+    fn the_other_work_is_unknown_when_the_cpus_measured_change() {
+        use cpu_usage::{Ticks, busy_between};
+        let before = Ticks { busy: 100, total: 1000, cpu_ids: vec![0], host_cpus: 2 };
+        let after = Ticks { busy: 900, total: 1025, cpu_ids: vec![1], host_cpus: 2 };
+        assert_eq!(busy_between(before.clone(), after.clone(), 1, Some(6.0)), None);
+        // On the same CPU, the same counters show it busy.
+        let same = Ticks { cpu_ids: vec![0], ..after };
+        assert!(busy_between(before, same, 1, Some(6.0)).is_some());
     }
 
     #[test]

@@ -18,15 +18,15 @@ that is not a positive number is ignored, with a warning.
 
 ## How idle threads wait
 
-At the start of `train`, winnowr measures the other work on the machine (the cores busy over
-250 ms, or the load average when every core is busy) and sets how XGBoost's OpenMP threads wait
-between parallel steps. If the threads fit on the free cores, they keep polling for the next step
-for a while (fastest); if the machine is busy, they poll only briefly; with more than twice as
-much work as cores, they sleep at once. Polling threads on a busy machine slowed training down
-10-100 times. The choice is logged at debug level (`RUST_LOG=winnowr=debug`) and does not change
-the model. Setting `OMP_WAIT_POLICY`, or `KMP_BLOCKTIME` (macOS) or `GOMP_SPINCOUNT` (Linux),
-overrides it. On Linux, winnowr can set the wait only when GCC's OpenMP runtime is linked
-statically (see `xgboost/build.rs`).
+At the start of `train`, winnowr measures the other work on the CPUs it may use (the cores busy over
+250 ms, or the load average when every core is busy; on Linux, within its CPU affinity and container
+CPU limit) and sets how XGBoost's OpenMP threads wait between parallel steps. If the threads fit on
+the free cores, they keep polling for the next step for a while (fastest); if the machine is busy,
+they poll only briefly; with more than twice as much work as cores, they sleep at once. Polling
+threads on a busy machine slowed training down 10-100 times. The choice is logged at debug level
+(`RUST_LOG=winnowr=debug`) and does not change the model. Setting `OMP_WAIT_POLICY`, or
+`KMP_BLOCKTIME` (macOS) or `GOMP_SPINCOUNT` (Linux), overrides it. On Linux, winnowr can set the
+wait only when GCC's OpenMP runtime is linked statically (see `xgboost/build.rs`).
 
 ## OpenMP environment variables that `train` refuses
 
