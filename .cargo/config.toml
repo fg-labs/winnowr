@@ -1,0 +1,9 @@
+[alias]
+ci-test = "nextest run --workspace --locked --no-tests=pass"
+# nextest does not run doctests.
+ci-doctest = "test --doc --workspace --locked"
+ci-fmt = "fmt --all -- --check"
+ci-lint = "clippy --workspace --all-targets --all-features --locked -- -D warnings"
+# `cargo doc` takes no trailing rustdoc args, hence `--config`. A string rather than an array:
+# cargo concatenates array values from nested configs but replaces strings.
+ci-doc = "doc --workspace --no-deps --locked --config build.rustdocflags=[\"-D\",\"warnings\"]"

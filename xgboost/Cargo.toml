@@ -1,0 +1,52 @@
+[package]
+name = "winnowr-xgboost"
+version.workspace = true
+authors.workspace = true
+description = "Statically linked XGBoost (vendored source) with a small safe API, for winnowr."
+edition.workspace = true
+rust-version.workspace = true
+# The crate's own code is MIT; the vendored XGBoost and dmlc-core sources are Apache-2.0.
+license = "MIT AND Apache-2.0"
+repository.workspace = true
+keywords = ["xgboost", "machine-learning", "ffi"]
+categories = ["external-ffi-bindings", "science"]
+links = "xgboost"
+# Ship only the parts of the vendored source tree that the CMake build needs.
+include = [
+    "/Cargo.toml",
+    "/build.rs",
+    "/build/*.rs",
+    "/src/**",
+    "/README.md",
+    "/LICENSE-MIT",
+    # winnowr's fixes to the vendored sources, applied by build.rs to a copy of them.
+    "/patches/*.patch",
+    # Keeps the patches directory, which build.rs reads, when there are no patches.
+    "/patches/.gitkeep",
+    "/vendor/xgboost/CMakeLists.txt",
+    "/vendor/xgboost/LICENSE",
+    "/vendor/xgboost/NEWS.md",
+    "/vendor/xgboost/cmake/**",
+    "/vendor/xgboost/include/**",
+    "/vendor/xgboost/src/**",
+    "/vendor/xgboost/plugin/**",
+    "/vendor/xgboost/dmlc-core/CMakeLists.txt",
+    "/vendor/xgboost/dmlc-core/LICENSE",
+    "/vendor/xgboost/dmlc-core/cmake/**",
+    "/vendor/xgboost/dmlc-core/include/**",
+    "/vendor/xgboost/dmlc-core/src/**",
+]
+
+[dependencies]
+serde_json = "1.0.154"
+
+[build-dependencies]
+cc = "1.11.2"
+cmake = "0.1.58"
+
+[dev-dependencies]
+rstest = "0.28.0"
+
+[package.metadata.dist]
+# A library: dist builds and ships only the winnowr binary.
+dist = false

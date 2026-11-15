@@ -1,0 +1,114 @@
+[workspace]
+# winnowr-xgboost builds the vendored XGBoost statically; it is published with winnowr.
+members = ["xgboost"]
+
+# Metadata shared by both crates. The toolchain used for development and CI is pinned in
+# rust-toolchain.toml; rust-version is the oldest Rust the crates support, tested in CI.
+[workspace.package]
+version = "0.1.0"
+authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
+edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/fg-labs/winnowr"
+
+[package]
+name = "winnowr"
+version.workspace = true
+authors.workspace = true
+description = "Machine-learned genotyping and filtering of germline small-variant calls."
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+readme = "README.md"
+repository.workspace = true
+keywords = ["bioinformatics", "genomics", "vcf", "variant-calling", "xgboost"]
+categories = ["science::bioinformatics", "command-line-utilities"]
+# Ship only what's needed to build the crate; keep docs and CI out of the published tarball.
+exclude = ["/docs", "/.github"]
+
+[[bin]]
+name = "winnowr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+# Feature tables: columnar in memory (Arrow), Parquet on disk. Snappy reads tables written by
+# the Python version; zstd writes new ones.
+arrow-array = "60.1.0"
+arrow-schema = "60.1.0"
+arrow-select = "60.1.0"
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+env_logger = "0.11.11"
+# Reads gzipped and BGZF-compressed text inputs (e.g. BED files).
+flate2 = "1.1.11"
+# Ordered maps for metadata that keeps the order it was given in (e.g. contigs).
+indexmap = { version = "2.14.2", features = ["serde"] }
+log = "0.4.35"
+mimalloc = { version = "0.1.52", default-features = false }
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "snap", "zstd"] }
+rayon = "1.12.0"
+# VCF/BCF and BAM I/O, with htslib built from source and linked statically.
+rust-htslib = { version = "1.0.2", default-features = false, features = ["bzip2", "lzma", "libdeflate", "static"] }
+# Build htslib's bzip2 and xz from source and link them statically, rather than linking the
+# system libraries found by pkg-config, so the binary is self-contained.
+bzip2-sys = { version = "0.1.13", features = ["static"] }
+lzma-sys = { version = "0.1.20", features = ["static"] }
+# Scratch directories for files written in parallel and then concatenated (e.g. scored VCF
+# shards).
+tempfile = "3.27.0"
+# The feature table metadata, stored as JSON in the Parquet schema.
+serde = { version = "1.0.229", features = ["derive"] }
+# Correctly rounded float parsing, so model files read back exactly what was written.
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+# XGBoost, built from the vendored source and linked statically with OpenMP, so the binary is
+# self-contained (see xgboost/build.rs).
+winnowr-xgboost = { version = "0.1.0", path = "xgboost" }
+
+# On Linux, mimalloc also replaces malloc for the C and C++ code (XGBoost, htslib, the OpenMP
+# runtime), so their allocations come from mimalloc's arenas, which it marks for transparent huge
+# pages (madvise). Training is bound by memory latency, and XGBoost's large buffers otherwise sit
+# on 4 KiB pages unless THP is turned on system-wide (see the README's "Performance tuning").
+[target.'cfg(target_os = "linux")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false, features = ["override"] }
+
+[dev-dependencies]
+rstest = "0.28.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# The profile that 'dist' builds release binaries with: the release profile, so CI's
+# `--release` checks and benchmarks test exactly what ships.
+[profile.dist]
+inherits = "release"
+
+# Release binaries and installers, built by `dist` (see .github/workflows/release.yml, which is
+# generated from this config by `dist generate`).
+[workspace.metadata.dist]
+cargo-dist-version = "0.34.0"
+ci = "github"
+installers = ["shell"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+install-path = "CARGO_HOME"
+install-updater = false
+# release.yml is generated, then given version comments on its pinned actions.
+allow-dirty = ["ci"]
+# Native runners for every target: XGBoost is C++ built from source.
+# Ubuntu 22.04 keeps the Linux binaries compatible with glibc 2.35 and newer.
+github-custom-runners = { aarch64-apple-darwin = "macos-15", aarch64-unknown-linux-gnu = "ubuntu-22.04-arm", x86_64-unknown-linux-gnu = "ubuntu-22.04" }
+
+# libomp.a for the static OpenMP link on macOS (see xgboost/build.rs).
+[workspace.metadata.dist.dependencies.homebrew]
+libomp = "*"
+
+# libclang for bindgen, which builds rust-htslib's htslib bindings on Linux.
+[workspace.metadata.dist.dependencies.apt]
+libclang-dev = "*"
+
+# Pin the actions in the generated release workflow by commit, at the same versions as the other
+# workflows. Dependabot does not bump release.yml (`dist generate` would undo it): bump these.
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+"actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9" # v7.0.2
+"actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8.0.2

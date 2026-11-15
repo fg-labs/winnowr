@@ -1,0 +1,213 @@
+name: Check and Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# The Rust toolchain comes from rust-toolchain.toml (`rustup toolchain install` with no name
+# installs it), so the version is written in one place. Jobs that compile use sccache and set
+# RUSTC_WRAPPER themselves, next to the step that installs it.
+
+jobs:
+  # Tests run natively on every release target: XGBoost (with static OpenMP) is built from C++
+  # source, so linking differs per platform.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15]
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          # No job here pushes, so the token is not persisted into .git/config where a build
+          # script could read it. Same for every job below.
+          persist-credentials: false
+      - name: Install libomp (static OpenMP for XGBoost)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+      - name: Install libclang (bindgen, for htslib)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libclang-dev
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Install nextest
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest@0.9.151
+      - name: Unit tests
+        run: cargo ci-test
+      - name: Doctests
+        run: cargo ci-doctest
+      # Release binaries are built by dist with the `dist` profile, which is the release profile.
+      - name: Release binary is self-contained
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          binary=target/release/winnowr
+          "$binary" --version
+          if [ "$RUNNER_OS" = macOS ]; then libs=$(otool -L "$binary"); else libs=$(ldd "$binary"); fi
+          echo "$libs"
+          if grep -E 'xgboost|omp|hts|bz2|lzma|deflate' <<< "$libs"; then
+            echo "::error::winnowr links XGBoost, OpenMP or htslib and its codecs dynamically"
+            exit 1
+          fi
+
+  # Builds and tests in Debian 12 (bookworm), with only the packages a Debian image needs to
+  # build winnowr (see docs/Dockerfile.bookworm), on x86_64 and aarch64. Debian's GCC and its
+  # position-independent libgomp.a differ from Ubuntu 22.04's, and pipelines build winnowr there.
+  debian:
+    name: debian (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    container: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      # git before checkout, so that it clones (with the submodules) rather than downloading an
+      # archive without them.
+      - name: Install the build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl git gcc g++ make cmake libclang-dev
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Release binary is self-contained
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          binary=target/release/winnowr
+          "$binary" --version
+          libs=$(ldd "$binary")
+          echo "$libs"
+          if grep -E 'xgboost|omp|hts|bz2|lzma|deflate' <<< "$libs"; then
+            echo "::error::winnowr links XGBoost, OpenMP or htslib and its codecs dynamically"
+            exit 1
+          fi
+
+  # Builds and tests on the oldest supported Rust (Cargo.toml `rust-version`), so that a change
+  # using a newer API can't silently break `cargo install` for users on that version.
+  msrv:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install libclang (bindgen, for htslib)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libclang-dev
+      - name: Install the oldest supported Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "::error::no rust-version in Cargo.toml"
+            exit 1
+          fi
+          rustup toolchain install "$msrv" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+      - name: Test on the oldest supported Rust
+        run: cargo test --workspace --locked
+
+  lint:
+    runs-on: ubuntu-22.04
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install libclang (bindgen, for htslib)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libclang-dev
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Clippy check
+        run: cargo ci-lint
+
+  format:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Rustfmt check
+        run: cargo ci-fmt
+
+  # Catches unresolved intra-doc links, which neither `cargo build` nor clippy reports.
+  docs:
+    runs-on: ubuntu-22.04
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install libclang (bindgen, for htslib)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libclang-dev
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Rustdoc check
+        run: cargo ci-doc
+
+  # The published winnowr-xgboost crate ships a subset of the vendored sources (its `include`
+  # list); check that the packaged crate still builds on its own.
+  package:
+    runs-on: ubuntu-22.04
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Package and build winnowr-xgboost
+        run: cargo package --locked -p winnowr-xgboost

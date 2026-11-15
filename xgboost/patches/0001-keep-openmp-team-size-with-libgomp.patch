@@ -1,0 +1,86 @@
+Keep the OpenMP team size fixed with libgomp.
+
+XGBoost master caps each ParallelFor's team at its loop size (dmlc/xgboost#12792) and each
+ParallelFor2d's at its block count (#12803). With libgomp, team sizes that vary from region to
+region are very slow (it retires and re-creates threads), and a lossguide tree has many tiny
+regions per node. This keeps the team at the requested size when built against libgomp's omp.h,
+keeps the caps with other runtimes (LLVM libomp on macOS), and runs a single iteration or block
+inline with no parallel region. Results are unchanged.
+
+Source: nh13/xgboost commit 486b2719b (patch 0001 of the series against 293cad1a8). Only the src/
+hunks are carried here: build.rs builds XGBoost's sources, not its C++ tests, which are in the
+upstream patch.
+
+Applied by build.rs to a copy of the vendored sources (paths are relative to the XGBoost root).
+
+diff --git a/src/common/openmp_exec.h b/src/common/openmp_exec.h
+index 2b40b095b..3c8cae26d 100644
+--- a/src/common/openmp_exec.h
++++ b/src/common/openmp_exec.h
+@@ -22,6 +22,23 @@
+ namespace xgboost::common {
+ // Without OpenMP, the pragmas are ignored and dmlc's OpenMP stubs run loops serially.
+ struct OpenMPExecutor {
++  /**
++   * @brief Whether a parallel region always uses the requested number of threads.
++   *
++   * Regions smaller than the thread count normally get a smaller team, which saves waking idle
++   * threads. GCC's libgomp, however, retires the extra threads when a team shrinks and starts
++   * new ones when it grows again, so team sizes that vary from region to region (as in a
++   * lossguide tree, with many tiny regions per node) are many times slower than a fixed team.
++   * With libgomp the team therefore stays at the requested size and threads without work skip
++   * the loop. The check keys on libgomp's omp.h, a compile-time proxy for the runtime that is
++   * loaded at run time; it is false without OpenMP.
++   */
++#if defined(_LIBGOMP_OMP_LOCK_DEFINED)
++  static constexpr bool kFixedTeam = true;
++#else
++  static constexpr bool kFixedTeam = false;
++#endif
++
+   [[nodiscard]] static std::int32_t MaxNumWorkers() noexcept {
+ #if !defined(_OPENMP)
+     return 1;
+@@ -53,7 +70,9 @@ struct OpenMPExecutor {
+     if (size <= 0) {
+       return;
+     }
+-    n_threads = static_cast<std::int32_t>(std::min<std::size_t>(n_threads, size));
++    if (!kFixedTeam) {
++      n_threads = static_cast<std::int32_t>(std::min<std::size_t>(n_threads, size));
++    }
+ 
+     auto&& callback = detail::BindWorker(fn, [] { return Worker{omp_get_thread_num()}; });
+     dmlc::OMPException exc;
+@@ -115,7 +134,15 @@ struct OpenMPExecutor {
+     if (n_blocks_in_space == 0) {
+       return;
+     }
+-    n_threads = static_cast<std::int32_t>(std::min<std::size_t>(n_threads, n_blocks_in_space));
++    if (n_blocks_in_space == 1) {
++      // Run a single block on the calling thread without starting a parallel region.
++      auto&& callback = detail::BindWorker(fn, [] { return Worker{0}; });
++      callback(space.GetFirstDimension(0), space.GetRange(0));
++      return;
++    }
++    if (!kFixedTeam) {
++      n_threads = static_cast<std::int32_t>(std::min<std::size_t>(n_threads, n_blocks_in_space));
++    }
+ 
+     dmlc::OMPException exc;
+ #pragma omp parallel num_threads(n_threads)
+diff --git a/src/common/threading_utils.h b/src/common/threading_utils.h
+index fbd57e161..4370d77b8 100644
+--- a/src/common/threading_utils.h
++++ b/src/common/threading_utils.h
+@@ -144,8 +144,8 @@ void ParallelFor2d(BlockedSpace2d const& space, std::int32_t n_threads, WithWork
+ 
+ template <typename Index, typename Func>
+ void ParallelFor(Index size, std::int32_t n_threads, Sched sched, Func&& fn) {
+-  if (n_threads == 1) {
+-    // early exit
++  if (n_threads == 1 || size == 1) {
++    // Run serially on the calling thread without starting a parallel region.
+     auto&& callback = detail::BindWorker(fn, [] { return Worker{0}; });
+     for (Index i = 0; i < size; ++i) {
+       callback(i);

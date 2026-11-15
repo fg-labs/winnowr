@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1.7
+#
+# A reference image for winnowr on Debian 12 (bookworm), for pipelines to adapt: winnowr is built
+# from a release's source tarball, checked against its sha256, in a build stage, and only the
+# binary is copied into a slim runtime stage. It builds for linux/amd64 and linux/arm64. The build
+# context is not used, so any directory will do:
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 -f docs/Dockerfile.bookworm \
+#       --build-arg WINNOWR_VERSION=0.1.0 --build-arg WINNOWR_SHA256=<sha256> .
+#
+# Each GitHub release of fg-labs/winnowr (from v0.1.0) carries the source tarball,
+# winnowr-<version>-src.tar.gz, and its sha256, in winnowr-<version>-src.tar.gz.sha256: give that
+# sha256 as WINNOWR_SHA256. The tarball holds the vendored XGBoost sources (the
+# xgboost/vendor/xgboost git submodule), which GitHub's automatic archive/<tag>.tar.gz leaves out,
+# so that archive cannot be built. To build from another tarball made the same way (see
+# docs/DEVELOPING.md, "Making a release"), e.g. a mirror, give its URL as WINNOWR_SRC_URL and its
+# sha256 as WINNOWR_SHA256.
+#
+# The build needs, beyond Rust (the version in rust-toolchain.toml) and the C compiler and
+# libc headers of the rust image: g++ and make (XGBoost, htslib and its codecs, built from
+# source), cmake (XGBoost) and libclang-dev (bindgen, for htslib's bindings). Nothing else is
+# installed: htslib's zlib, bzip2, xz and libdeflate are built from source and linked statically,
+# and htslib is built without network (curl) support.
+#
+# GCC's OpenMP runtime is linked statically: Debian builds libgomp.a position-independent, so the
+# default (PIE) build links it, and the binary needs only the C and C++ runtimes (libc6,
+# libstdc++6, libgcc-s1), which debian:bookworm-slim has.
+
+# Debian bookworm with Rust 1.100.0 (rust-toolchain.toml's channel), a multi-arch index digest.
+FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ make cmake libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG WINNOWR_VERSION
+ARG WINNOWR_SHA256
+ARG WINNOWR_SRC_URL=https://github.com/fg-labs/winnowr/releases/download/v${WINNOWR_VERSION}/winnowr-${WINNOWR_VERSION}-src.tar.gz
+RUN if [ -z "${WINNOWR_SHA256}" ]; then \
+        echo "give --build-arg WINNOWR_SHA256=<the source tarball's sha256>" >&2; exit 1; \
+    fi; \
+    case "${WINNOWR_SRC_URL}" in \
+        */download/v/*) echo "give --build-arg WINNOWR_VERSION=<version> (or WINNOWR_SRC_URL)" >&2; \
+                        exit 1 ;; \
+    esac
+ADD --checksum=sha256:${WINNOWR_SHA256} ${WINNOWR_SRC_URL} /src/winnowr.tar.gz
+RUN mkdir -p /src/winnowr \
+    && tar -xzf /src/winnowr.tar.gz -C /src/winnowr --strip-components 1
+WORKDIR /src/winnowr
+# RUSTUP_TOOLCHAIN uses the image's toolchain as it is, rather than letting rust-toolchain.toml
+# add the development components (rustfmt, clippy) that a build does not need.
+ENV RUSTUP_TOOLCHAIN=1.100.0
+RUN cargo build --release --locked \
+    && install -m 0755 target/release/winnowr /usr/local/bin/winnowr \
+    && winnowr --version \
+    && ldd /usr/local/bin/winnowr \
+    && if ldd /usr/local/bin/winnowr | grep -E 'gomp|xgboost|hts|bz2|lzma|deflate'; then \
+           echo "winnowr links OpenMP, XGBoost or htslib dynamically" >&2; exit 1; \
+       fi
+
+# The same Debian release as the build stage, so the C and C++ runtimes match.
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+# procps provides ps, which Nextflow uses to collect task metrics; time is GNU time, for
+# per-step resource reports. winnowr itself needs nothing beyond the base image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends procps time \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/winnowr /usr/local/bin/winnowr
+RUN winnowr --version

@@ -1,0 +1,65 @@
+name: Supply chain (cargo-deny)
+
+# Runs on every PR (so a PR that adds a problematic dependency fails review) and weekly (so a new
+# advisory against an existing dependency surfaces even on a quiet repo).
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 12 * * 1" # Mondays 12:00 UTC
+  workflow_dispatch:
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
+
+  # Dependabot cannot track the vendored XGBoost (a submodule pinned to a release tag or, between
+  # releases, an upstream master commit), so check it against upstream's latest release on the
+  # same schedule: the vendored version (from its headers) must not be older, and a master commit
+  # whose headers give the latest release's version (a snapshot from before that release) must
+  # move to the release's tag.
+  vendored-xgboost:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Compare with the latest XGBoost release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          header=xgboost/vendor/xgboost/include/xgboost/version_config.h
+          component() { sed -n "s/^#define XGBOOST_VER_$1 \([0-9]*\).*/\1/p" "$header"; }
+          vendored="v$(component MAJOR).$(component MINOR).$(component PATCH)"
+          latest=$(gh api repos/dmlc/xgboost/releases/latest --jq .tag_name)
+          echo "Vendored XGBoost: $vendored ($(git -C xgboost/vendor/xgboost rev-parse HEAD)); latest release: $latest"
+          if [ "$(printf '%s\n%s\n' "$vendored" "$latest" | sort -V | tail -n 1)" != "$vendored" ]; then
+            echo "::error::the vendored XGBoost ($vendored) is behind the latest release ($latest); see docs/DEVELOPING.md"
+            exit 1
+          fi
+          # The headers of master give the next release's number before it is tagged, so a master
+          # commit can match the latest release's number without being that release.
+          if [ "$vendored" = "$latest" ]; then
+            commit=$(git -C xgboost/vendor/xgboost rev-parse HEAD)
+            released=$(gh api "repos/dmlc/xgboost/commits/$latest" --jq .sha)
+            if [ "$commit" != "$released" ]; then
+              echo "::error::the vendored XGBoost ($commit) is not the $latest release ($released) but has its version: a pre-release master commit; move it to the $latest tag (see docs/DEVELOPING.md)"
+              exit 1
+            fi
+          fi

@@ -1,0 +1,25 @@
+[workspace]
+# path of the git-cliff configuration
+changelog_config = "cliff.toml"
+# update dependencies with `cargo update`
+dependencies_update = true
+# labels for the release PR
+pr_labels = ["release"]
+# GitHub releases are created by the dist release workflow (.github/workflows/release.yml)
+git_release_enable = false
+# disable running `cargo-semver-checks` until after the first release
+semver_check = false
+# publish only when a release PR is merged, not whenever main has an unpublished version (the
+# default would publish 0.1.0 as soon as the first commit lands on main)
+release_always = false
+
+# The binary: its `vX.Y.Z` tag triggers the dist release workflow.
+[[package]]
+name = "winnowr"
+git_tag_name = "v{{ version }}"
+
+# The library: published to crates.io with winnowr, but not tagged or given its own changelog.
+[[package]]
+name = "winnowr-xgboost"
+git_tag_enable = false
+changelog_update = false
