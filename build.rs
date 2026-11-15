@@ -12,7 +12,9 @@ fn main() {
 
     // Printing any rerun-if-changed turns off Cargo's default of rerunning on every package
     // file change, so list the files whose edits change the dirty state, as well as the git
-    // files that change on a commit, a checkout or staging.
+    // files that change on a commit, a checkout or staging. Only paths that exist are listed:
+    // Cargo treats a missing one as always changed, and the crate published to crates.io has no
+    // `xgboost/` directory.
     let code = [
         "build.rs",
         "Cargo.toml",
@@ -24,7 +26,7 @@ fn main() {
         "xgboost/patches",
         "xgboost/src",
     ];
-    for path in code {
+    for path in code.into_iter().filter(|path| manifest_dir.join(path).exists()) {
         println!("cargo:rerun-if-changed={path}");
     }
 

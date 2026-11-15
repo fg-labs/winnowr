@@ -23,8 +23,15 @@ readme = "README.md"
 repository.workspace = true
 keywords = ["bioinformatics", "genomics", "vcf", "variant-calling", "xgboost"]
 categories = ["science::bioinformatics", "command-line-utilities"]
-# Ship only what's needed to build the crate; keep docs and CI out of the published tarball.
-exclude = ["/docs", "/.github"]
+# Ship only what's needed to build the crate (winnowr-xgboost is its own package); keep docs, CI
+# and development configuration (e.g. rust-toolchain.toml, .cargo/) out of the published crate.
+# Cargo adds Cargo.toml, Cargo.lock and the readme itself.
+include = ["/build.rs", "/src/**", "/LICENSE", "/CHANGELOG.md"]
+
+# docs.rs documents Linux only: winnowr-xgboost supports only macOS and Linux, and docs.rs does not
+# cross-compile htslib's C for macOS.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [[bin]]
 name = "winnowr"
