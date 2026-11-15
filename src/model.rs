@@ -394,9 +394,9 @@ impl WinnowrModel {
                 self.info.features.join(", ")
             );
         }
-        // An empty prediction reports the booster's outputs per row.
-        let empty = named_matrix(&[], 0, &self.info.features, NonZeroUsize::MIN)?;
-        let classes = self.booster.predict(&empty)?.shape.get(1).copied().unwrap_or(0);
+        // Read from the booster's config: predicting an empty matrix would report it too, but
+        // XGBoost then warns "Empty dataset".
+        let classes = self.booster.outputs_per_row()?;
         if classes != self.info.num_classes() {
             bail!(
                 "the booster predicts {classes} classes, but a {} model has {}",
