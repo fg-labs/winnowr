@@ -223,7 +223,8 @@ const SHARD_SPAN: u64 = 5_000_000;
 /// # Errors
 ///
 /// Returns an error if a region is malformed, its contig is not in the VCF header or the
-/// reference, or it overlaps another region (its records would be measured twice).
+/// reference, it starts past the contig's end, or it overlaps another region (its records would
+/// be measured twice).
 fn plan_shards<S: AsRef<str>>(
     inputs: &ReadInputs<'_>,
     regions: &[S],
@@ -244,7 +245,7 @@ fn plan_shards<S: AsRef<str>>(
                 region.as_ref_str()
             );
         }
-        let length = fasta.length(&region.chrom).with_context(|| {
+        let length = fasta.checked_length(&region.chrom)?.with_context(|| {
             format!(
                 "contig {} is not in the reference {}",
                 region.chrom,
@@ -257,6 +258,15 @@ fn plan_shards<S: AsRef<str>>(
         let vcf_length = summary.contig_lengths.get(&region.chrom).copied().flatten();
         let extent = length.max(vcf_length.unwrap_or(0)).max(1);
         let (start, end) = region.span.unwrap_or((1, extent));
+        // A span past the contig's end (e.g. of another build) would give no shards and an empty
+        // table; one that only runs past it is clamped.
+        if start > extent {
+            bail!(
+                "region {} starts past the end of contig {} ({extent} bp)",
+                region.as_ref_str(),
+                region.chrom
+            );
+        }
         let end = end.min(extent);
         let overlapped = planned.iter().find(|(chrom, other_start, other_end, _)| {
             *chrom == region.chrom && start <= *other_end && *other_start <= end
@@ -268,11 +278,18 @@ fn plan_shards<S: AsRef<str>>(
             );
         }
         planned.push((region.chrom.clone(), start, end, region.as_ref_str()));
+        // Shards split the span up to the reference's (checked) length; any rest, past the
+        // reference (where records are an error) and sized only by the VCF header, is the last
+        // shard's, so a corrupt header length cannot make countless shards.
+        let split_end = end.min(length.max(start));
         let mut shard_start = start;
-        while shard_start <= end {
-            let shard_end = (shard_start + SHARD_SPAN - 1).min(end);
+        while shard_start <= split_end {
+            let shard_end = (shard_start + SHARD_SPAN - 1).min(split_end);
             shards.push((region.chrom.clone(), shard_start, shard_end));
             shard_start = shard_end + 1;
+        }
+        if let Some(last) = shards.last_mut() {
+            last.2 = end;
         }
     }
     Ok(shards)
@@ -472,6 +489,36 @@ mod tests {
     fn parses_regions(#[case] text: &str, #[case] chrom: &str, #[case] span: Option<(u64, u64)>) {
         let region = Region::parse(text, &["chr1", "HLA-A*01:01"]).unwrap();
         assert_eq!(region, Region { chrom: chrom.to_string(), span });
+    }
+
+    #[test]
+    fn plans_shards_clamping_spans_to_the_contig() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reference = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(1000))]);
+        let inputs = ReadInputs {
+            vcf: Path::new("unused.vcf.gz"),
+            alignments: Path::new("unused.bam"),
+            reference: &reference,
+        };
+        let summary = crate::vcf::VcfSummary {
+            samples: vec!["S1".to_string()],
+            contig_lengths: [("chr1".to_string(), Some(1000))].into_iter().collect(),
+        };
+        let shards = plan_shards(&inputs, &["chr1:900-5000"], &summary).unwrap();
+        assert_eq!(shards, [("chr1".to_string(), 900, 1000)]);
+        // A VCF header length past the reference's is one more span of the last shard, however
+        // long.
+        let long = crate::vcf::VcfSummary {
+            contig_lengths: [("chr1".to_string(), Some(u64::MAX))].into_iter().collect(),
+            ..summary.clone()
+        };
+        let shards = plan_shards(&inputs, &["chr1"], &long).unwrap();
+        assert_eq!(shards, [("chr1".to_string(), 1, u64::MAX)]);
+        let error = plan_shards(&inputs, &["chr1:5000-6000"], &summary).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "region chr1:5000-6000 starts past the end of contig chr1 (1000 bp)"
+        );
     }
 
     #[rstest]

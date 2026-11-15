@@ -33,7 +33,8 @@ use up some of it, and the counts can be lower than the depth.
 `--settings` changes the counting, as comma-separated settings over the defaults
 `mapq20,bq10,flank5`: `mapqN` (the lowest MAPQ of the high bin), `bqN` (the minimum base quality of
 a SNP base) and `flankN` (the aligned flank bases an indel read needs on each side of the repeat
-tract). The settings are written at the top of the table and kept in the feature table.
+tract, at most 10000). The settings are written at the top of the table and kept in the feature
+table.
 
 ## Training and scoring
 

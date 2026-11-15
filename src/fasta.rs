@@ -89,6 +89,20 @@ impl IndexedFasta {
         self.entries.get(name).map(|entry| entry.length)
     }
 
+    /// The length of a sequence, checked against the FASTA's size, or `None` if the index does
+    /// not have it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index places the sequence's end past the end of the file.
+    pub fn checked_length(&self, name: &str) -> Result<Option<u64>> {
+        let Some(entry) = self.entries.get(name) else { return Ok(None) };
+        if entry.length > 0 {
+            self.span(name, entry, 0, entry.length)?;
+        }
+        Ok(Some(entry.length))
+    }
+
     /// The bytes of the file holding `[start, end)` of a sequence (0-based; `start < end`), as
     /// `(first, last)` (half-open).
     ///
@@ -190,8 +204,14 @@ mod tests {
             std::fs::write(&fai, format!("chr1\t{length}\t6\t60\t61\n")).unwrap();
             let mut fasta = IndexedFasta::from_path(&path).unwrap();
             assert_eq!(fasta.fetch_all("chr1").unwrap_err().to_string(), expected, "{length}");
+            assert_eq!(fasta.checked_length("chr1").unwrap_err().to_string(), expected);
             assert_eq!(fasta.length("chr1"), Some(length));
         }
+        // A sequence that fits passes the check.
+        std::fs::write(&fai, "chr1\t4\t6\t60\t61\n").unwrap();
+        let fasta = IndexedFasta::from_path(&path).unwrap();
+        assert_eq!(fasta.checked_length("chr1").unwrap(), Some(4));
+        assert_eq!(fasta.checked_length("chr9").unwrap(), None);
     }
 
     #[test]

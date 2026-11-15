@@ -26,7 +26,7 @@ per `--regions` range) to `extract --strlen` or `score --strlen`.
 `--reads` sets which reads measure the tracts, as comma-separated settings over the defaults:
 
 - `mapqN`: only reads with MAPQ of at least N (default 20),
-- `flankN`: N aligned flank bases on each side of the tract (default 5),
+- `flankN`: N aligned flank bases on each side of the tract (default 5, at most 10000),
 - `legacy`: `mapq0,flank2`, as winnowr measured before the settings were recorded.
 
 The settings are written at the top of the strlen table, kept in the feature table and recorded in

@@ -44,7 +44,8 @@ winnowr score --vcf sample.vcf.gz --gvcf sample.g.vcf.gz --models snp.winnowr.js
 ```
 
 `strlen` and `pileup` measure the autosomes `chr1` to `chr22` by default; `--regions` takes other
-contigs or ranges (e.g. `chr22:20000000-30000000`).
+contigs or ranges (e.g. `chr22:20000000-30000000`). A range that starts past its contig's end is an
+error.
 
 `sample.winnowr.vcf.gz` holds every record of `sample.vcf.gz`: dropped calls get FILTER
 `WinnowrDrop`, and scored calls get the models' probabilities in INFO.
