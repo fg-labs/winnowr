@@ -259,6 +259,11 @@ const WAIT_VARIABLES: [&str; 2] = ["OMP_WAIT_POLICY", "GOMP_SPINCOUNT"];
 /// Setting `OMP_WAIT_POLICY`, or `KMP_BLOCKTIME` (macOS) or `GOMP_SPINCOUNT` (Linux), leaves the
 /// runtime as the environment sets it. Models are unchanged by how threads wait.
 ///
+/// On macOS the blocktime also sets XGBoost's team sizes (patch 0002 in `patches/`): with a
+/// positive blocktime every parallel region uses all `threads`, and with 0 each region's team is
+/// capped at its work, which saves waking threads that would sleep at once. Models are unchanged
+/// by that too (`tests/blocktime.rs`).
+///
 /// Call it before XGBoost first runs: on macOS, later calls have no effect.
 pub fn wait_between_parallel_regions(threads: NonZeroUsize) -> WaitChoice {
     let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
