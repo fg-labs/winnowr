@@ -36,7 +36,7 @@ use crate::common::{PASS, Task, has_suffix, is_bgzf_path};
 use crate::labels::Label;
 use crate::policy::{CallKey, Decision};
 use crate::shards::{ReaderPool, contig_shards};
-use crate::vcf::{FieldReader, filter_string};
+use crate::vcf::{DeclaredIds, FieldReader, filter_string};
 
 /// The FILTER of a dropped call.
 pub const DROP_FILTER: &str = "WinnowrDrop";
@@ -151,7 +151,33 @@ pub fn write_scored_vcf(
         }
         (Format::Vcf, true, None)
     };
-    let sharded = if format == Format::Vcf && !uncompressed { tabix_contigs(vcf) } else { None };
+    // Shards are read by region, which skips records at POS 0: inputs that have them, or may
+    // have them, are written in one pass.
+    let scan = if format == Format::Vcf && !uncompressed {
+        crate::vcf::tabix_scan::<&str>(vcf, None)
+    } else {
+        None
+    };
+    let sharded = scan.and_then(|scan| match scan.pos0 {
+        Some(found) if found.is_empty() => Some(scan.contigs),
+        Some(found) => {
+            info!(
+                "{} has records at POS 0 (on {}), which a read by region skips, so it is written \
+                 in one pass",
+                vcf.display(),
+                found.join(", ")
+            );
+            None
+        }
+        None => {
+            warn!(
+                "could not check {} for records at POS 0 (its tabix index could not be read), so \
+                 it is written in one pass rather than in parallel",
+                vcf.display()
+            );
+            None
+        }
+    });
     let index = DecisionIndex::new(&decisions);
     let (applied, n_applied) = match sharded {
         Some(contigs) => write_sharded(vcf, output, &index, &contigs)?,
@@ -274,9 +300,11 @@ fn write_serial(
     let mut applied_keys: HashSet<CallKey> = HashSet::new();
     let mut applied = Applied::default();
     let mut fields = FieldReader::new();
+    let declared = DeclaredIds::new(reader.header(), vcf)?;
     let mut record = reader.empty_record();
     while let Some(read) = reader.read(&mut record) {
         read.with_context(|| format!("failed to read {}", vcf.display()))?;
+        declared.check(&record).with_context(|| format!("failed to read {}", vcf.display()))?;
         writer.translate(&mut record);
         apply_decision(
             &mut record,
@@ -294,23 +322,14 @@ fn write_serial(
 /// The span of the shards a scored VCF is written in, in parallel.
 const WRITE_SHARD_SPAN: u64 = 10_000_000;
 
-/// The contigs with records in a bgzipped VCF's tabix (or CSI) index, in file order, or `None` if
-/// it is not a tabix-indexed VCF.
-fn tabix_contigs(vcf: &Path) -> Option<Vec<String>> {
-    use std::io::Read as _;
-    let mut magic = [0u8; 3];
-    let mut text = rust_htslib::bgzf::Reader::from_path(vcf).ok()?;
-    text.read_exact(&mut magic).ok()?;
-    if &magic == b"BCF" {
-        return None;
-    }
-    rust_htslib::tbx::Reader::from_path(vcf).ok().map(|index| index.seqnames())
-}
-
 /// An input reader and the scored VCF header, reused across the shards a worker writes.
 struct ShardReaders {
     reader: IndexedReader,
     header: Header,
+    declared: DeclaredIds,
+    /// A writer to nowhere with the input's header, that checks a record can be formatted, and
+    /// whose header also declares the names for [`DeclaredIds::check_tags`].
+    check: Writer,
 }
 
 /// Writes the scored VCF in shards of [`WRITE_SHARD_SPAN`] (by POS) in parallel on the rayon
@@ -359,7 +378,14 @@ fn write_sharded(
                 None => {
                     let reader = crate::vcf::open_indexed(vcf)?;
                     let header = scored_header(reader.header());
-                    ShardReaders { reader, header }
+                    let declared = DeclaredIds::new(reader.header(), vcf)?;
+                    let mut input = Header::from_template(reader.header());
+                    for line in declared.tag_probe_lines() {
+                        input.push_record(line.as_bytes());
+                    }
+                    let check = Writer::from_path("/dev/null", &input, true, Format::Vcf)
+                        .context("failed to open /dev/null")?;
+                    ShardReaders { reader, header, declared, check }
                 }
             };
             let path = tmp.path().join(format!("shard-{i:07}.vcf.gz"));
@@ -424,6 +450,28 @@ fn write_shard(
         if pos < start || end.is_some_and(|end| pos >= end) {
             continue;
         }
+        readers
+            .declared
+            .check(&record)
+            .with_context(|| format!("failed to read {}", vcf.display()))?;
+        // A record read by region is not flagged for an undeclared INFO or FORMAT tag, whose id
+        // lies past the header's dictionary; translating it would give it the id of one of
+        // winnowr's header lines. Formatting it with its own header rejects such an id. It is
+        // written (to nowhere) rather than formatted to a string, which must be UTF-8.
+        readers.check.write(&record).with_context(|| {
+            format!(
+                "the record at {} has an INFO or FORMAT tag not declared in the VCF header; \
+                 declare it",
+                crate::vcf::position(&record)
+            )
+        })?;
+        // Nor for an INFO or FORMAT tag named like a field declared only as another kind, which
+        // has an id, and would be written with no header line of its kind.
+        readers.check.translate(&mut record);
+        readers
+            .declared
+            .check_tags(&record)
+            .with_context(|| format!("failed to read {}", vcf.display()))?;
         if writer.is_none() {
             let created = Writer::from_path(path, &readers.header, false, Format::Vcf)
                 .with_context(|| format!("failed to create {}", path.display()))?;
@@ -439,10 +487,12 @@ fn write_shard(
     Ok((wrote, applied, applied_keys.len()))
 }
 
-/// True if two paths name the same existing file.
+/// True if two paths name the same existing file (the same device and inode, so through a
+/// symbolic or hard link too).
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
         _ => false,
     }
 }
@@ -839,7 +889,10 @@ mod tests {
         ];
         let dir = TempDir::new().unwrap();
         let vcf = write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &lines);
-        assert_eq!(tabix_contigs(&vcf).unwrap(), ["chr2", "chr1", "chr3"]);
+        assert_eq!(
+            crate::vcf::tabix_scan::<&str>(&vcf, None).unwrap().contigs,
+            ["chr2", "chr1", "chr3"]
+        );
         let decisions = || {
             let mut decisions = HashMap::new();
             let on = |chrom: &str, k: CallKey| (chrom.to_string(), k.1, k.2, k.3, k.4);
@@ -973,12 +1026,256 @@ mod tests {
         assert!(duplicate.info(b"WINNOWR_P").float().unwrap().is_none());
     }
 
+    /// Whether `write_scored_vcf` writes `vcf` to `name` in parallel shards.
+    fn writes_sharded(vcf: &Path, name: &str) -> bool {
+        is_bgzf_path(Path::new(name))
+            && crate::vcf::tabix_scan::<&str>(vcf, None)
+                .is_some_and(|scan| scan.pos0 == Some(vec![]))
+    }
+
+    #[rstest]
+    #[case::sharded("out.vcf.gz", true)]
+    #[case::serial("out.bcf", false)]
+    fn an_undeclared_filter_is_an_error(#[case] name: &str, #[case] sharded: bool) {
+        let dir = TempDir::new().unwrap();
+        let lines = [
+            "chr1\t100\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5",
+            "chr1\t200\t.\tG\tT\t50\tLowQual;Undeclared\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5",
+        ];
+        let vcf =
+            write_indexed_vcf(dir.path(), "in.vcf.gz", &vcf_header(&[FIELDS], &["S1"]), &lines);
+        assert_eq!(writes_sharded(&vcf, name), sharded);
+        let output = dir.path().join(name);
+        let error = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(
+                "a FILTER of the record at chr1:200 is not declared with a ##FILTER line in the \
+                 VCF header"
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[rstest]
+    #[case::sharded("out.vcf.gz")]
+    #[case::serial("out.bcf")]
+    fn a_filter_named_like_a_declared_info_field_is_written(#[case] name: &str) {
+        // htslib gives it the INFO field's id (FILTER, INFO and FORMAT share one dictionary).
+        let dir = TempDir::new().unwrap();
+        let lines = ["chr1\t100\t.\tA\tC\t50\tAC\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5"];
+        let vcf =
+            write_indexed_vcf(dir.path(), "in.vcf.gz", &vcf_header(&[FIELDS], &["S1"]), &lines);
+        let output = dir.path().join(name);
+        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+        let filters: Vec<String> = VcfReader::from_path(&output)
+            .unwrap()
+            .records()
+            .map(|r| filter_string(&r.unwrap()))
+            .collect();
+        assert_eq!(filters, ["AC"]);
+    }
+
+    /// An undeclared INFO tag made htslib exit the process when the one-pass writer translated
+    /// the record; it is an error instead (the sharded writer already failed to write it).
+    #[rstest]
+    #[case::info("UNDECLARED=1;AC=1", "GT")]
+    #[case::format("AC=1", "GT:UNDECLARED")]
+    // Declared only as a FILTER, which shares htslib's dictionary with INFO and FORMAT names.
+    #[case::info_declared_as_a_filter("LowQual=1;AC=1", "GT")]
+    #[case::format_declared_as_a_filter("AC=1", "GT:LowQual")]
+    #[case::info_declared_as_a_format_field("GQ=1;AC=1", "GT")]
+    #[case::format_declared_as_an_info_field("AC=1", "GT:AF")]
+    fn an_undeclared_tag_is_an_error(#[case] info: &str, #[case] format: &str) {
+        let dir = TempDir::new().unwrap();
+        let sample = if format == "GT" { "0/1" } else { "0/1:3" };
+        let line = format!("chr1\t100\t.\tA\tC\t50\tPASS\t{info}\t{format}\t{sample}");
+        let vcf =
+            write_indexed_vcf(dir.path(), "in.vcf.gz", &vcf_header(&[FIELDS], &["S1"]), &[&line]);
+        let error = write_scored_vcf(&vcf, &dir.path().join("out.bcf"), HashMap::new(), THREADS)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(
+                "the record at chr1:100 has a FILTER, INFO or FORMAT tag not declared in the VCF \
+                 header"
+            ),
+            "{error:#}"
+        );
+        // Read by region, the tag is not flagged, and was written under one of winnowr's names.
+        assert!(writes_sharded(&vcf, "out.vcf.gz"));
+        let error = write_scored_vcf(&vcf, &dir.path().join("out.vcf.gz"), HashMap::new(), THREADS)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(
+                "the record at chr1:100 has an INFO or FORMAT tag not declared in the VCF header"
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn records_at_pos_0_are_written() {
+        let dir = TempDir::new().unwrap();
+        let lines = [
+            "chr1\t0\t.\tN\tA\t50\tPASS\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5",
+            "chr1\t5\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5",
+            "chr2\t1\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5",
+        ];
+        let header = vcf_header(&[FIELDS], &["S1"]);
+        let vcf = write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &lines);
+        let contigs = ["chr1", "chr2", "chr3"];
+        let scan = crate::vcf::tabix_scan(&vcf, Some(&contigs[..])).unwrap();
+        assert_eq!(scan.contigs, ["chr1", "chr2"]);
+        assert_eq!(scan.pos0, Some(vec!["chr1".to_string()]));
+        assert!(!writes_sharded(&vcf, "out.vcf.gz"));
+        let output = dir.path().join("out.vcf.gz");
+        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+        assert_eq!(positions(&output), [(0, -1), (0, 4), (1, 0)]);
+        // Without them, nothing is found.
+        let vcf = write_indexed_vcf(dir.path(), "none.vcf.gz", &header, &lines[1..]);
+        let scan = crate::vcf::tabix_scan(&vcf, Some(&contigs[..])).unwrap();
+        assert_eq!(scan.pos0, Some(vec![]));
+    }
+
+    /// htslib reads a POS of `00` or `+0` as 0 too.
+    #[rstest]
+    #[case::leading_zero("00")]
+    #[case::plus_sign("+0")]
+    fn records_at_pos_0_written_otherwise_are_written(#[case] pos: &str) {
+        let dir = TempDir::new().unwrap();
+        let first = format!("chr1\t{pos}\t.\tN\tA\t50\tPASS\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5");
+        let lines =
+            [first.as_str(), "chr1\t5\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5"];
+        let header = vcf_header(&[FIELDS], &["S1"]);
+        let vcf = write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &lines);
+        let scan = crate::vcf::tabix_scan(&vcf, Some(&["chr1"][..])).unwrap();
+        assert_eq!(scan.pos0, Some(vec!["chr1".to_string()]));
+        assert!(!writes_sharded(&vcf, "out.vcf.gz"));
+        let output = dir.path().join("out.vcf.gz");
+        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+        assert_eq!(positions(&output), [(0, -1), (0, 4)]);
+    }
+
+    /// Each record's contig index and 0-based position.
+    fn positions(vcf: &Path) -> Vec<(u32, i64)> {
+        VcfReader::from_path(vcf)
+            .unwrap()
+            .records()
+            .map(|r| r.map(|r| (r.rid().unwrap(), r.pos())).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn inputs_the_tabix_scan_cannot_read_are_written_in_one_pass() {
+        let dir = TempDir::new().unwrap();
+        let header = vcf_header(&[FIELDS], &["S1"]);
+        let lines = [
+            "chr1\t0\t.\tN\tA\t50\tPASS\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5",
+            "chr1\t5\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5\tGT:GQ:AD\t0/1:30:5,5",
+        ];
+        let expected = [(0, -1), (0, 4)];
+        let write = |vcf: &Path| {
+            let output = dir.path().join("out.vcf.gz");
+            write_scored_vcf(vcf, &output, HashMap::new(), THREADS).unwrap();
+            positions(&output)
+        };
+        // A BCF: no tabix index.
+        let bcf = dir.path().join("in.bcf");
+        let text = write_indexed_vcf(dir.path(), "text.vcf.gz", &header, &lines);
+        {
+            let mut reader = VcfReader::from_path(&text).unwrap();
+            let out = Header::from_template(reader.header());
+            let mut writer = Writer::from_path(&bcf, &out, false, Format::Bcf).unwrap();
+            for record in reader.records() {
+                writer.write(&record.unwrap()).unwrap();
+            }
+        }
+        index::build(&bcf, None, 1, IndexType::Csi(14)).unwrap();
+        assert_eq!(crate::vcf::tabix_scan::<&str>(&bcf, None), None);
+        assert_eq!(write(&bcf), expected);
+        // A Latin-1 sample name, which rust-htslib's tabix reader panics on.
+        let latin1 = header.replace("\tS1", "\tJos\u{e9}");
+        let mut bytes = latin1.into_bytes();
+        let at = bytes.windows(2).position(|w| w == [0xc3, 0xa9]).unwrap();
+        bytes.splice(at..at + 2, [0xe9]);
+        let path = dir.path().join("latin1.vcf.gz");
+        {
+            use std::io::Write as _;
+            let mut writer = rust_htslib::bgzf::Writer::from_path(&path).unwrap();
+            writer.write_all(&bytes).unwrap();
+            for line in lines {
+                writer.write_all(line.as_bytes()).unwrap();
+                writer.write_all(b"\n").unwrap();
+            }
+        }
+        index::build(&path, None, 1, IndexType::Tbx).unwrap();
+        assert_eq!(crate::vcf::tabix_scan::<&str>(&path, None), None);
+        assert_eq!(write(&path), expected);
+        // A record line at POS 1 that is not UTF-8: the contigs are known, POS 0 is not.
+        let raw = [
+            "chr1\t1\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5;AS_RAW_MQ=caf\u{e9}\tGT\t0/1".to_string(),
+            "chr1\t5\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5\tGT\t0/1".to_string(),
+        ];
+        let path = dir.path().join("record.vcf.gz");
+        {
+            use std::io::Write as _;
+            let mut writer = rust_htslib::bgzf::Writer::from_path(&path).unwrap();
+            writer.write_all(header.as_bytes()).unwrap();
+            for line in &raw {
+                let mut line = line.clone().into_bytes();
+                if let Some(at) = line.windows(2).position(|w| w == [0xc3, 0xa9]) {
+                    line.splice(at..at + 2, [0xe9]);
+                }
+                writer.write_all(&line).unwrap();
+                writer.write_all(b"\n").unwrap();
+            }
+        }
+        index::build(&path, None, 1, IndexType::Tbx).unwrap();
+        let scan = crate::vcf::tabix_scan::<&str>(&path, None).unwrap();
+        assert_eq!((scan.contigs, scan.pos0), (vec!["chr1".to_string()], None));
+        assert_eq!(write(&path), [(0, 0), (0, 4)]);
+    }
+
+    /// A record past the first that is not UTF-8 is not seen by the tabix scan, so it is written
+    /// in shards, which check it without reading it as UTF-8.
+    #[test]
+    fn a_record_that_is_not_utf8_is_written_in_shards() {
+        let dir = TempDir::new().unwrap();
+        let header = vcf_header(&[FIELDS], &["S1"]);
+        let path = dir.path().join("in.vcf.gz");
+        {
+            use std::io::Write as _;
+            let mut writer = rust_htslib::bgzf::Writer::from_path(&path).unwrap();
+            writer.write_all(header.as_bytes()).unwrap();
+            writer.write_all(b"chr1\t1\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5\tGT\t0/1\n").unwrap();
+            writer
+                .write_all(
+                    b"chr1\t100\t.\tA\tC\t50\tPASS\tAC=1;AF=0.5;AS_RAW_MQ=caf\xe9\tGT\t0/1\n",
+                )
+                .unwrap();
+        }
+        index::build(&path, None, 1, IndexType::Tbx).unwrap();
+        assert!(writes_sharded(&path, "out.vcf.gz"));
+        let output = dir.path().join("out.vcf.gz");
+        write_scored_vcf(&path, &output, HashMap::new(), THREADS).unwrap();
+        assert_eq!(positions(&output), [(0, 0), (0, 99)]);
+        let mut reader = VcfReader::from_path(&output).unwrap();
+        let record = reader.records().nth(1).unwrap().unwrap();
+        let value = record.info(b"AS_RAW_MQ").string().unwrap().unwrap();
+        assert_eq!(value[0], b"caf\xe9");
+    }
+
     #[test]
     fn refuses_to_overwrite_the_input() {
         let dir = TempDir::new().unwrap();
         let vcf = input(&dir);
         let message =
             write_scored_vcf(&vcf, &vcf, HashMap::new(), THREADS).unwrap_err().to_string();
+        assert!(message.ends_with("is the input VCF; write to another path"), "{message}");
+        // So is a hard link to it, which has another canonical path.
+        let linked = dir.path().join("linked.vcf.gz");
+        std::fs::hard_link(&vcf, &linked).unwrap();
+        let message =
+            write_scored_vcf(&vcf, &linked, HashMap::new(), THREADS).unwrap_err().to_string();
         assert!(message.ends_with("is the input VCF; write to another path"), "{message}");
         // Plain-text and BCF outputs are written too.
         let plain = dir.path().join("out.vcf");

@@ -96,6 +96,75 @@ fn starts_like_an_index(path: &Path) -> bool {
         .is_ok_and(|()| INDEX_MAGIC.iter().any(|expected| **expected == magic))
 }
 
+/// What the tabix index of a bgzipped VCF says about it (see [`tabix_scan`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TabixScan {
+    /// The contigs with records in the index, in file order.
+    pub contigs: Vec<String>,
+    /// The contigs scanned on which the VCF has records at POS 0 (a telomere), or `None` if that
+    /// is not known (a record line at POS 0 or 1 is not UTF-8, or the index cannot be read).
+    pub pos0: Option<Vec<String>>,
+}
+
+/// Opens a VCF's tabix index and finds, of the given contigs (every indexed contig if `None`),
+/// those with records at POS 0. Returns `None` if the VCF is not bgzipped text with a tabix (or
+/// CSI) index, e.g. a BCF, or rust-htslib cannot read its header lines as UTF-8.
+///
+/// An [`IndexedReader`] never returns records at POS 0 (htslib reads POS 0 as 0-based position
+/// -1, before any region), so a reader that fetches by region must account for them. The tabix
+/// index keeps them, at 0-based position 0. Reading them makes htslib warn "Coordinate <= 0
+/// detected. Did you forget to use the -0 option?", which is expected here.
+///
+/// rust-htslib panics, rather than failing, on a header or record line that is not UTF-8; such a
+/// panic is caught, without its message, and makes the answer unknown.
+pub(crate) fn tabix_scan<S: AsRef<str>>(vcf: &Path, contigs: Option<&[S]>) -> Option<TabixScan> {
+    use rust_htslib::tbx::Read as _;
+    let mut magic = [0u8; 3];
+    rust_htslib::bgzf::Reader::from_path(vcf).ok()?.read_exact(&mut magic).ok()?;
+    if &magic == b"BCF" {
+        return None;
+    }
+    let caught = |f: &mut dyn FnMut() -> Option<Vec<String>>| {
+        quietly(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))).ok().flatten()
+    };
+    let mut tabix = None;
+    let indexed = caught(&mut || {
+        let reader = rust_htslib::tbx::Reader::from_path(vcf).ok()?;
+        let names = reader.seqnames();
+        tabix = Some(reader);
+        Some(names)
+    })?;
+    let mut tabix = tabix?;
+    let wanted: Vec<String> = match contigs {
+        Some(contigs) => contigs.iter().map(|c| c.as_ref().to_string()).collect(),
+        None => indexed.clone(),
+    };
+    let pos0 = caught(&mut || {
+        let mut found = Vec::new();
+        let mut line = Vec::new();
+        for contig in &wanted {
+            // A contig without records is not in the index.
+            let Ok(tid) = tabix.tid(contig) else { continue };
+            // The records overlapping the first base: those at POS 0 and 1.
+            tabix.fetch(tid, 0, 1).ok()?;
+            while tabix.read(&mut line).ok()? {
+                if line.split(|&b| b == b'\t').nth(1).is_some_and(is_zero) {
+                    found.push(contig.clone());
+                    break;
+                }
+            }
+        }
+        Some(found)
+    });
+    Some(TabixScan { contigs: indexed, pos0 })
+}
+
+/// Whether a POS field is a number htslib reads as 0: zeros, after an optional `+`.
+fn is_zero(pos: &[u8]) -> bool {
+    let digits = pos.strip_prefix(b"+").unwrap_or(pos);
+    !digits.is_empty() && digits.iter().all(|&b| b == b'0')
+}
+
 /// Fetches the records overlapping the 0-based, half-open span `[start, end)` of a contig (to
 /// its end if `end` is `None`), returning whether the index has records on the contig.
 ///
@@ -401,7 +470,148 @@ impl FieldReader {
     }
 }
 
+/// The ids of the FILTER, INFO and FORMAT names a VCF header declares (they share htslib's ID
+/// dictionary).
+///
+/// htslib reads a FILTER the header does not declare with a warning, adding it to its own copy
+/// of the header. Through an [`IndexedReader`] that is not the copy a record's header refers to,
+/// so naming the record's FILTERs (or translating the record to another header) reads past the
+/// header's dictionary and crashes the process. Records are checked with
+/// [`DeclaredIds::check`] right after they are read, before either. A FILTER named like a
+/// declared INFO or FORMAT field has that field's id, which names it safely, so it is accepted,
+/// as htslib accepts it.
+///
+/// An INFO or FORMAT tag named like a field declared only as another kind (e.g. INFO `LowQual`
+/// with only `##FILTER=<ID=LowQual>`) has an id too, so it is formatted and translated as if
+/// declared. A plain reader flags it, but a record read by region is not flagged: such records are
+/// checked with [`DeclaredIds::check_tags`].
+#[derive(Debug, Clone)]
+pub(crate) struct DeclaredIds {
+    /// The ids of the FILTER, INFO and FORMAT names.
+    ids: std::collections::HashSet<u32>,
+    /// The names declared, but not as INFO fields.
+    not_info: Vec<Vec<u8>>,
+    /// The names declared, but not as FORMAT fields.
+    not_format: Vec<Vec<u8>>,
+}
+
+impl DeclaredIds {
+    /// The ids declared in the header of the VCF at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a header line is not UTF-8.
+    pub(crate) fn new(header: &HeaderView, path: &Path) -> Result<Self> {
+        let mut names: IndexMap<String, (bool, bool)> = IndexMap::new();
+        for record in header_records(header, path)? {
+            let (values, is_info, is_format) = match record {
+                HeaderRecord::Filter { values, .. } => (values, false, false),
+                HeaderRecord::Info { values, .. } => (values, true, false),
+                HeaderRecord::Format { values, .. } => (values, false, true),
+                _ => continue,
+            };
+            let Some(name) = values.get("ID") else { continue };
+            let kinds = names.entry(name.clone()).or_default();
+            kinds.0 |= is_info;
+            kinds.1 |= is_format;
+        }
+        let ids = names
+            .keys()
+            .filter_map(|name| header.name_to_id(name.as_bytes()).ok().map(|id| *id))
+            .collect();
+        let not = |kind: fn(&(bool, bool)) -> bool| -> Vec<Vec<u8>> {
+            names
+                .iter()
+                .filter(|(_, kinds)| !kind(kinds))
+                .map(|(name, _)| name.as_bytes().to_vec())
+                .collect()
+        };
+        let (not_info, not_format) = (not(|kinds| kinds.0), not(|kinds| kinds.1));
+        Ok(DeclaredIds { ids, not_info, not_format })
+    }
+
+    /// Header lines that declare each name declared only as other kinds as an INFO and a FORMAT
+    /// field, for [`DeclaredIds::check_tags`]. Added to a copy of the header, they keep every
+    /// name's id.
+    pub(crate) fn tag_probe_lines(&self) -> Vec<String> {
+        let description = "Declared by winnowr to find tags declared only as other kinds";
+        let info = self.not_info.iter().map(|name| {
+            let name = String::from_utf8_lossy(name);
+            format!("##INFO=<ID={name},Number=0,Type=Flag,Description=\"{description}\">")
+        });
+        let format = self.not_format.iter().map(|name| {
+            let name = String::from_utf8_lossy(name);
+            format!("##FORMAT=<ID={name},Number=.,Type=String,Description=\"{description}\">")
+        });
+        info.chain(format).collect()
+    }
+
+    /// Checks a record has no INFO tag named like a field not declared as an INFO field, and no
+    /// FORMAT tag named like a field not declared as a FORMAT field. The record must have been
+    /// translated to a copy of its header with the [`DeclaredIds::tag_probe_lines`] added.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the record's position and the tag if it has one.
+    pub(crate) fn check_tags(&self, record: &Record) -> Result<()> {
+        let info = self
+            .not_info
+            .iter()
+            .find(|name| record.info(name).flag().is_ok_and(|present| present))
+            .map(|name| ("INFO", name));
+        let format = || {
+            self.not_format
+                .iter()
+                .find(|name| {
+                    !matches!(record.format(name).string(), Err(HtslibError::BcfMissingTag { .. }))
+                })
+                .map(|name| ("FORMAT", name))
+        };
+        if let Some((kind, name)) = info.or_else(format) {
+            bail!(
+                "the record at {} has an INFO or FORMAT tag not declared in the VCF header; \
+                 declare it ({kind}/{} is declared only as another kind)",
+                position(record),
+                String::from_utf8_lossy(name)
+            );
+        }
+        Ok(())
+    }
+
+    /// Checks a record (read with the header these were taken from) can be named and written:
+    /// its FILTERs are declared, and htslib found nothing wrong with it (e.g. an undeclared INFO
+    /// or FORMAT tag, which a plain reader flags and on which htslib exits the process when the
+    /// record is translated to another header).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the record's position if either is not so.
+    pub(crate) fn check(&self, record: &Record) -> Result<()> {
+        if record.filters().any(|id| !self.ids.contains(&id)) {
+            bail!(
+                "a FILTER of the record at {} is not declared with a ##FILTER line in the VCF \
+                 header; add one for it",
+                position(record)
+            );
+        }
+        let errcode = record.inner().errcode;
+        if errcode != 0 {
+            let what = if errcode & 2 != 0 {
+                "has a FILTER, INFO or FORMAT tag not declared in the VCF header; declare it"
+            } else if errcode & 1 != 0 {
+                "is on a contig not declared in the VCF header; declare it"
+            } else {
+                "is malformed"
+            };
+            bail!("the record at {} {what} (htslib error code {errcode})", position(record));
+        }
+        Ok(())
+    }
+}
+
 /// The record's FILTER names joined with `;`, or `PASS` when it has none.
+///
+/// The record's FILTERs must be declared in its header (see [`DeclaredIds`]).
 pub(crate) fn filter_string(record: &Record) -> String {
     let header = record.header();
     let names: Vec<String> = record

@@ -3,7 +3,9 @@
 Scoring needs trained models: winnowr distributes none, so [train your own](quick-training.md)
 first. It also needs, for the sample:
 
-- the single-sample VCF from HaplotypeCaller (gVCF mode), indexed,
+- the single-sample VCF from HaplotypeCaller (gVCF mode), indexed, with every FILTER, INFO and
+  FORMAT tag of its records declared in its header (`extract` and `score` stop with an error naming
+  the record otherwise),
 - the gVCF it was genotyped from, indexed, when the VCF lacks the raw annotations (RAW_MQandDP,
   QUALapprox, VarDP, AS_RAW_MQ),
 - the region BEDs the models were trained with, under the same names, plus GIAB's GRCh38

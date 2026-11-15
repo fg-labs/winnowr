@@ -76,9 +76,10 @@ table), and warn that other names are ignored.
 
 ## The output VCF
 
-`score` writes every record of the input VCF. The output format follows the `-o`
-suffix, in any case: `.vcf.gz` (or `.vcf.bgz`) is bgzipped and tabix-indexed, `.bcf` is CSI-indexed
-BCF, and anything else is plain-text VCF.
+`score` writes every record of the input VCF, including any at POS 0, which are not read or scored
+(`extract` and `score` warn about them). The output format follows the `-o` suffix, in any case:
+`.vcf.gz` (or `.vcf.bgz`) is bgzipped and tabix-indexed, `.bcf` is CSI-indexed BCF, and anything
+else is plain-text VCF.
 
 Genotype models score PASS calls of their variant type; promote models score the non-PASS calls of
 their variant type that do not overlap a PASS call. Other records are written unchanged. A scored

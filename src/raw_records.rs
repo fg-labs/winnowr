@@ -21,7 +21,8 @@ use crate::gvcf::{
 };
 use crate::shards::{ContigShard, ReaderPool, contig_shards};
 use crate::vcf::{
-    FieldReader, check_contigs, fetch_span, filter_string, has_format, has_info, open_indexed,
+    DeclaredIds, FieldReader, check_contigs, fetch_span, filter_string, has_format, has_info,
+    open_indexed,
 };
 
 /// The raw values of one VCF record. Missing numeric values are NaN.
@@ -74,8 +75,13 @@ pub struct RawRecord {
     /// The `0/0` likelihood, FORMAT/PL\[0\].
     pub pl_ref: f64,
     /// The `0/1` likelihood, FORMAT/PL\[1\].
+    ///
+    /// The PL features are those of allele 1 even when it is `*` (e.g. `0/*` for `G>*,T`), unlike
+    /// [`RawRecord::ad_alt`], which skips `*`. Models are trained on these values, so they are
+    /// kept: taking the PLs of the first non-`*` allele would change the features existing models
+    /// see.
     pub pl_het: f64,
-    /// The `1/1` likelihood, FORMAT/PL\[2\].
+    /// The `1/1` likelihood, FORMAT/PL\[2\] (allele 1's, as for [`RawRecord::pl_het`]).
     pub pl_hom: f64,
     /// The summed depth of every alternate allele (NaN if none is known).
     pub ad_alt_total: f64,
@@ -175,6 +181,20 @@ where
         per_shard = read_shards(vcf, annotation_source, &shards)?;
     }
 
+    // A read by region skips records at POS 0 (telomeres): say so rather than drop them silently.
+    match crate::vcf::tabix_scan(vcf, Some(contigs)).and_then(|scan| scan.pos0) {
+        Some(found) if found.is_empty() => {}
+        Some(found) => warn!(
+            "VCF {} has records at POS 0 on {}; they are not read, and so not scored (htslib's \
+             warning about the -0 option is about them, and harmless)",
+            vcf.display(),
+            found.join(", ")
+        ),
+        None => info!(
+            "Could not check VCF {} for records at POS 0 (e.g. it is a BCF); any are not read",
+            vcf.display()
+        ),
+    }
     let mut per_contig = vec![0usize; contigs.len()];
     for (shard, records) in shards.iter().zip(&per_shard) {
         per_contig[shard.index] += records.records.len();
@@ -343,7 +363,8 @@ fn check_vcf_header<S: AsRef<str>>(
 /// Lazily opened readers, reused across the shards a worker reads.
 #[derive(Default)]
 struct Readers {
-    vcf: Option<IndexedReader>,
+    /// The VCF reader, and the ids its header declares.
+    vcf: Option<(IndexedReader, DeclaredIds)>,
     gvcf: Option<IndexedReader>,
 }
 
@@ -368,7 +389,12 @@ fn read_shard(
     start: u64,
     end: Option<u64>,
 ) -> Result<ContigRecords> {
-    let vcf = reader(&mut readers.vcf, vcf_path)?;
+    if readers.vcf.is_none() {
+        let reader = open_indexed(vcf_path)?;
+        let declared = DeclaredIds::new(reader.header(), vcf_path)?;
+        readers.vcf = Some((reader, declared));
+    }
+    let Some((vcf, declared)) = readers.vcf.as_mut() else { unreachable!("opened above") };
     let has_records = fetch_span(vcf, contig, start, end, vcf_path)?;
     let chrom: Arc<str> = Arc::from(contig);
     let mut record = vcf.empty_record();
@@ -379,6 +405,9 @@ fn read_shard(
         read.with_context(|| {
             format!("failed to read a record on {contig} from {}", vcf_path.display())
         })?;
+        declared
+            .check(&record)
+            .with_context(|| format!("failed to read {}", vcf_path.display()))?;
         // A fetch also returns records that start before the shard but overlap it.
         let pos = u64::try_from(record.pos()).unwrap_or(0);
         if pos < start || end.is_some_and(|end| pos >= end) {
@@ -602,6 +631,69 @@ mod tests {
         assert_eq!(qual_approx, [50.0, 51.0, 52.0, 53.0, 54.0]);
     }
 
+    /// htslib's indexed reader names an undeclared FILTER through a header that lacks it, which
+    /// crashed the process; it is an error instead.
+    #[rstest::rstest]
+    #[case::alone("Undeclared")]
+    #[case::with_a_declared_one("LowQual;Undeclared")]
+    fn an_undeclared_filter_is_an_error(#[case] filter: &str) {
+        let dir = TempDir::new().unwrap();
+        let record =
+            format!("chr1 100 . A C 50 {filter} RAW_MQandDP=54000,30;QUALapprox=60 GT 0/1");
+        let fields = [CALL_FIELDS, RAW_FIELDS];
+        let vcf = write_vcf(&dir, "in.vcf.gz", &fields, &["S1"], &[record.as_str()]);
+        let error = format!("{:#}", extract(&vcf, None, &["chr1"]).unwrap_err());
+        assert!(
+            error.contains(
+                "a FILTER of the record at chr1:100 is not declared with a ##FILTER line in the \
+                 VCF header; add one for it"
+            ),
+            "{error}"
+        );
+        // Declared, it is read.
+        let declared = "##FILTER=<ID=Undeclared,Description=\"Now declared\">\n";
+        let vcf = write_vcf(
+            &dir,
+            "ok.vcf.gz",
+            &[CALL_FIELDS, RAW_FIELDS, declared],
+            &["S1"],
+            &[record.as_str()],
+        );
+        assert_eq!(extract(&vcf, None, &["chr1"]).unwrap()[0].filter, filter);
+    }
+
+    /// A read by region skips records at POS 0, in a VCF (where they are reported) or a BCF
+    /// (where they cannot be); the other records are read.
+    #[test]
+    fn records_at_pos_0_are_skipped() {
+        let dir = TempDir::new().unwrap();
+        let records = [
+            "chr1 0 . N A 50 PASS RAW_MQandDP=54000,30;QUALapprox=60 GT 0/1",
+            "chr1 100 . A C 50 PASS RAW_MQandDP=54000,30;QUALapprox=60 GT 0/1",
+        ];
+        let vcf = write_vcf(&dir, "in.vcf.gz", &[CALL_FIELDS, RAW_FIELDS], &["S1"], &records);
+        let scan = crate::vcf::tabix_scan(&vcf, Some(&["chr1"][..])).unwrap();
+        assert_eq!(scan.pos0, Some(vec!["chr1".to_string()]));
+        let positions = |vcf: &Path| -> Vec<u64> {
+            extract(vcf, None, &["chr1"]).unwrap().iter().map(|r| r.pos).collect()
+        };
+        assert_eq!(positions(&vcf), [100]);
+        let bcf = dir.path().join("in.bcf");
+        {
+            use rust_htslib::bcf::{Format, Header, Read as _, Reader, Writer};
+            let mut reader = Reader::from_path(&vcf).unwrap();
+            let header = Header::from_template(reader.header());
+            let mut writer = Writer::from_path(&bcf, &header, false, Format::Bcf).unwrap();
+            for record in reader.records() {
+                writer.write(&record.unwrap()).unwrap();
+            }
+        }
+        rust_htslib::bcf::index::build(&bcf, None, 1, rust_htslib::bcf::index::Type::Csi(14))
+            .unwrap();
+        assert_eq!(crate::vcf::tabix_scan::<&str>(&bcf, None), None);
+        assert_eq!(positions(&bcf), [100]);
+    }
+
     #[test]
     fn reads_raw_values_and_annotations_from_the_vcf() {
         let dir = TempDir::new().unwrap();
@@ -698,6 +790,7 @@ mod tests {
         assert_eq!(star.filter, "PASS");
         assert_eq!(star.genotype, Genotype::diploid(1, 2));
         assert_eq!((star.ad_ref, star.ad_alt, star.ad_alt_total), (3.0, 4.0, 6.0));
+        // The PLs stay allele 1's (`*`): 0/0, 0/* and */*, as models were trained on.
         assert_eq!((star.pl_ref, star.pl_het, star.pl_hom), (0.0, 1.0, 2.0));
 
         let insertion = &records[3];
