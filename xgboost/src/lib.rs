@@ -1133,8 +1133,12 @@ impl Booster {
     }
 
     /// The number of outputs the model predicts per row: the class count of a multi-class model,
-    /// else the target count (1 for a single-target model).
-    fn outputs_per_row(&self) -> Result<usize> {
+    /// else the target count (1 for a single-target model), as the model's config records it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if XGBoost fails or its config has no class or target count.
+    pub fn outputs_per_row(&self) -> Result<usize> {
         let (mut len, mut data) = (0, ptr::null());
         // SAFETY: the handle is live and the outputs point to a booster-owned buffer that is
         // copied immediately.
@@ -1417,6 +1421,20 @@ mod tests {
         let prediction = booster.predict(&empty).unwrap();
         assert!(prediction.values.is_empty());
         assert_eq!(prediction.shape, vec![0, 3]);
+    }
+
+    #[test]
+    fn outputs_per_row_are_the_class_or_target_count() {
+        let (booster, _) = trained_booster(1);
+        assert_eq!(booster.outputs_per_row().unwrap(), 3);
+        let (features, labels) = three_class_data(30);
+        let labels: Vec<f32> = labels.iter().map(|&class| f32::from(class > 0.0)).collect();
+        let mut train = DMatrix::from_dense(&features, 30, 2, f32::NAN).unwrap();
+        train.set_labels(&labels).unwrap();
+        let mut booster = Booster::new(&[&train], TWO).unwrap();
+        booster.set_param("objective", "binary:logistic").unwrap();
+        booster.update(0, &train).unwrap();
+        assert_eq!(booster.outputs_per_row().unwrap(), 1);
     }
 
     #[test]
