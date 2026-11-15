@@ -33,7 +33,7 @@ use crate::numeric::metric_float;
 use crate::policy::{ModelRowDecisions, Policy, check_model_kinds, decide_model_rows};
 use crate::promote_labels::promote_mask;
 use crate::regions::{RegionSet, ref_span};
-use crate::rescore::{Counts, Mode};
+use crate::rescore::{CallAction, Mode, Outcome};
 use crate::samples::SampleCalls;
 use crate::table::FeatureTable;
 
@@ -248,181 +248,6 @@ pub fn with_truth_labels(table: &FeatureTable, labels: &FeatureTable) -> Result<
     info.fn_counts.clone_from(&labels.info().fn_counts);
     info.promote_labelled = labels.info().promote_labelled;
     Ok(out)
-}
-
-/// A genotype model's action on a PASS call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallAction {
-    /// No action.
-    Keep,
-    /// Dropped (including re-genotyped to `0/0`).
-    Drop,
-    /// Flipped het <-> hom.
-    Flip,
-    /// Re-genotyped to the length caller's genotype.
-    Regenotype,
-}
-
-impl CallAction {
-    /// The action given drop, flip and re-genotype flags (the first set wins).
-    #[must_use]
-    pub const fn of(drop: bool, flip: bool, regenotype: bool) -> CallAction {
-        if drop {
-            CallAction::Drop
-        } else if flip {
-            CallAction::Flip
-        } else if regenotype {
-            CallAction::Regenotype
-        } else {
-            CallAction::Keep
-        }
-    }
-}
-
-/// The actions on one stratum's labelled calls and their outcomes against one truth set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Outcome {
-    /// Labelled PASS calls.
-    pub labelled: i64,
-    /// PASS calls dropped.
-    pub dropped: i64,
-    /// True-positive PASS calls dropped.
-    pub dropped_tp: i64,
-    /// PASS calls flipped.
-    pub flipped: i64,
-    /// Flips that produced the truth genotype.
-    pub flips_fixed: i64,
-    /// Flips of true-positive calls.
-    pub flips_broke_tp: i64,
-    /// PASS calls re-genotyped.
-    pub regenotyped: i64,
-    /// Re-genotypes that produced the truth genotype.
-    pub regenotypes_fixed: i64,
-    /// Re-genotypes of true-positive calls.
-    pub regenotypes_broke_tp: i64,
-    /// Labelled promotion candidates (non-PASS calls).
-    pub candidates: i64,
-    /// Candidates promoted.
-    pub promoted: i64,
-    /// Promotions that turned a truth FN into a TP.
-    pub promoted_correct: i64,
-    /// Promotions whose genotype was flipped.
-    pub promoted_flipped: i64,
-    /// The counts before any action (FNs from the truth FNs in the stratum).
-    pub before: Counts,
-    /// The change in counts from the actions.
-    pub delta: Counts,
-}
-
-impl Outcome {
-    /// Adds a labelled PASS call and the action taken on it.
-    pub fn add_call(
-        &mut self,
-        label: Label,
-        flip_ok: bool,
-        regenotype_ok: bool,
-        action: CallAction,
-    ) {
-        let is_tp = label == Label::Keep;
-        self.labelled += 1;
-        if is_tp {
-            self.before.tp += 1;
-        } else {
-            self.before.fp += 1;
-        }
-        let d = &mut self.delta;
-        match action {
-            CallAction::Keep => {}
-            CallAction::Drop => {
-                self.dropped += 1;
-                if is_tp {
-                    self.dropped_tp += 1;
-                    d.tp -= 1;
-                    d.fn_ += 1;
-                } else {
-                    d.fp -= 1;
-                }
-            }
-            CallAction::Flip | CallAction::Regenotype => {
-                let ok = if action == CallAction::Flip {
-                    self.flipped += 1;
-                    flip_ok
-                } else {
-                    self.regenotyped += 1;
-                    regenotype_ok
-                };
-                let (fixed, broke) = if action == CallAction::Flip {
-                    (&mut self.flips_fixed, &mut self.flips_broke_tp)
-                } else {
-                    (&mut self.regenotypes_fixed, &mut self.regenotypes_broke_tp)
-                };
-                if is_tp {
-                    *broke += 1;
-                    d.tp -= 1;
-                    d.fp += 1;
-                    d.fn_ += 1;
-                } else if ok {
-                    *fixed += 1;
-                    d.tp += 1;
-                    d.fp -= 1;
-                    d.fn_ -= 1;
-                }
-            }
-        }
-    }
-
-    /// Adds a labelled promotion candidate and whether it was promoted (and flipped).
-    pub fn add_candidate(&mut self, label: PromoteLabel, promote: bool, flip: bool) {
-        self.candidates += 1;
-        if !promote {
-            return;
-        }
-        self.promoted += 1;
-        if flip {
-            self.promoted_flipped += 1;
-        }
-        let right = (label == PromoteLabel::Promote && !flip)
-            || (label == PromoteLabel::PromoteFlip && flip);
-        if right {
-            self.promoted_correct += 1;
-            self.delta.tp += 1;
-            self.delta.fn_ -= 1;
-        } else {
-            self.delta.fp += 1;
-        }
-    }
-
-    /// The counts after the actions.
-    #[must_use]
-    pub fn after(&self) -> Counts {
-        Counts {
-            tp: self.before.tp + self.delta.tp,
-            fp: self.before.fp + self.delta.fp,
-            fn_: self.before.fn_ + self.delta.fn_,
-        }
-    }
-
-    /// Adds another outcome's counts.
-    pub fn add(&mut self, other: &Outcome) {
-        self.labelled += other.labelled;
-        self.dropped += other.dropped;
-        self.dropped_tp += other.dropped_tp;
-        self.flipped += other.flipped;
-        self.flips_fixed += other.flips_fixed;
-        self.flips_broke_tp += other.flips_broke_tp;
-        self.regenotyped += other.regenotyped;
-        self.regenotypes_fixed += other.regenotypes_fixed;
-        self.regenotypes_broke_tp += other.regenotypes_broke_tp;
-        self.candidates += other.candidates;
-        self.promoted += other.promoted;
-        self.promoted_correct += other.promoted_correct;
-        self.promoted_flipped += other.promoted_flipped;
-        for (sum, part) in [(&mut self.before, other.before), (&mut self.delta, other.delta)] {
-            sum.tp += part.tp;
-            sum.fp += part.fp;
-            sum.fn_ += part.fn_;
-        }
-    }
 }
 
 /// Predicted P(keep) against the observed fraction of `Keep` labels, in equal-width bins.
@@ -1495,6 +1320,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::rescore::Counts;
     use crate::testing::{call_table, vcf_header, write_indexed_vcf};
 
     /// The truth FN records of a hap.py output VCF on `contigs`, counted by variant type and stratum.
@@ -1575,52 +1401,6 @@ mod tests {
         let got = table_strata(&table, [&first, &second]).unwrap();
         use Stratum::*;
         assert_eq!(got, [FirstOnly, Both, Both, SecondOnly, SecondOnly, Neither, Neither]);
-    }
-
-    /// Every label, flip_ok, regenotype_ok and action: the outcomes summed over calls are what
-    /// `evaluate`'s rescoring gives the same calls and actions.
-    #[test]
-    fn outcomes_sum_to_rescore() {
-        use crate::rescore::{Actions, Promotions, baseline_counts, rescore, rescore_promote};
-        let labels = [Label::Drop, Label::Keep, Label::Flip, Label::Regenotype];
-        let actions =
-            [CallAction::Keep, CallAction::Drop, CallAction::Flip, CallAction::Regenotype];
-        let mut outcome = Outcome::default();
-        let (mut all_labels, mut flip_oks, mut regenotype_oks) = (vec![], vec![], vec![]);
-        let mut masks = Actions { drop: vec![], flip: vec![], regenotype: vec![] };
-        for label in labels {
-            for flip_ok in [false, true] {
-                for regenotype_ok in [false, true] {
-                    for action in actions {
-                        outcome.add_call(label, flip_ok, regenotype_ok, action);
-                        all_labels.push(label);
-                        flip_oks.push(flip_ok);
-                        regenotype_oks.push(regenotype_ok);
-                        masks.drop.push(action == CallAction::Drop);
-                        masks.flip.push(action == CallAction::Flip);
-                        masks.regenotype.push(action == CallAction::Regenotype);
-                    }
-                }
-            }
-        }
-        outcome.before.fn_ = 100;
-        let baseline = baseline_counts(&all_labels, 100);
-        assert_eq!(outcome.before, baseline);
-        let rescored = rescore(&all_labels, &flip_oks, &masks, baseline, &regenotype_oks);
-        assert_eq!(outcome.after(), rescored);
-        // Promotions on top.
-        let promote_labels = [PromoteLabel::Stay, PromoteLabel::Promote, PromoteLabel::PromoteFlip];
-        let mut candidates = Vec::new();
-        let mut promotions = Promotions { promote: vec![], flip: vec![] };
-        for label in promote_labels {
-            for (promote, flip) in [(false, false), (true, false), (true, true)] {
-                outcome.add_candidate(label, promote, flip);
-                candidates.push(label);
-                promotions.promote.push(promote);
-                promotions.flip.push(flip);
-            }
-        }
-        assert_eq!(outcome.after(), rescore_promote(&candidates, &promotions, rescored));
     }
 
     mod end_to_end {
