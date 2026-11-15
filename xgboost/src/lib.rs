@@ -1,7 +1,7 @@
 //! A statically linked XGBoost with the small safe API that winnowr needs.
 //!
 //! XGBoost is built from the vendored sources (see `build.rs`) and called through its C API.
-//! Only the calls winnowr uses are bound: dense matrices with labels, weights and feature names;
+//! Only the calls winnowr uses are bound: dense matrices with labels and feature names;
 //! boosters that train one round at a time, evaluate, predict, truncate, and save or load JSON.
 //!
 //! Every booster is given an explicit thread count, which bounds the OpenMP threads XGBoost uses
@@ -18,7 +18,7 @@
 //! let mut train = DMatrix::from_dense(&features, 4, 1, f32::NAN).unwrap();
 //! train.set_labels(&[0.0, 0.0, 1.0, 1.0]).unwrap();
 //! let mut booster = Booster::new(&[&train], threads).unwrap();
-//! booster.set_param("objective", "binary:logistic").unwrap();
+//! booster.set_params(&[("objective", "binary:logistic")]).unwrap();
 //! booster.update(0, &train).unwrap();
 //! let prediction = booster.predict(&train).unwrap();
 //! assert_eq!(prediction.shape, vec![4, 1]);
@@ -275,7 +275,7 @@ impl OpenMpWait {
     /// The policy for `threads` threads on `cores` cores, while other processes have `busy`
     /// cores' worth of work (`None` if unknown, which counts as busy).
     #[must_use]
-    pub fn for_load(threads: usize, cores: usize, busy: Option<f64>) -> Self {
+    pub(crate) fn for_load(threads: usize, cores: usize, busy: Option<f64>) -> Self {
         // A negative or NaN measurement counts as unknown.
         let Some(busy) = busy.filter(|busy| *busy >= 0.0) else {
             return Self::SpinBriefly;
@@ -377,7 +377,7 @@ pub fn wait_between_parallel_regions(threads: NonZeroUsize) -> WaitChoice {
     WaitChoice { wait, threads, cores, busy }
 }
 
-/// Checks that the OpenMP environment gives XGBoost's training the threads that `-t` asks for.
+/// Checks that the OpenMP environment gives XGBoost's training the `threads` threads requested.
 ///
 /// - A dynamic team (`OMP_DYNAMIC`) lets the runtime grant a parallel region fewer threads than
 ///   requested. XGBoost's `hist` training assumes the full team: blocks of work are then silently
@@ -389,8 +389,8 @@ pub fn wait_between_parallel_regions(threads: NonZeroUsize) -> WaitChoice {
 ///   the thread count shrinks every team the same way, while XGBoost, which reads only
 ///   `OMP_THREAD_LIMIT`, still asks for the full team.
 /// - An `OMP_THREAD_LIMIT` below the thread count makes XGBoost cap its threads at the limit. That
-///   is safe, but the model depends on the thread count, so it would not be the model `-t`
-///   names; the limit is fixed at start.
+///   is safe, but the model depends on the thread count, so it would not be the model the
+///   requested threads train; the limit is fixed at start.
 ///
 /// All are refused up front. Prediction splits its work as the team's threads arrive, so it
 /// needs none of these checks.
@@ -399,12 +399,100 @@ pub fn wait_between_parallel_regions(threads: NonZeroUsize) -> WaitChoice {
 ///
 /// # Errors
 ///
-/// Returns a message naming the variable to unset or change.
+/// Returns an error whose [`Error::openmp_problem`] names the variable to unset or change.
 pub fn check_openmp_environment(
     threads: NonZeroUsize,
     var: impl Fn(&str) -> Option<String>,
-) -> std::result::Result<(), String> {
-    OpenMpRuntime::LINKED.check_environment(threads, var)
+) -> Result<()> {
+    OpenMpRuntime::LINKED.check_environment(threads, var).map_err(Error::from)
+}
+
+/// Why the OpenMP environment cannot give XGBoost's training the threads requested (see
+/// [`check_openmp_environment`]).
+///
+/// Its [`Display`](fmt::Display) is [`OpenMpProblem::explanation`] followed by what to do, in
+/// terms of the threads requested; a caller can instead follow the explanation with advice in its
+/// own terms (e.g. naming its thread option). Adding a variant is a breaking change, so callers
+/// can match every variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenMpProblem {
+    /// `OMP_DYNAMIC` has a value the runtime reads as true.
+    Dynamic {
+        /// The value.
+        value: String,
+    },
+    /// A thread limit of the runtime that XGBoost does not read (e.g. libomp's
+    /// `KMP_DEVICE_THREAD_LIMIT`) is below the threads requested.
+    HiddenThreadLimit {
+        /// The variable.
+        variable: &'static str,
+        /// Its limit.
+        limit: usize,
+        /// The threads requested.
+        threads: NonZeroUsize,
+    },
+    /// `OMP_THREAD_LIMIT` is below the threads requested, so XGBoost would use fewer.
+    ThreadLimit {
+        /// The limit.
+        limit: usize,
+        /// The threads requested.
+        threads: NonZeroUsize,
+    },
+}
+
+/// `n` threads, as "1 thread" or "`n` threads".
+fn n_threads(n: usize) -> String {
+    if n == 1 { "1 thread".to_string() } else { format!("{n} threads") }
+}
+
+impl OpenMpProblem {
+    /// What is wrong and what it does to training, without what to do about it.
+    #[must_use]
+    pub fn explanation(&self) -> String {
+        /// Why OpenMP giving XGBoost fewer threads than it asks for is a problem.
+        const UNHANDLED: &str =
+            "which XGBoost's training does not handle (it can lose rows or crash)";
+        match self {
+            Self::Dynamic { value } => format!(
+                "OMP_DYNAMIC={value} lets OpenMP give XGBoost fewer threads than it asks for, \
+                 {UNHANDLED}"
+            ),
+            Self::HiddenThreadLimit { variable, limit, threads } => format!(
+                "{variable}={limit} is below the {} requested, so OpenMP would give XGBoost \
+                 fewer threads than it asks for, {UNHANDLED}",
+                n_threads(threads.get())
+            ),
+            Self::ThreadLimit { limit, threads } => format!(
+                "OMP_THREAD_LIMIT={limit} is below the {} requested, so XGBoost would run with \
+                 {}",
+                n_threads(threads.get()),
+                n_threads(*limit)
+            ),
+        }
+    }
+}
+
+impl fmt::Display for OpenMpProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let explanation = self.explanation();
+        match self {
+            Self::Dynamic { .. } => {
+                write!(f, "{explanation}; unset OMP_DYNAMIC or set it to false")
+            }
+            Self::HiddenThreadLimit { variable, limit, .. } => write!(
+                f,
+                "{explanation}; request {} or fewer, or raise or unset {variable}",
+                n_threads(*limit)
+            ),
+            Self::ThreadLimit { limit, threads } => write!(
+                f,
+                "{explanation}, and a model trained so is not the one {} would train; request {} \
+                 or fewer, or raise or unset OMP_THREAD_LIMIT",
+                n_threads(threads.get()),
+                n_threads(*limit)
+            ),
+        }
+    }
 }
 
 /// The OpenMP runtime XGBoost is linked with, which sets how the environment is read.
@@ -462,31 +550,20 @@ impl OpenMpRuntime {
         self,
         threads: NonZeroUsize,
         var: impl Fn(&str) -> Option<String>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), OpenMpProblem> {
         if let Some(value) = var("OMP_DYNAMIC").filter(|value| self.reads_as_true(value)) {
-            return Err(format!(
-                "OMP_DYNAMIC={value} lets OpenMP give XGBoost fewer threads than it asks for, \
-                 which XGBoost's training does not handle (it can lose rows or crash); unset \
-                 OMP_DYNAMIC or set it to false"
-            ));
+            return Err(OpenMpProblem::Dynamic { value });
         }
         let limit = |name: &str| var(name).and_then(|value| value.trim().parse::<usize>().ok());
-        for &name in self.hidden_thread_limits() {
-            if let Some(limit) = limit(name).filter(|&limit| limit < threads.get()) {
-                return Err(format!(
-                    "{name}={limit} is below the {threads} threads requested, so OpenMP would \
-                     give XGBoost fewer threads than it asks for, which XGBoost's training does \
-                     not handle (it can lose rows or crash); use -t {limit} or less, or raise or \
-                     unset {name}"
-                ));
+        for &variable in self.hidden_thread_limits() {
+            if let Some(limit) = limit(variable).filter(|&limit| limit < threads.get()) {
+                return Err(OpenMpProblem::HiddenThreadLimit { variable, limit, threads });
             }
         }
         match limit("OMP_THREAD_LIMIT") {
-            Some(limit) if limit < threads.get() => Err(format!(
-                "OMP_THREAD_LIMIT={limit} is below the {threads} threads requested, so XGBoost \
-                 would run with {limit} threads, and a model trained so is not the one -t \
-                 {threads} names; use -t {limit} or less, or raise or unset OMP_THREAD_LIMIT"
-            )),
+            Some(limit) if limit < threads.get() => {
+                Err(OpenMpProblem::ThreadLimit { limit, threads })
+            }
             _ => Ok(()),
         }
     }
@@ -639,21 +716,47 @@ mod ffi {
     }
 }
 
-/// An error from XGBoost (its last-error message) or from invalid arguments.
+/// An error from XGBoost (its last-error message), from invalid arguments, or from an OpenMP
+/// environment that training cannot run in (see [`Error::openmp_problem`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error(String);
+pub struct Error {
+    /// The message.
+    message: String,
+    /// What is wrong with the OpenMP environment, for an error of
+    /// [`check_openmp_environment`].
+    openmp_problem: Option<OpenMpProblem>,
+}
 
 impl Error {
+    /// An error with a message.
+    fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into(), openmp_problem: None }
+    }
+
     /// The error message.
+    #[cfg(test)]
+    fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// What is wrong with the OpenMP environment, if this is an error of
+    /// [`check_openmp_environment`], so that a caller can explain it in its own terms (e.g. name
+    /// its own thread option).
     #[must_use]
-    pub fn message(&self) -> &str {
-        &self.0
+    pub fn openmp_problem(&self) -> Option<&OpenMpProblem> {
+        self.openmp_problem.as_ref()
+    }
+}
+
+impl From<OpenMpProblem> for Error {
+    fn from(problem: OpenMpProblem) -> Self {
+        Self { message: problem.to_string(), openmp_problem: Some(problem) }
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "XGBoost: {}", self.0)
+        write!(f, "XGBoost: {}", self.message)
     }
 }
 
@@ -670,7 +773,7 @@ fn check(code: c_int) -> Result<()> {
     // SAFETY: XGBGetLastError returns a NUL-terminated, thread-local string that stays valid
     // until the next XGBoost call on this thread; it is copied immediately.
     let message = unsafe { CStr::from_ptr(ffi::XGBGetLastError()) };
-    Err(Error(clean_message(&message.to_string_lossy())))
+    Err(Error::new(clean_message(&message.to_string_lossy())))
 }
 
 /// The user-facing part of an XGBoost error message.
@@ -708,7 +811,7 @@ fn is_source_location(text: &str) -> bool {
 
 /// A C string from Rust text, rejecting interior NUL bytes.
 fn c_string(text: &str) -> Result<CString> {
-    CString::new(text).map_err(|_| Error(format!("text contains a NUL byte: {text:?}")))
+    CString::new(text).map_err(|_| Error::new(format!("text contains a NUL byte: {text:?}")))
 }
 
 /// Convert a length to XGBoost's unsigned 64-bit length type.
@@ -724,7 +827,7 @@ fn c_threads(threads: NonZeroUsize) -> c_int {
 
 /// Convert a length reported by XGBoost to `usize`.
 fn from_bst_len(len: ffi::BstUlong, what: &str) -> Result<usize> {
-    usize::try_from(len).map_err(|_| Error(format!("{what} {len} overflows usize")))
+    usize::try_from(len).map_err(|_| Error::new(format!("{what} {len} overflows usize")))
 }
 
 /// A slice from a pointer and length returned by XGBoost: empty when the length is zero (when
@@ -739,7 +842,7 @@ unsafe fn borrowed_slice<'a, T>(data: *const T, len: usize) -> Result<&'a [T]> {
         return Ok(&[]);
     }
     if data.is_null() {
-        return Err(Error(format!("XGBoost returned a null pointer for {len} values")));
+        return Err(Error::new(format!("XGBoost returned a null pointer for {len} values")));
     }
     // SAFETY: the caller guarantees `data` points to `len` valid values; it is non-null.
     Ok(unsafe { std::slice::from_raw_parts(data, len) })
@@ -759,7 +862,7 @@ unsafe fn copy_strings(strings: *const *const c_char, len: ffi::BstUlong) -> Res
         .iter()
         .map(|&pointer| {
             if pointer.is_null() {
-                return Err(Error("XGBoost returned a null string".into()));
+                return Err(Error::new("XGBoost returned a null string"));
             }
             // SAFETY: forwarded from the caller; checked non-null above.
             Ok(unsafe { CStr::from_ptr(pointer) }.to_string_lossy().into_owned())
@@ -776,7 +879,7 @@ pub fn version() -> (i32, i32, i32) {
     (major, minor, patch)
 }
 
-/// A dense, in-memory data matrix (rows of `f32` features) with optional labels and weights.
+/// A dense, in-memory data matrix (rows of `f32` features) with optional labels and feature names.
 #[derive(Debug)]
 pub struct DMatrix {
     handle: ffi::DMatrixHandle,
@@ -818,7 +921,7 @@ impl DMatrix {
     ) -> Result<Self> {
         let expected = num_rows.checked_mul(num_cols);
         if expected != Some(values.len()) {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "{} values do not fill {num_rows} rows of {num_cols} columns",
                 values.len()
             )));
@@ -844,7 +947,7 @@ impl DMatrix {
     /// # Errors
     ///
     /// Returns an error if XGBoost fails.
-    pub fn num_rows(&self) -> Result<usize> {
+    pub(crate) fn num_rows(&self) -> Result<usize> {
         let mut rows = 0;
         // SAFETY: the handle is live and `rows` is a valid out-pointer.
         check(unsafe { ffi::XGDMatrixNumRow(self.handle, &mut rows) })?;
@@ -856,7 +959,7 @@ impl DMatrix {
     /// # Errors
     ///
     /// Returns an error if XGBoost fails.
-    pub fn num_cols(&self) -> Result<usize> {
+    pub(crate) fn num_cols(&self) -> Result<usize> {
         let mut cols = 0;
         // SAFETY: the handle is live and `cols` is a valid out-pointer.
         check(unsafe { ffi::XGDMatrixNumCol(self.handle, &mut cols) })?;
@@ -872,20 +975,11 @@ impl DMatrix {
         self.set_float_info("label", labels)
     }
 
-    /// Set the per-row training weights.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there is not one weight per row, or XGBoost fails.
-    pub fn set_weights(&mut self, weights: &[f32]) -> Result<()> {
-        self.set_float_info("weight", weights)
-    }
-
     /// Set a per-row float field after checking its length.
     fn set_float_info(&mut self, field: &str, values: &[f32]) -> Result<()> {
         let rows = self.num_rows()?;
         if values.len() != rows {
-            return Err(Error(format!("{} {field}s for {rows} rows", values.len())));
+            return Err(Error::new(format!("{} {field}s for {rows} rows", values.len())));
         }
         let name = c_string(field)?;
         // SAFETY: the handle is live, `name` is NUL-terminated, and `values` holds `rows`
@@ -907,7 +1001,7 @@ impl DMatrix {
     pub fn set_feature_names<S: AsRef<str>>(&mut self, names: &[S]) -> Result<()> {
         let cols = self.num_cols()?;
         if names.len() != cols {
-            return Err(Error(format!("{} feature names for {cols} columns", names.len())));
+            return Err(Error::new(format!("{} feature names for {cols} columns", names.len())));
         }
         let owned = names.iter().map(|n| c_string(n.as_ref())).collect::<Result<Vec<_>>>()?;
         let pointers: Vec<*const c_char> = owned.iter().map(|n| n.as_ptr()).collect();
@@ -929,7 +1023,7 @@ impl DMatrix {
     /// # Errors
     ///
     /// Returns an error if XGBoost fails.
-    pub fn feature_names(&self) -> Result<Vec<String>> {
+    pub(crate) fn feature_names(&self) -> Result<Vec<String>> {
         let field = c_string("feature_name")?;
         let (mut len, mut names) = (0, ptr::null());
         // SAFETY: the handle is live, `field` is NUL-terminated, and the out-pointers are valid;
@@ -991,7 +1085,7 @@ impl Booster {
                 for other in rest {
                     let other_names = other.feature_names()?;
                     if other_names != names {
-                        return Err(Error(format!(
+                        return Err(Error::new(format!(
                             "the cached matrices have different feature names: {names:?} and \
                              {other_names:?}"
                         )));
@@ -1054,7 +1148,7 @@ impl Booster {
         let is_space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
         let key = json.get(1..).and_then(|rest| rest.iter().find(|byte| !is_space(byte)));
         if json.first() != Some(&b'{') || key != Some(&b'"') {
-            return Err(Error("the model is not a JSON object".into()));
+            return Err(Error::new("the model is not a JSON object"));
         }
         let booster = Self::new(&[], threads)?;
         // SAFETY: the handle is live and `json` is a readable buffer of `json.len()` bytes,
@@ -1081,7 +1175,7 @@ impl Booster {
     /// # Errors
     ///
     /// Returns an error if a string contains a NUL byte, or XGBoost rejects the parameter.
-    pub fn set_param(&mut self, name: &str, value: &str) -> Result<()> {
+    pub(crate) fn set_param(&mut self, name: &str, value: &str) -> Result<()> {
         self.set_params(&[(name, value)])
     }
 
@@ -1141,7 +1235,7 @@ impl Booster {
             )
         })?;
         if result.is_null() {
-            return Err(Error("XGBoost returned no evaluation result".into()));
+            return Err(Error::new("XGBoost returned no evaluation result"));
         }
         // SAFETY: on success `result` is a valid NUL-terminated string owned by the booster.
         Ok(unsafe { CStr::from_ptr(result) }.to_string_lossy().into_owned())
@@ -1152,7 +1246,7 @@ impl Booster {
     /// # Errors
     ///
     /// Returns an error if XGBoost fails.
-    pub fn num_features(&self) -> Result<usize> {
+    pub(crate) fn num_features(&self) -> Result<usize> {
         let mut features = 0;
         // SAFETY: the handle is live and `features` is a valid out-pointer.
         check(unsafe { ffi::XGBoosterGetNumFeature(self.handle, &mut features) })?;
@@ -1182,13 +1276,13 @@ impl Booster {
     fn check_features(&self, data: &DMatrix) -> Result<()> {
         let (expected, actual) = (self.num_features()?, data.num_cols()?);
         if expected != actual {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "the model has {expected} features but the matrix has {actual} columns"
             )));
         }
         let (expected, actual) = (self.feature_names()?, data.feature_names()?);
         if expected != actual {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "the matrix's feature names {actual:?} do not match the model's {expected:?}"
             )));
         }
@@ -1230,7 +1324,7 @@ impl Booster {
             .map(|&n| from_bst_len(n, "dimension"))
             .collect::<Result<_>>()?;
         let len = shape.iter().try_fold(1usize, |total, &n| total.checked_mul(n));
-        let len = len.ok_or_else(|| Error("prediction size overflows usize".into()))?;
+        let len = len.ok_or_else(|| Error::new("prediction size overflows usize"))?;
         // SAFETY: on success `result` points to the product of `shape` floats.
         let values = unsafe { borrowed_slice(result, len) }?.to_vec();
         // XGBoost reports `[0, 0]` for a matrix with no rows, whatever the model's outputs.
@@ -1253,13 +1347,13 @@ impl Booster {
         // SAFETY: on success `data` points to `len` bytes.
         let config: serde_json::Value =
             serde_json::from_slice(unsafe { borrowed_slice(data.cast::<u8>(), len) }?)
-                .map_err(|e| Error(format!("XGBoost returned an invalid config: {e}")))?;
+                .map_err(|e| Error::new(format!("XGBoost returned an invalid config: {e}")))?;
         let parameter = |name: &str| -> Result<usize> {
             let value = &config["learner"]["learner_model_param"][name];
             value
                 .as_str()
                 .and_then(|text| text.parse().ok())
-                .ok_or_else(|| Error(format!("the model config has no {name}: {value}")))
+                .ok_or_else(|| Error::new(format!("the model config has no {name}: {value}")))
         };
         let classes = parameter("num_class")?;
         Ok(if classes > 0 { classes } else { parameter("num_target")?.max(1) })
@@ -1292,7 +1386,7 @@ impl Booster {
         let mut rounds: c_int = 0;
         // SAFETY: the handle is live and `rounds` is a valid out-pointer.
         check(unsafe { ffi::XGBoosterBoostedRounds(self.handle, &mut rounds) })?;
-        usize::try_from(rounds).map_err(|_| Error(format!("negative round count {rounds}")))
+        usize::try_from(rounds).map_err(|_| Error::new(format!("negative round count {rounds}")))
     }
 
     /// A new booster with only rounds `[0, rounds)` (e.g. to keep the best early-stopping
@@ -1304,9 +1398,9 @@ impl Booster {
     pub fn truncated(&self, rounds: usize) -> Result<Self> {
         let trained = self.boosted_rounds()?;
         if rounds == 0 || rounds > trained {
-            return Err(Error(format!("cannot keep {rounds} of {trained} rounds")));
+            return Err(Error::new(format!("cannot keep {rounds} of {trained} rounds")));
         }
-        let end = c_int::try_from(rounds).map_err(|_| Error("round count overflow".into()))?;
+        let end = c_int::try_from(rounds).map_err(|_| Error::new("round count overflow"))?;
         let mut handle = ptr::null_mut();
         // SAFETY: the handle is live and `handle` is a valid out-pointer for the new booster.
         check(unsafe { ffi::XGBoosterSlice(self.handle, 0, end, 1, &mut handle) })?;
@@ -1330,12 +1424,198 @@ mod tests {
 
     const TWO: NonZeroUsize = NonZeroUsize::new(2).expect("2 is non-zero");
 
-    /// Runs the check for `runtime` with `-t 2` and the given variables set.
+    /// The vendored C API header, where XGBoost declares the functions `mod ffi` binds.
+    const C_API_HEADER: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/xgboost/include/xgboost/c_api.h");
+
+    /// A C type from `c_api.h` (e.g. `char const **`, or `const char *` of an array parameter
+    /// `name[]` with `array`), as `mod ffi` writes it in Rust.
+    fn rust_type(c_type: &str, array: bool) -> String {
+        let spaced = c_type.replace('*', " * ");
+        let tokens: Vec<&str> = spaced.split_whitespace().collect();
+        let stars = tokens.iter().position(|&t| t == "*").unwrap_or(tokens.len());
+        let base = tokens[..stars].iter().find(|&&t| t != "const").copied().unwrap_or("?");
+        let mut pointee_const = tokens[..stars].contains(&"const");
+        let mut rust = match base {
+            "char" => "c_char",
+            "float" => "c_float",
+            "int" => "c_int",
+            "void" => "c_void",
+            "bst_ulong" => "BstUlong",
+            other => other,
+        }
+        .to_string();
+        let mut rest = tokens[stars..].iter().peekable();
+        let mut levels = Vec::new();
+        while let Some(&token) = rest.next() {
+            assert_eq!(token, "*", "{c_type}");
+            levels.push(pointee_const);
+            pointee_const = rest.next_if(|&&t| t == "const").is_some();
+        }
+        if array {
+            levels.push(pointee_const);
+        }
+        for is_const in levels {
+            rust = format!("{} {rust}", if is_const { "*const" } else { "*mut" });
+        }
+        rust
+    }
+
+    /// The parameter types and return type of `name` as `c_api.h` declares it, in Rust.
+    fn declared_in_header(header: &str, name: &str) -> (Vec<String>, Option<String>) {
+        let at = header
+            .match_indices(&format!("{name}("))
+            .map(|(at, _)| at)
+            .find(|&at| {
+                let line = header[..at].rsplit('\n').next().unwrap_or_default();
+                line.starts_with("XGB_DLL") && (line.ends_with(' ') || line.ends_with('*'))
+            })
+            .unwrap_or_else(|| panic!("{name} is not declared in {C_API_HEADER}"));
+        let line_start = header[..at].rfind('\n').map_or(0, |i| i + 1);
+        let returns = header[line_start..at].trim_start_matches("XGB_DLL").trim();
+        let close = at + header[at..].find(')').expect("a closing parenthesis");
+        // Without comments.
+        let params: String = header[at + name.len() + 1..close]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let params = params.trim();
+        let params = if params.is_empty() || params == "void" {
+            Vec::new()
+        } else {
+            params
+                .split(',')
+                .map(|param| {
+                    let param = param.trim();
+                    let array = param.ends_with("[]");
+                    let param = param.trim_end_matches("[]");
+                    // The parameter name is the last identifier.
+                    let split = param
+                        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .map_or(0, |i| i + 1);
+                    rust_type(&param[..split], array)
+                })
+                .collect()
+        };
+        let returns = (returns != "void").then(|| rust_type(returns, false));
+        (params, returns)
+    }
+
+    /// Each function in `mod ffi`, with its parameter types and return type.
+    fn bound_in_ffi() -> Vec<(String, Vec<String>, Option<String>)> {
+        let source = include_str!("lib.rs");
+        let module = source.find("\nmod ffi {").expect("mod ffi");
+        let start =
+            module + source[module..].find("unsafe extern \"C\" {").expect("its extern block");
+        let end = start + source[start..].find("\n    }\n").expect("the end of the extern block");
+        source[start..end]
+            .split("pub fn ")
+            .skip(1)
+            .map(|declaration| {
+                let declaration: String =
+                    declaration.split_whitespace().collect::<Vec<_>>().join(" ");
+                let open = declaration.find('(').expect("parameters");
+                let close = declaration.rfind(')').expect("parameters");
+                let name = declaration[..open].to_string();
+                let params = declaration[open + 1..close]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|param| !param.is_empty())
+                    .map(|param| param.split_once(':').expect("name: type").1.trim().to_string())
+                    .collect();
+                let returns = declaration[close + 1..]
+                    .trim()
+                    .strip_prefix("->")
+                    .map(|ty| ty.trim_end_matches(';').trim().to_string());
+                (name, params, returns)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ffi_declarations_match_the_c_api_header() {
+        let header = std::fs::read_to_string(C_API_HEADER).unwrap();
+        // The handle and length types are the header's.
+        for typedef in [
+            "typedef uint64_t bst_ulong;",
+            "typedef void *DMatrixHandle;",
+            "typedef void *BoosterHandle;",
+        ] {
+            assert!(header.contains(typedef), "{typedef}");
+        }
+        // ... and so are `mod ffi`'s aliases of them.
+        let _: fn(ffi::BstUlong) -> u64 = |length| length;
+        let _: fn(ffi::DMatrixHandle) -> *mut std::ffi::c_void = |handle| handle;
+        let _: fn(ffi::BoosterHandle) -> *mut std::ffi::c_void = |handle| handle;
+        let bound = bound_in_ffi();
+        // Every declaration is parsed (a binding added to `mod ffi` is added here too).
+        let mut names: Vec<&str> = bound.iter().map(|(name, ..)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "XGBGetLastError",
+                "XGBoostVersion",
+                "XGBoosterBoostedRounds",
+                "XGBoosterCreate",
+                "XGBoosterEvalOneIter",
+                "XGBoosterFree",
+                "XGBoosterGetNumFeature",
+                "XGBoosterGetStrFeatureInfo",
+                "XGBoosterLoadModelFromBuffer",
+                "XGBoosterPredictFromDMatrix",
+                "XGBoosterSaveJsonConfig",
+                "XGBoosterSaveModelToBuffer",
+                "XGBoosterSetParams",
+                "XGBoosterSetStrFeatureInfo",
+                "XGBoosterSlice",
+                "XGBoosterUpdateOneIter",
+                "XGDMatrixCreateFromMat_omp",
+                "XGDMatrixFree",
+                "XGDMatrixGetStrFeatureInfo",
+                "XGDMatrixNumCol",
+                "XGDMatrixNumRow",
+                "XGDMatrixSetFloatInfo",
+                "XGDMatrixSetStrFeatureInfo",
+            ]
+        );
+        // Pointer mutability is not compared: `mod ffi` declares some out-pointers' targets
+        // `*const` (read-only views of what XGBoost hands back) where C has them mutable, which
+        // has the same ABI. The arity, the base types and the pointer depths must match.
+        let erased = |types: &[String]| -> Vec<String> {
+            types.iter().map(|t| t.replace("*const ", "*").replace("*mut ", "*")).collect()
+        };
+        for (name, params, returns) in bound {
+            let (header_params, header_returns) = declared_in_header(&header, &name);
+            assert_eq!(erased(&params), erased(&header_params), "{name}");
+            assert_eq!(
+                erased(returns.as_slice()),
+                erased(header_returns.as_slice()),
+                "{name} returns"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case("int", false, "c_int")]
+    #[case("const char *", false, "*const c_char")]
+    #[case("char const **", false, "*mut *const c_char")]
+    #[case("const char ***", false, "*mut *mut *const c_char")]
+    #[case("const char *", true, "*mut *const c_char")]
+    #[case("const DMatrixHandle", true, "*const DMatrixHandle")]
+    #[case("bst_ulong const **", false, "*mut *const BstUlong")]
+    #[case("char * const *", false, "*const *mut c_char")]
+    fn maps_c_types_to_rust(#[case] c_type: &str, #[case] array: bool, #[case] expected: &str) {
+        assert_eq!(rust_type(c_type, array), expected);
+    }
+
+    /// Runs the check for `runtime` with two threads and the given variables set.
     fn check_with(runtime: OpenMpRuntime, set: &[(&str, &str)]) -> std::result::Result<(), String> {
         let var = |name: &str| {
             set.iter().find(|(set_name, _)| *set_name == name).map(|(_, value)| value.to_string())
         };
-        runtime.check_environment(TWO, var)
+        runtime.check_environment(TWO, var).map_err(|problem| problem.to_string())
     }
 
     #[rstest]
@@ -1409,7 +1689,46 @@ mod tests {
             if cfg!(target_os = "macos") { OpenMpRuntime::LibOmp } else { OpenMpRuntime::LibGomp };
         assert_eq!(OpenMpRuntime::LINKED, expected);
         let var = |name: &str| (name == "OMP_THREAD_LIMIT").then(|| "1".to_string());
-        assert!(check_openmp_environment(TWO, var).unwrap_err().starts_with("OMP_THREAD_LIMIT=1"));
+        let error = check_openmp_environment(TWO, var).unwrap_err();
+        assert_eq!(
+            error.openmp_problem(),
+            Some(&OpenMpProblem::ThreadLimit { limit: 1, threads: TWO })
+        );
+        assert_eq!(
+            error.openmp_problem().unwrap().explanation(),
+            "OMP_THREAD_LIMIT=1 is below the 2 threads requested, so XGBoost would run with 1 \
+             thread"
+        );
+        assert_eq!(
+            error.to_string(),
+            "XGBoost: OMP_THREAD_LIMIT=1 is below the 2 threads requested, so XGBoost would run \
+             with 1 thread, and a model trained so is not the one 2 threads would train; request \
+             1 thread or fewer, or raise or unset OMP_THREAD_LIMIT"
+        );
+        assert_eq!(Error::new("other").openmp_problem(), None);
+    }
+
+    #[rstest]
+    #[case::dynamic(
+        OpenMpProblem::Dynamic { value: "true".to_string() },
+        "OMP_DYNAMIC=true lets OpenMP give XGBoost fewer threads than it asks for, which XGBoost's \
+         training does not handle (it can lose rows or crash); unset OMP_DYNAMIC or set it to false"
+    )]
+    #[case::hidden(
+        OpenMpProblem::HiddenThreadLimit { variable: "KMP_ALL_THREADS", limit: 1, threads: TWO },
+        "KMP_ALL_THREADS=1 is below the 2 threads requested, so OpenMP would give XGBoost fewer \
+         threads than it asks for, which XGBoost's training does not handle (it can lose rows or \
+         crash); request 1 thread or fewer, or raise or unset KMP_ALL_THREADS"
+    )]
+    #[case::thread_limit(
+        OpenMpProblem::ThreadLimit { limit: 1, threads: TWO },
+        "OMP_THREAD_LIMIT=1 is below the 2 threads requested, so XGBoost would run with 1 thread, \
+         and a model trained so is not the one 2 threads would train; request 1 thread or fewer, \
+         or raise or unset OMP_THREAD_LIMIT"
+    )]
+    fn openmp_problems_explain_what_to_do(#[case] problem: OpenMpProblem, #[case] expected: &str) {
+        assert_eq!(problem.to_string(), expected);
+        assert!(expected.starts_with(&problem.explanation()), "{expected}");
     }
 
     /// A separable two-feature, three-class dataset: the class is set by the first feature.
@@ -1722,26 +2041,6 @@ mod tests {
     }
 
     #[test]
-    fn weights_change_the_trained_model() {
-        let (features, labels) = three_class_data(90);
-        let first_round = |weights: Option<&[f32]>| {
-            let mut matrix = DMatrix::from_dense(&features, 90, 2, f32::NAN).unwrap();
-            matrix.set_labels(&labels).unwrap();
-            if let Some(weights) = weights {
-                matrix.set_weights(weights).unwrap();
-            }
-            let mut booster = Booster::new(&[&matrix], TWO).unwrap();
-            booster.set_params(&[("objective", "multi:softprob"), ("num_class", "3")]).unwrap();
-            booster.update(0, &matrix).unwrap();
-            booster.predict(&matrix).unwrap()
-        };
-        // Up-weight class 0, so the first round raises row 0's class-0 probability further.
-        let weights: Vec<f32> = (0..90).map(|i| if i % 3 == 0 { 20.0 } else { 1.0 }).collect();
-        let (unweighted, weighted) = (first_round(None), first_round(Some(&weights)));
-        assert!(weighted.values[0] > unweighted.values[0], "{weighted:?} vs {unweighted:?}");
-    }
-
-    #[test]
     fn missing_sentinel_values_predict_like_nan() {
         let (booster, _) = trained_booster(5);
         let sentinel = -999.0;
@@ -1803,8 +2102,6 @@ mod tests {
         assert_eq!(error.message(), "3 values do not fill 2 rows of 2 columns");
         let mut matrix = DMatrix::from_dense(&[1.0, 2.0, 3.0, 4.0], 2, 2, f32::NAN).unwrap();
         assert_eq!(matrix.set_labels(&[1.0]).unwrap_err().message(), "1 labels for 2 rows");
-        let error = matrix.set_weights(&[1.0, 1.0, 1.0]).unwrap_err();
-        assert_eq!(error.message(), "3 weights for 2 rows");
         let error = matrix.set_feature_names(&["only_one"]).unwrap_err();
         assert_eq!(error.message(), "1 feature names for 2 columns");
         assert_eq!((matrix.num_rows().unwrap(), matrix.num_cols().unwrap()), (2, 2));

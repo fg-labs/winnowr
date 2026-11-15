@@ -1843,9 +1843,27 @@ pub fn run(cli: &Cli) -> Result<()> {
     // Only training needs the full OpenMP team (see check_openmp_environment).
     if matches!(cli.command, Command::Train(_)) {
         winnowr_xgboost::check_openmp_environment(threads, |name| std::env::var(name).ok())
-            .map_err(anyhow::Error::msg)?;
+            .map_err(openmp_error)?;
     }
     dispatch(&cli.command, threads)
+}
+
+/// The error for an OpenMP environment that training cannot run in: the problem, with advice
+/// that names `-t` (see [`winnowr_xgboost::OpenMpProblem`]).
+fn openmp_error(error: winnowr_xgboost::Error) -> anyhow::Error {
+    use winnowr_xgboost::OpenMpProblem;
+    let Some(problem) = error.openmp_problem() else { return error.into() };
+    let explanation = problem.explanation();
+    match problem {
+        OpenMpProblem::Dynamic { .. } => anyhow::anyhow!(problem.to_string()),
+        OpenMpProblem::HiddenThreadLimit { variable, limit, .. } => {
+            anyhow::anyhow!("{explanation}; use -t {limit} or less, or raise or unset {variable}")
+        }
+        OpenMpProblem::ThreadLimit { limit, threads } => anyhow::anyhow!(
+            "{explanation}, and a model trained so is not the one -t {threads} names; use -t \
+             {limit} or less, or raise or unset OMP_THREAD_LIMIT"
+        ),
+    }
 }
 
 /// A command line as one string, for the log, that a POSIX shell reads back as the same arguments:
@@ -2622,6 +2640,44 @@ mod tests {
         assert_eq!(shown("keep_fallback"), names);
         assert_eq!(shown("outside_indel_t_drop"), [DEFAULT_OUTSIDE_INDEL_T_DROP.to_string()]);
         assert_eq!(OutsideTDrop(None).to_string(), "none");
+    }
+
+    // The messages winnowr gave before the OpenMP check moved into winnowr-xgboost, unchanged.
+    #[rstest]
+    #[case::dynamic(
+        winnowr_xgboost::OpenMpProblem::Dynamic { value: "1".to_string() },
+        "OMP_DYNAMIC=1 lets OpenMP give XGBoost fewer threads than it asks for, which XGBoost's \
+         training does not handle (it can lose rows or crash); unset OMP_DYNAMIC or set it to false"
+    )]
+    #[case::hidden(
+        winnowr_xgboost::OpenMpProblem::HiddenThreadLimit {
+            variable: "KMP_DEVICE_THREAD_LIMIT",
+            limit: 1,
+            threads: NonZeroUsize::new(2).unwrap(),
+        },
+        "KMP_DEVICE_THREAD_LIMIT=1 is below the 2 threads requested, so OpenMP would give XGBoost \
+         fewer threads than it asks for, which XGBoost's training does not handle (it can lose rows \
+         or crash); use -t 1 or less, or raise or unset KMP_DEVICE_THREAD_LIMIT"
+    )]
+    #[case::thread_limit(
+        winnowr_xgboost::OpenMpProblem::ThreadLimit { limit: 1, threads: NonZeroUsize::new(2).unwrap() },
+        "OMP_THREAD_LIMIT=1 is below the 2 threads requested, so XGBoost would run with 1 thread, \
+         and a model trained so is not the one -t 2 names; use -t 1 or less, or raise or unset \
+         OMP_THREAD_LIMIT"
+    )]
+    fn openmp_errors_name_the_thread_option(
+        #[case] problem: winnowr_xgboost::OpenMpProblem,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(openmp_error(problem.into()).to_string(), expected);
+    }
+
+    #[test]
+    fn other_xgboost_errors_pass_through_openmp_error() {
+        let error = winnowr_xgboost::Booster::from_json(b"[]", NonZeroUsize::new(1).unwrap())
+            .expect_err("an invalid model");
+        let message = error.to_string();
+        assert_eq!(openmp_error(error).to_string(), message);
     }
 
     #[rstest]
