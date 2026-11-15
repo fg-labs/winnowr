@@ -2,7 +2,9 @@
 //! the calls (`winnowr strlen` and `winnowr pileup`): the regions measured, their shards, the
 //! readers each shard uses, and helpers for reading the reads.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use anyhow::{Context, Result, bail};
 
@@ -408,19 +410,49 @@ where
     // Reader sets are pooled, so at most one per worker thread is ever opened, and a shard takes
     // a set already holding its contig's sequence when there is one.
     let pool: ReaderPool<ShardReaders> = ReaderPool::new();
+    let contigs = SharedContigs::default();
     shards
         .par_iter()
         .map(|(chrom, start, end)| {
             let mut readers =
                 pool.take_preferring(|readers| readers.holds(chrom)).unwrap_or_default();
-            let measured =
-                readers.open(inputs, chrom, cram_fields).and_then(|(vcf, reads, contig)| {
+            let measured = readers.open(inputs, chrom, cram_fields, &contigs).and_then(
+                |(vcf, reads, contig)| {
                     measure(&mut Shard { chrom, start: *start, end: *end, vcf, reads, contig })
-                });
+                },
+            );
             pool.put(readers);
             measured
         })
         .collect()
+}
+
+/// Contig sequences shared by the reader sets of a pass: sets on the same contig hold one copy of
+/// its sequence, read once while any set holds it, rather than one copy each (a whole contig,
+/// e.g. ~250 MB for chr1, per worker thread).
+#[derive(Default)]
+struct SharedContigs(Mutex<HashMap<String, Arc<ContigSlot>>>);
+
+/// A contig's sequence while some reader set holds it; locked while it is read.
+type ContigSlot = Mutex<Weak<Vec<u8>>>;
+
+impl SharedContigs {
+    /// `chrom`'s sequence: the copy a reader set holds, else read from `fasta`. A sequence is
+    /// freed when no set holds it.
+    fn get(&self, chrom: &str, fasta: &mut crate::fasta::IndexedFasta) -> Result<Arc<Vec<u8>>> {
+        let slot = {
+            let mut slots = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(slots.entry(chrom.to_string()).or_default())
+        };
+        // Sets that want the contig while it is being read wait for it rather than read it too.
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sequence) = slot.upgrade() {
+            return Ok(sequence);
+        }
+        let sequence = Arc::new(fasta.fetch_all(chrom)?);
+        *slot = Arc::downgrade(&sequence);
+        Ok(sequence)
+    }
 }
 
 /// Readers and the last contig's sequence, reused across the shards measured with them.
@@ -429,7 +461,7 @@ struct ShardReaders {
     vcf: Option<rust_htslib::bcf::IndexedReader>,
     reads: Option<rust_htslib::bam::IndexedReader>,
     fasta: Option<crate::fasta::IndexedFasta>,
-    contig: Option<(String, Vec<u8>)>,
+    contig: Option<(String, Arc<Vec<u8>>)>,
 }
 
 impl ShardReaders {
@@ -439,12 +471,13 @@ impl ShardReaders {
     }
 
     /// Opens the readers not yet open (the reads decoding only the CRAM fields `cram_fields`) and
-    /// loads `chrom`'s sequence if it is not loaded.
+    /// takes `chrom`'s sequence from `contigs` if it is not held.
     fn open(
         &mut self,
         inputs: &ReadInputs<'_>,
         chrom: &str,
         cram_fields: u32,
+        contigs: &SharedContigs,
     ) -> Result<(&mut rust_htslib::bcf::IndexedReader, &mut rust_htslib::bam::IndexedReader, &[u8])>
     {
         use rust_htslib::bam::Read as _;
@@ -467,8 +500,10 @@ impl ShardReaders {
         if self.fasta.is_none() {
             self.fasta = Some(crate::fasta::IndexedFasta::from_path(inputs.reference)?);
         }
-        if self.contig.as_ref().is_none_or(|(name, _)| name != chrom) {
-            let sequence = self.fasta.as_mut().expect("opened above").fetch_all(chrom)?;
+        if !self.holds(chrom) {
+            // The last contig is let go first, so it is freed if no other set holds it.
+            self.contig = None;
+            let sequence = contigs.get(chrom, self.fasta.as_mut().expect("opened above"))?;
             self.contig = Some((chrom.to_string(), sequence));
         }
         let (Some(vcf), Some(reads), Some((_, contig))) =
@@ -476,7 +511,7 @@ impl ShardReaders {
         else {
             unreachable!("the readers were opened above");
         };
-        Ok((vcf, reads, contig))
+        Ok((vcf, reads, contig.as_slice()))
     }
 }
 
@@ -525,6 +560,26 @@ mod tests {
             error.to_string(),
             "region chr1:5000-6000 starts past the end of contig chr1 (1000 bp)"
         );
+    }
+
+    #[test]
+    fn reader_sets_share_a_contig_while_any_holds_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path =
+            crate::testing::write_fasta(dir.path(), &[("chr1", "ACGTACGTAC"), ("chr2", "GG")]);
+        let mut fasta = crate::fasta::IndexedFasta::from_path(&path).unwrap();
+        let contigs = SharedContigs::default();
+        let first = contigs.get("chr1", &mut fasta).unwrap();
+        let second = contigs.get("chr1", &mut fasta).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_slice(), b"ACGTACGTAC");
+        assert_eq!(contigs.get("chr2", &mut fasta).unwrap().as_slice(), b"GG");
+        // Freed when no set holds it, and read again when next wanted.
+        let weak = Arc::downgrade(&first);
+        drop((first, second));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(contigs.get("chr1", &mut fasta).unwrap().as_slice(), b"ACGTACGTAC");
+        assert!(contigs.get("chr3", &mut fasta).is_err());
     }
 
     #[rstest]

@@ -1,8 +1,9 @@
 //! Per-read repeat-tract lengths at indel calls ("strlen" evidence): the repeat tract, the length
 //! histogram, and the strlen tables `winnowr strlen` writes.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::BuildHasher;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -468,6 +469,10 @@ pub(crate) fn tract_window(tract: &RepeatTract, flank: u64) -> ((i64, i64), (i64
     ((first, last), (first.max(0), last + 1))
 }
 
+/// Read names found by hash, stored with their hashes: a name is hashed once (the stored hashes
+/// grow the table) and copied only when new.
+type ReadNames = (std::hash::RandomState, hashbrown::HashTable<(u64, Vec<u8>)>);
+
 /// The read evidence for one tract, accumulated over the reads overlapping it, in order.
 struct TractAccumulator {
     first: i64,
@@ -476,7 +481,7 @@ struct TractAccumulator {
     length: i64,
     min_mapq: u8,
     /// The names of the measured reads, when mates are collapsed.
-    measured: Option<HashSet<Vec<u8>>>,
+    measured: Option<ReadNames>,
     n_overlap: u64,
     n_spanning: u64,
     histogram: Histogram,
@@ -497,7 +502,7 @@ impl TractAccumulator {
             flank,
             length: tract.length() as i64,
             min_mapq: options.min_mapq,
-            measured: options.collapse_mates.then(HashSet::new),
+            measured: options.collapse_mates.then(Default::default),
             n_overlap: 0,
             n_spanning: 0,
             histogram: Histogram::new(),
@@ -548,10 +553,16 @@ impl TractAccumulator {
         if record.mapq() < self.min_mapq {
             return;
         }
-        if let Some(measured) = &mut self.measured
-            && !measured.insert(record.qname().to_vec())
-        {
-            return;
+        if let Some((hasher, measured)) = &mut self.measured {
+            let name = record.qname();
+            let hash = hasher.hash_one(name);
+            let same = |(h, seen): &(u64, Vec<u8>)| *h == hash && seen == name;
+            match measured.entry(hash, same, |&(h, _)| h) {
+                hashbrown::hash_table::Entry::Occupied(_) => return,
+                hashbrown::hash_table::Entry::Vacant(entry) => {
+                    entry.insert((hash, name.to_vec()));
+                }
+            }
         }
         *self.histogram.entry(observed - self.length).or_insert(0) += 1;
         self.n_spanning += 1;

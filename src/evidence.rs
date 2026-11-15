@@ -1,8 +1,8 @@
 //! Read-evidence tables: the tab-separated tables `winnowr strlen` and `winnowr pileup` write,
 //! each starting with a line that records the settings its evidence was measured with.
 
-use std::collections::HashSet;
 use std::fmt;
+use std::hash::BuildHasher;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -66,7 +66,10 @@ pub fn read_tables<E: Evidence>(paths: &[impl AsRef<Path>]) -> Result<EvidenceTa
         bail!("no {} tables given", E::NAME);
     }
     let mut rows = Vec::new();
-    let mut seen: HashSet<(String, u64, String, String)> = HashSet::new();
+    // The rows kept, by the hash of their key: the hash (so the table grows without hashing keys
+    // again) and the index into `rows`, whose key is compared, so no key is copied.
+    let hasher = std::hash::RandomState::new();
+    let mut seen: hashbrown::HashTable<(u64, usize)> = hashbrown::HashTable::new();
     let mut options: Option<(E, &Path)> = None;
     for path in paths {
         let path = path.as_ref();
@@ -115,8 +118,12 @@ pub fn read_tables<E: Evidence>(paths: &[impl AsRef<Path>]) -> Result<EvidenceTa
             }
             let row =
                 E::parse_row(&line).with_context(|| format!("{}:{line_number}", path.display()))?;
-            let (chrom, pos, reference, alt) = E::row_key(&row);
-            if seen.insert((chrom.to_string(), pos, reference.to_string(), alt.to_string())) {
+            let key = E::row_key(&row);
+            let hash = hasher.hash_one(key);
+            let same = |&(h, i): &(u64, usize)| h == hash && E::row_key(&rows[i]) == key;
+            if let hashbrown::hash_table::Entry::Vacant(entry) = seen.entry(hash, same, |&(h, _)| h)
+            {
+                entry.insert((hash, rows.len()));
                 rows.push(row);
             }
         }

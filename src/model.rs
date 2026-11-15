@@ -559,14 +559,27 @@ pub fn to_matrix<S: AsRef<str>>(table: &FeatureTable, features: &[S]) -> Result<
     if !missing.is_empty() {
         bail!("the feature table lacks model features: {}", missing.join(", "));
     }
+    let width = features.len();
     let rows = table.num_rows();
-    let mut matrix = vec![f32::NAN; rows * features.len()];
-    for (column, name) in features.iter().enumerate() {
-        let values = table.f64_column(name.as_ref())?;
-        for (row, &value) in values.iter().enumerate() {
-            let value = value as f32;
-            matrix[row * features.len() + column] =
-                if value.is_infinite() { f32::NAN } else { value };
+    let mut matrix = vec![f32::NAN; rows * width];
+    // Filled a few columns at a time (a column with nulls is copied, so not all at once), a block
+    // of rows at a time, so that the writes stay in the block's cache lines rather than striding
+    // the whole matrix once per column.
+    const GROUP_COLUMNS: usize = 8;
+    const BLOCK_ROWS: usize = 4096;
+    for (group, names) in features.chunks(GROUP_COLUMNS).enumerate() {
+        let columns: Vec<_> =
+            names.iter().map(|name| table.f64_column(name.as_ref())).collect::<Result<_>>()?;
+        for first in (0..rows).step_by(BLOCK_ROWS) {
+            let last = (first + BLOCK_ROWS).min(rows);
+            for (offset, values) in columns.iter().enumerate() {
+                let column = group * GROUP_COLUMNS + offset;
+                for (row, &value) in (first..last).zip(&values[first..last]) {
+                    let value = value as f32;
+                    matrix[row * width + column] =
+                        if value.is_infinite() { f32::NAN } else { value };
+                }
+            }
         }
     }
     Ok(matrix)
@@ -748,6 +761,39 @@ mod tests {
             pileup_settings: None,
             winnowr_version: crate::version::VERSION.clone(),
             xgboost_version: "3.4.2".to_string(),
+        }
+    }
+
+    /// The matrix is the features' values row by row, in the features' order, whatever the
+    /// blocks and column groups it is filled in.
+    #[test]
+    fn to_matrix_is_the_features_row_by_row() {
+        let (rows, width) = (4097, 10);
+        let names: Vec<String> = (0..width).map(|c| format!("f{c}")).collect();
+        let value = |row: usize, column: usize| match (row + column) % 7 {
+            0 => f64::INFINITY,
+            1 => f64::NEG_INFINITY,
+            2 => f64::NAN,
+            _ => (row * 31 + column) as f64 / 3.0,
+        };
+        let columns: Vec<(&str, Vec<f64>)> = names
+            .iter()
+            .enumerate()
+            .map(|(c, name)| (name.as_str(), (0..rows).map(|r| value(r, c)).collect()))
+            .collect();
+        let table = table(&columns);
+        // The features in another order than the table's columns.
+        let order: Vec<usize> = (0..width).rev().collect();
+        let features: Vec<&str> = order.iter().map(|&c| names[c].as_str()).collect();
+        let matrix = to_matrix(&table, &features).unwrap();
+        assert_eq!(matrix.len(), rows * width);
+        for row in 0..rows {
+            for (i, &column) in order.iter().enumerate() {
+                let expected = value(row, column) as f32;
+                let expected = if expected.is_infinite() { f32::NAN } else { expected };
+                let got = matrix[row * width + i];
+                assert_eq!(got.to_bits(), expected.to_bits(), "row {row}, feature {i}");
+            }
         }
     }
 

@@ -25,6 +25,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use smallvec::SmallVec;
 
 use crate::alleles::{length_change, variant_type_of};
 use crate::common::VariantType;
@@ -309,7 +310,9 @@ impl Substitutions {
     ) -> Option<usize> {
         let start = u64::try_from(record.pos()).ok()?;
         let (qualities, sequence) = (record.qual(), record.seq());
-        let mut bases = Vec::with_capacity(self.positions.len());
+        // The read's bases, on the stack for the usual few positions: this runs for every read at
+        // every site.
+        let mut bases: SmallVec<[u8; 8]> = SmallVec::with_capacity(self.positions.len());
         for &at in &self.positions {
             let query = query_position_at(cigar, start, u64::try_from(at).ok()?)? as usize;
             let quality = *qualities.get(query)?;
@@ -319,9 +322,10 @@ impl Substitutions {
             }
             bases.push(sequence[query].to_ascii_uppercase());
         }
-        Some(if bases == self.reference {
+        let bases = bases.as_slice();
+        Some(if bases == self.reference.as_slice() {
             REF
-        } else if self.alts.contains(&bases) {
+        } else if self.alts.iter().any(|alt| alt.as_slice() == bases) {
             ALT
         } else {
             OTHER
@@ -812,6 +816,45 @@ mod tests {
         let counted = count_sites(&mut reader, 0, &[site], &options).unwrap();
         assert_eq!(counted[0].n_reads, 7);
         assert_eq!(counted[0].counts, [[0, 0, 1], [0, 0, 4], [0, 0, 1]]);
+    }
+
+    #[test]
+    fn counts_alleles_substituted_at_more_bases_than_fit_on_the_stack() {
+        let dir = TempDir::new().unwrap();
+        let options = PileupOptions::default();
+        // Ten substituted bases at 0-based [122, 132), more than the 8 a read's bases hold on the
+        // stack: the alternate changes every one.
+        let positions: Vec<usize> = (122..132).collect();
+        let change = |base: u8| match base {
+            b'A' => 'C',
+            b'C' => 'G',
+            b'G' => 'T',
+            _ => 'A',
+        };
+        let alt: Vec<(usize, char)> =
+            positions.iter().map(|&at| (at, change(reference().as_bytes()[at]))).collect();
+        let reads: Vec<(&str, String)> = vec![
+            ("ref", bases_with(90, 160, &[])),
+            ("alt", bases_with(90, 160, &alt)),
+            // The alternate but for its last base.
+            ("other", bases_with(90, 160, &alt[..alt.len() - 1])),
+        ];
+        let reads: Vec<TestRead<'_>> = reads
+            .iter()
+            .map(|(name, bases)| TestRead { bases: Some(bases), ..read(name, 90, "70M", 60) })
+            .collect();
+        let bam = write_bam(dir.path(), "reads.bam", reference().len() as u64, &reads);
+        let substitutions = Substitutions {
+            positions: positions.iter().map(|&at| at as i64).collect(),
+            reference: reference().as_bytes()[122..132].to_vec(),
+            alts: vec![alt.iter().map(|&(_, base)| base as u8).collect()],
+        };
+        let span = substitutions.span();
+        let site = Site { kind: SiteKind::Snp(substitutions), span };
+        let mut reader = rust_htslib::bam::IndexedReader::from_path(&bam).unwrap();
+        let counted = count_sites(&mut reader, 0, &[site], &options).unwrap();
+        assert_eq!(counted[0].n_reads, 3);
+        assert_eq!(counted[0].counts, [[0, 0, 1], [0, 0, 1], [0, 0, 1]]);
     }
 
     #[test]

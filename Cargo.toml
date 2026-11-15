@@ -49,6 +49,8 @@ env_logger = "0.11.11"
 # Checks the magic bytes of tabix and CSI indexes, and writes the gzipped `stratify` calls file
 # (text inputs are read through htslib).
 flate2 = "1.1.11"
+# Hash tables of row indices and read names, found by hash without copying their keys.
+hashbrown = { version = "0.17.1", default-features = false }
 # Ordered maps for metadata that keeps the order it was given in (e.g. contigs).
 indexmap = { version = "2.14.2", features = ["serde"] }
 log = "0.4.35"
@@ -68,6 +70,8 @@ tempfile = "3.27.0"
 serde = { version = "1.0.229", features = ["derive"] }
 # Correctly rounded float parsing, so model files read back exactly what was written.
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+# A read's few bases at a pileup site, on the stack.
+smallvec = "1.16.5"
 # XGBoost, built from the vendored source and linked statically with OpenMP, so the binary is
 # self-contained (see xgboost/build.rs).
 winnowr-xgboost = { version = "0.1.0", path = "xgboost" }
