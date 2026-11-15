@@ -140,7 +140,8 @@ pub(crate) enum Command {
     /// Each call is in one stratum by whether its REF span is inside each of two truth sets'
     /// confident regions: both, <second>-only, <first>-only or neither. Calls are scored as
     /// `score` does. Writes <output>.strata.tsv (actions, outcomes and F1 of the labelled calls
-    /// per truth set and stratum; the `all` rows match `evaluate`), <output>.rates.tsv (action
+    /// per truth set and stratum; the `all` rows match `evaluate`'s, except with a genotype and a
+    /// promote model in veto mode, which `evaluate` does not report), <output>.rates.tsv (action
     /// rates of every scored call per stratum, variant type and chromosome, with no truth needed)
     /// and <output>.calibration.tsv (binned P(keep) against the observed keep rate).
     ///

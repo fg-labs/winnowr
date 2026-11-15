@@ -12,8 +12,10 @@
 //! - the genotype model's P(keep) is binned against the observed fraction of `Keep` labels (see
 //!   [`Calibration`]).
 //!
-//! Summed over strata, a truth set's outcome is the `genotyper+promote` (or `genotyper`) row of
-//! `winnowr evaluate` for its table.
+//! Summed over strata, a truth set's outcome is a row of `winnowr evaluate` for its table: the
+//! `--mode` row (`genotyper` or `veto`), `genotyper+promote` with a genotype and a promote model in
+//! genotyper mode, or `promote` with only a promote model. `evaluate` has no row for a genotype and
+//! a promote model in veto mode, so those outcomes match none.
 
 use std::collections::BTreeMap;
 use std::io::Write;
