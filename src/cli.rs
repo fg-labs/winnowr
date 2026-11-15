@@ -435,20 +435,6 @@ pub(crate) struct EvaluateArgs {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OutsideTDrop(Option<f64>);
 
-/// Parses a probability: a finite number in `[0, 1]`.
-///
-/// # Errors
-///
-/// Returns an error naming the value if it is not a number, not finite, or outside `[0, 1]`.
-fn parse_probability(text: &str) -> Result<f64> {
-    let value: f64 = text.parse().with_context(|| format!("not a number: {text}"))?;
-    // A NaN fails the range check too.
-    if !(0.0..=1.0).contains(&value) {
-        bail!("must be a probability between 0 and 1, got {text}");
-    }
-    Ok(value)
-}
-
 impl std::fmt::Display for OutsideTDrop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
@@ -471,6 +457,20 @@ impl std::str::FromStr for OutsideTDrop {
         }
         Ok(OutsideTDrop(Some(value)))
     }
+}
+
+/// Parses a probability: a finite number in `[0, 1]`.
+///
+/// # Errors
+///
+/// Returns an error naming the value if it is not a number, not finite, or outside `[0, 1]`.
+fn parse_probability(text: &str) -> Result<f64> {
+    let value: f64 = text.parse().with_context(|| format!("not a number: {text}"))?;
+    // A NaN fails the range check too.
+    if !(0.0..=1.0).contains(&value) {
+        bail!("must be a probability between 0 and 1, got {text}");
+    }
+    Ok(value)
 }
 
 /// Options that change how genotype and promote models act, beyond their thresholds.

@@ -24,11 +24,12 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::common::{PhaseTimer, Task, VariantType};
-use crate::evaluation::metric_float;
+use crate::io::write_tsv;
 use crate::labels::{
     HappyFn, Label, PromoteLabel, TRUTH_DELTA_COLUMNS, labelled_mask, read_happy_fns,
 };
 use crate::model::WinnowrModel;
+use crate::numeric::metric_float;
 use crate::policy::{ModelRowDecisions, Policy, check_model_kinds, decide_model_rows};
 use crate::promote_labels::promote_mask;
 use crate::regions::{RegionSet, ref_span};
@@ -125,26 +126,6 @@ pub type StratumFnCounts = BTreeMap<(VariantType, Stratum), i64>;
 
 /// Truth FN counts by variant type and region (an index into a list of region sets).
 pub type RegionFnCounts = BTreeMap<(VariantType, usize), i64>;
-
-/// The truth FN records of a hap.py output VCF on `contigs`, counted by variant type and stratum.
-///
-/// An FN's stratum is decided by its REF span as a call's is (see [`table_strata`]): it is inside
-/// a truth set's regions only if its whole span is. hap.py reports the FNs of its own truth set
-/// that overlap that truth set's regions, so an FN whose span crosses their edge falls in a
-/// stratum without that truth set, as a labelled call with the same span does; it still counts in
-/// the truth set's `all` row.
-///
-/// # Errors
-///
-/// Returns an error if the VCF cannot be read or is not hap.py output.
-#[cfg(test)]
-pub fn fn_strata<S: AsRef<str>>(
-    happy: &Path,
-    contigs: &[S],
-    beds: [&RegionSet; 2],
-) -> Result<StratumFnCounts> {
-    Ok(fn_counts(happy, contigs, beds, &[])?.0)
-}
 
 /// The truth FN records of a hap.py output VCF on `contigs`, counted by variant type and stratum
 /// (as `fn_strata`) and by variant type and each region of `regions` that the FN's REF span
@@ -1518,19 +1499,6 @@ pub const REGION_RATE_COLUMNS: [&str; 17] = [
     "promoted_per_pass",
 ];
 
-/// Writes a tab-separated file with a header line.
-fn write_tsv<I: Iterator<Item = Vec<String>>>(path: &Path, header: &[&str], rows: I) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut out = std::io::BufWriter::new(file);
-    writeln!(out, "{}", header.join("\t"))?;
-    for row in rows {
-        debug_assert_eq!(row.len(), header.len());
-        writeln!(out, "{}", row.join("\t"))?;
-    }
-    out.flush().with_context(|| format!("failed to write {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1540,6 +1508,25 @@ mod tests {
 
     use super::*;
     use crate::testing::{call_table, vcf_header, write_indexed_vcf};
+
+    /// The truth FN records of a hap.py output VCF on `contigs`, counted by variant type and stratum.
+    ///
+    /// An FN's stratum is decided by its REF span as a call's is (see [`table_strata`]): it is inside
+    /// a truth set's regions only if its whole span is. hap.py reports the FNs of its own truth set
+    /// that overlap that truth set's regions, so an FN whose span crosses their edge falls in a
+    /// stratum without that truth set, as a labelled call with the same span does; it still counts in
+    /// the truth set's `all` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VCF cannot be read or is not hap.py output.
+    fn fn_strata<S: AsRef<str>>(
+        happy: &Path,
+        contigs: &[S],
+        beds: [&RegionSet; 2],
+    ) -> Result<StratumFnCounts> {
+        Ok(fn_counts(happy, contigs, beds, &[])?.0)
+    }
 
     fn names() -> [String; 2] {
         ["v421".to_string(), "v5q".to_string()]

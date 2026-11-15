@@ -279,6 +279,26 @@ pub struct HappyLabels {
     pub truth_deltas: IndexMap<LabelKey, Option<(i64, i64)>>,
 }
 
+impl HappyLabels {
+    /// No labels, and zero FN counts for SNPs and indels.
+    fn empty() -> HappyLabels {
+        HappyLabels {
+            fn_counts: [(VariantType::Snp, 0), (VariantType::Indel, 0)].into_iter().collect(),
+            ..HappyLabels::default()
+        }
+    }
+
+    /// Adds the labels of other contigs (keys are disjoint, as they include the contig).
+    fn merge(&mut self, other: HappyLabels) {
+        self.labels.extend(other.labels);
+        for (variant_type, n) in other.fn_counts {
+            *self.fn_counts.entry(variant_type).or_default() += n;
+        }
+        self.fn_positions.extend(other.fn_positions);
+        self.truth_deltas.extend(other.truth_deltas);
+    }
+}
+
 /// The variant type of a hap.py BVT, if it is SNP or INDEL.
 pub(crate) fn variant_type_of_bvt(bvt: &str) -> Option<VariantType> {
     match bvt {
@@ -306,26 +326,6 @@ where
     let mut labels = HappyLabels::empty();
     let n_on_contigs = add_happy_records(&mut labels, records, &wanted)?;
     finish_happy_labels(labels, n_on_contigs, &wanted)
-}
-
-impl HappyLabels {
-    /// No labels, and zero FN counts for SNPs and indels.
-    fn empty() -> HappyLabels {
-        HappyLabels {
-            fn_counts: [(VariantType::Snp, 0), (VariantType::Indel, 0)].into_iter().collect(),
-            ..HappyLabels::default()
-        }
-    }
-
-    /// Adds the labels of other contigs (keys are disjoint, as they include the contig).
-    fn merge(&mut self, other: HappyLabels) {
-        self.labels.extend(other.labels);
-        for (variant_type, n) in other.fn_counts {
-            *self.fn_counts.entry(variant_type).or_default() += n;
-        }
-        self.fn_positions.extend(other.fn_positions);
-        self.truth_deltas.extend(other.truth_deltas);
-    }
 }
 
 /// Adds the labels of hap.py records on the `wanted` contigs to `labels`, in record order, and
@@ -990,17 +990,6 @@ pub fn labelled_mask(table: &FeatureTable, variant_type: VariantType) -> Result<
         .collect())
 }
 
-/// Counts the labels of each class, for logging.
-#[must_use]
-#[cfg(test)]
-pub fn label_counts(labels: &[f64]) -> HashMap<i64, usize> {
-    let mut counts = HashMap::new();
-    for &label in labels.iter().filter(|l| !l.is_nan()) {
-        *counts.entry(label as i64).or_default() += 1;
-    }
-    counts
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1009,6 +998,16 @@ mod tests {
 
     use super::*;
     use crate::testing::call_table;
+
+    /// Counts the labels of each class, for logging.
+    #[must_use]
+    fn label_counts(labels: &[f64]) -> HashMap<i64, usize> {
+        let mut counts = HashMap::new();
+        for &label in labels.iter().filter(|l| !l.is_nan()) {
+            *counts.entry(label as i64).or_default() += 1;
+        }
+        counts
+    }
 
     fn gt(text: &str) -> Genotype {
         if text == "./." { Genotype::MISSING } else { text.parse().unwrap() }

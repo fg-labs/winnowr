@@ -1,7 +1,7 @@
-//! Reading text files that may be gzip- or BGZF-compressed.
+//! Reading text files that may be gzip- or BGZF-compressed, and writing tab-separated files.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -110,6 +110,23 @@ pub(crate) fn lacks_bgzf_eof(path: &Path) -> bool {
         Ok(tail != BGZF_EOF)
     };
     check().unwrap_or(false)
+}
+
+/// Writes a tab-separated file with a header line.
+pub(crate) fn write_tsv<I: Iterator<Item = Vec<String>>>(
+    path: &Path,
+    header: &[&str],
+    rows: I,
+) -> Result<()> {
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut out = std::io::BufWriter::new(file);
+    writeln!(out, "{}", header.join("\t"))?;
+    for row in rows {
+        debug_assert_eq!(row.len(), header.len());
+        writeln!(out, "{}", row.join("\t"))?;
+    }
+    out.flush().with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[cfg(test)]

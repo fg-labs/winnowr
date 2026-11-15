@@ -25,6 +25,7 @@ mod evidence;
 mod extraction;
 mod fasta;
 mod features;
+mod fitting;
 mod gvcf;
 mod io;
 mod labels;

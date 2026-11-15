@@ -584,57 +584,6 @@ impl TractAccumulator {
     }
 }
 
-/// Measures a tract's length in each read spanning it, with the default [`StrlenOptions`]: a
-/// primary, non-duplicate, QC-passing, mapped read aligned (M/=/X) at both anchors, [`FLANK`]
-/// bases outside each end of the tract; reads with MAPQ below [`MIN_MAPQ`] are counted in the
-/// MAPQ summaries but not measured. Its observed tract length is the number of query bases
-/// between the anchors.
-///
-/// The reads are those a fetch of the tract and its flanks returns, in order, up to
-/// [`MAX_READS`]. [`measure_tracts`] measures many tracts with the same result, faster.
-///
-/// # Errors
-///
-/// Returns an error if the reads cannot be fetched or read.
-#[cfg(test)]
-pub fn measure_tract(
-    reads: &mut rust_htslib::bam::IndexedReader,
-    tid: u32,
-    tract: &RepeatTract,
-) -> Result<TractEvidence> {
-    measure_tract_with(reads, tid, tract, &StrlenOptions::default())
-}
-
-/// Measures a tract as [`measure_tract`] does, with other [`StrlenOptions`].
-///
-/// # Errors
-///
-/// Returns an error if the reads cannot be fetched or read.
-#[cfg(test)]
-pub fn measure_tract_with(
-    reads: &mut rust_htslib::bam::IndexedReader,
-    tid: u32,
-    tract: &RepeatTract,
-    options: &StrlenOptions,
-) -> Result<TractEvidence> {
-    use rust_htslib::bam::Read as _;
-    let (_, (beg, end)) = tract_window(tract, options.flank_of(tract));
-    reads.fetch((tid, beg, end)).context("failed to fetch reads")?;
-    let mut accumulator = TractAccumulator::new(tract, options);
-    let mut record = rust_htslib::bam::Record::new();
-    while let Some(read) = reads.read(&mut record) {
-        read.context("failed to read a read")?;
-        if record.flags() & crate::read_pass::SKIP_FLAGS != 0 {
-            continue;
-        }
-        accumulator.add(&record, &mut None);
-        if accumulator.is_full() {
-            break;
-        }
-    }
-    Ok(accumulator.finish())
-}
-
 /// Measures tracts on one contig as `measure_tract_with` does for each of `options`, with the
 /// same results, but reads each read once per cluster of nearby tracts rather than once per tract
 /// and option (see [`sweep_clusters`]): each read is counted for every tract (and option) whose
@@ -760,27 +709,6 @@ impl StrlenSite {
         ]
         .join("\t")
     }
-}
-
-/// Measures the repeat tract of every indel record (any FILTER) whose POS lies in each region,
-/// in region order, then VCF order, with the default [`StrlenOptions`]. Records without a pure insertion or deletion allele are
-/// skipped.
-///
-/// Regions are split into shards measured in parallel on the rayon pool, each with its own
-/// readers.
-///
-/// # Errors
-///
-/// Returns an error if a region is malformed or its contig is not in the VCF header or the
-/// reference, an indel record extends past the end of its contig in the reference, or a file
-/// cannot be read.
-#[cfg(test)]
-pub fn measure_regions<S: AsRef<str>>(
-    inputs: &ReadInputs<'_>,
-    regions: &[S],
-) -> Result<Vec<StrlenSite>> {
-    let mut per_option = measure_regions_with(inputs, regions, &[StrlenOptions::default()])?;
-    Ok(per_option.pop().unwrap_or_default())
 }
 
 /// Measures the records of regions as `measure_regions` does, once for each of `options`, in
@@ -931,7 +859,77 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::evidence::{check_options, read_tables};
+    use crate::evidence::read_tables;
+    use crate::model_evidence::check_options;
+
+    /// Measures the repeat tract of every indel record (any FILTER) whose POS lies in each region,
+    /// in region order, then VCF order, with the default [`StrlenOptions`]. Records without a pure insertion or deletion allele are
+    /// skipped.
+    ///
+    /// Regions are split into shards measured in parallel on the rayon pool, each with its own
+    /// readers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a region is malformed or its contig is not in the VCF header or the
+    /// reference, an indel record extends past the end of its contig in the reference, or a file
+    /// cannot be read.
+    fn measure_regions<S: AsRef<str>>(
+        inputs: &ReadInputs<'_>,
+        regions: &[S],
+    ) -> Result<Vec<StrlenSite>> {
+        let mut per_option = measure_regions_with(inputs, regions, &[StrlenOptions::default()])?;
+        Ok(per_option.pop().unwrap_or_default())
+    }
+
+    /// Measures a tract as [`measure_tract`] does, with other [`StrlenOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reads cannot be fetched or read.
+    fn measure_tract_with(
+        reads: &mut rust_htslib::bam::IndexedReader,
+        tid: u32,
+        tract: &RepeatTract,
+        options: &StrlenOptions,
+    ) -> Result<TractEvidence> {
+        use rust_htslib::bam::Read as _;
+        let (_, (beg, end)) = tract_window(tract, options.flank_of(tract));
+        reads.fetch((tid, beg, end)).context("failed to fetch reads")?;
+        let mut accumulator = TractAccumulator::new(tract, options);
+        let mut record = rust_htslib::bam::Record::new();
+        while let Some(read) = reads.read(&mut record) {
+            read.context("failed to read a read")?;
+            if record.flags() & crate::read_pass::SKIP_FLAGS != 0 {
+                continue;
+            }
+            accumulator.add(&record, &mut None);
+            if accumulator.is_full() {
+                break;
+            }
+        }
+        Ok(accumulator.finish())
+    }
+
+    /// Measures a tract's length in each read spanning it, with the default [`StrlenOptions`]: a
+    /// primary, non-duplicate, QC-passing, mapped read aligned (M/=/X) at both anchors, [`FLANK`]
+    /// bases outside each end of the tract; reads with MAPQ below [`MIN_MAPQ`] are counted in the
+    /// MAPQ summaries but not measured. Its observed tract length is the number of query bases
+    /// between the anchors.
+    ///
+    /// The reads are those a fetch of the tract and its flanks returns, in order, up to
+    /// [`MAX_READS`]. [`measure_tracts`] measures many tracts with the same result, faster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reads cannot be fetched or read.
+    fn measure_tract(
+        reads: &mut rust_htslib::bam::IndexedReader,
+        tid: u32,
+        tract: &RepeatTract,
+    ) -> Result<TractEvidence> {
+        measure_tract_with(reads, tid, tract, &StrlenOptions::default())
+    }
 
     #[rstest]
     #[case::empty(".", &[])]

@@ -9,9 +9,10 @@ use log::info;
 use winnowr_xgboost::Booster;
 
 use crate::common::{Task, VariantType};
+use crate::fitting::{fit_booster, validation_mask};
 use crate::model::{
-    CvFolds, MODEL_FORMAT_VERSION, ModelInfo, TrainingParams, WinnowrModel, fit_booster,
-    num_classes, predict_probabilities, to_matrix, validation_mask,
+    CvFolds, MODEL_FORMAT_VERSION, ModelInfo, TrainingParams, WinnowrModel, num_classes,
+    predict_probabilities, to_matrix,
 };
 use crate::rescore::{Mode, Probabilities};
 use crate::samples::{PromoteSampleCalls, SampleCalls};

@@ -200,6 +200,14 @@ impl Region {
             _ => bail!("malformed region (expected chrom or chrom:start-end): {region}"),
         }
     }
+
+    /// The region as written.
+    fn as_ref_str(&self) -> String {
+        match self.span {
+            Some((start, end)) => format!("{}:{start}-{end}", self.chrom),
+            None => self.chrom.clone(),
+        }
+    }
 }
 
 /// The inputs of a read pass (`winnowr strlen` and `winnowr pileup`).
@@ -405,16 +413,6 @@ where
             measured
         })
         .collect()
-}
-
-impl Region {
-    /// The region as written.
-    fn as_ref_str(&self) -> String {
-        match self.span {
-            Some((start, end)) => format!("{}:{start}-{end}", self.chrom),
-            None => self.chrom.clone(),
-        }
-    }
 }
 
 /// Readers and the last contig's sequence, reused across the shards measured with them.

@@ -208,18 +208,12 @@ pub struct StutterSite {
     pub histogram: Histogram,
 }
 
-/// Fits a stutter model from reads at sites with one true allele (homozygous truth).
+/// Fits a stutter model from reads at sites with one true allele (homozygous truth), with the
+/// given [`StutterFit`] settings.
 ///
 /// Each stratum's counts get [`STRATUM_PSEUDOCOUNT`] pseudo-reads distributed as its period class
 /// (all length bins pooled, plus one pseudo-read per bucket). Sums are taken in NumPy's order, so
 /// the model is the Python version's bit for bit.
-#[must_use]
-#[cfg(test)]
-pub fn fit_stutter_model(sites: &[StutterSite]) -> StutterModel {
-    fit_stutter_model_with(sites, StutterFit::default())
-}
-
-/// Fits a stutter model as `fit_stutter_model` does, with other [`StutterFit`] settings.
 #[must_use]
 pub fn fit_stutter_model_with(sites: &[StutterSite], fit: StutterFit) -> StutterModel {
     let mut counts = vec![vec![[0.0f64; N_ERRORS]; LENGTH_BINS.len()]; N_PERIOD_CLASSES];
@@ -585,6 +579,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::testing::fit_stutter_model;
 
     /// A model whose error distribution is the same in every stratum.
     fn uniform_model(probabilities: [f64; N_ERRORS]) -> StutterModel {

@@ -262,3 +262,12 @@ pub(crate) fn separable_model_of(
     info.validate().unwrap();
     WinnowrModel { booster, info }
 }
+
+/// Fits a stutter model with the default [`crate::stutter::StutterFit`] settings (see
+/// [`crate::stutter::fit_stutter_model_with`]).
+#[must_use]
+pub(crate) fn fit_stutter_model(
+    sites: &[crate::stutter::StutterSite],
+) -> crate::stutter::StutterModel {
+    crate::stutter::fit_stutter_model_with(sites, crate::stutter::StutterFit::default())
+}

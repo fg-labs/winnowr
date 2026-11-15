@@ -155,6 +155,34 @@ impl FoldPredictions {
     pub fn f1_gain(&self, thresholds: DecisionThresholds, mode: Mode) -> f64 {
         self.rescore(&self.decide(thresholds, mode)).f1() - self.baseline.f1()
     }
+
+    /// Combines folds predicting the same calls row by row: call `i` from `parts[which[i]]`
+    /// (e.g. each call from the fold that held it out).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are no parts, the parts have other calls or baselines, or
+    /// `which` names a missing part.
+    pub fn merge_rows(parts: &[FoldPredictions], which: &[usize]) -> Result<FoldPredictions> {
+        let baseline = shared_baseline(parts.iter().map(|p| p.baseline))?;
+        let probabilities: Vec<&Probabilities> = parts.iter().map(|p| &p.probabilities).collect();
+        let flags = |of: fn(&FoldPredictions) -> &[bool]| -> Result<Vec<bool>> {
+            pick_rows(&parts.iter().map(of).collect::<Vec<_>>(), which)
+        };
+        Ok(FoldPredictions {
+            probabilities: merge_probabilities(&probabilities, which)?,
+            labels: pick_rows(
+                &parts.iter().map(|p| p.labels.as_slice()).collect::<Vec<_>>(),
+                which,
+            )?,
+            flip_ok: flags(|p| &p.flip_ok)?,
+            flippable: flags(|p| &p.flippable)?,
+            baseline,
+            regenotypable: flags(|p| &p.regenotypable)?,
+            regenotypes_to_ref: flags(|p| &p.regenotypes_to_ref)?,
+            regenotype_ok: flags(|p| &p.regenotype_ok)?,
+        })
+    }
 }
 
 /// Picks each row's value from the part `which` names for it: row `i` from `parts[which[i]]`.
@@ -202,36 +230,6 @@ fn shared_baseline(baselines: impl IntoIterator<Item = Counts>) -> Result<Counts
         bail!("folds of the same calls have different baseline counts");
     }
     Ok(first)
-}
-
-impl FoldPredictions {
-    /// Combines folds predicting the same calls row by row: call `i` from `parts[which[i]]`
-    /// (e.g. each call from the fold that held it out).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there are no parts, the parts have other calls or baselines, or
-    /// `which` names a missing part.
-    pub fn merge_rows(parts: &[FoldPredictions], which: &[usize]) -> Result<FoldPredictions> {
-        let baseline = shared_baseline(parts.iter().map(|p| p.baseline))?;
-        let probabilities: Vec<&Probabilities> = parts.iter().map(|p| &p.probabilities).collect();
-        let flags = |of: fn(&FoldPredictions) -> &[bool]| -> Result<Vec<bool>> {
-            pick_rows(&parts.iter().map(of).collect::<Vec<_>>(), which)
-        };
-        Ok(FoldPredictions {
-            probabilities: merge_probabilities(&probabilities, which)?,
-            labels: pick_rows(
-                &parts.iter().map(|p| p.labels.as_slice()).collect::<Vec<_>>(),
-                which,
-            )?,
-            flip_ok: flags(|p| &p.flip_ok)?,
-            flippable: flags(|p| &p.flippable)?,
-            baseline,
-            regenotypable: flags(|p| &p.regenotypable)?,
-            regenotypes_to_ref: flags(|p| &p.regenotypes_to_ref)?,
-            regenotype_ok: flags(|p| &p.regenotype_ok)?,
-        })
-    }
 }
 
 /// Grid-searches the thresholds that maximise the summed F1 gain over folds.

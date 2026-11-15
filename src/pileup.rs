@@ -606,7 +606,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::evidence::{check_options, read_tables};
+    use crate::evidence::read_tables;
+    use crate::model_evidence::check_options;
     use crate::testing::{TestRead, write_bam};
 
     #[test]

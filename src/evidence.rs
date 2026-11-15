@@ -1,6 +1,5 @@
 //! Read-evidence tables: the tab-separated tables `winnowr strlen` and `winnowr pileup` write,
-//! each starting with a line that records the settings its evidence was measured with, and the
-//! check that evidence was measured as a model needs.
+//! each starting with a line that records the settings its evidence was measured with.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -166,30 +165,4 @@ pub fn write_table<E: Evidence>(
         bail!("failed to finish writing {}", path.display());
     }
     Ok(n)
-}
-
-/// Checks that evidence measured with `measured` (from `source`) can feed a model trained on
-/// evidence measured with `trained`.
-///
-/// # Errors
-///
-/// Returns an error, saying how to measure the evidence again, if the settings differ.
-pub fn check_options<E: Evidence>(
-    measured: E,
-    source: &str,
-    trained: E,
-    model: &Path,
-) -> Result<()> {
-    if measured != trained {
-        bail!(
-            "{source} was measured with {name} {settings} {measured}, but model {} was trained on \
-             evidence measured with {trained}: measure again with `winnowr {name} {option} \
-             {trained}` (or let `score --alignments` measure with the model's settings)",
-            model.display(),
-            name = E::NAME,
-            settings = E::SETTINGS,
-            option = E::OPTION,
-        );
-    }
-    Ok(())
 }
