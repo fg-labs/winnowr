@@ -61,14 +61,14 @@ the stutter model on its own training samples.
 `train --regenotype` (which implies `--repeat-length`) adds a fourth class, *re-genotype*: calls
 whose genotype a het <-> hom flip does not fix but the length caller's genotype does. Its threshold,
 `t_regenotype`, is chosen by cross-validation with the genotyper's thresholds. In
-`--mode genotyper`, `score` re-genotypes a call the length caller disagrees with when P(re-genotype)
-reaches it and the call is neither dropped nor flipped (P(drop) reaching `t_drop` comes first, then
-P(flip) reaching `t_flip`): the call gets the length caller's genotype, with an ALT allele added
-when needed, the INFO flag `WINNOWR_REGENOTYPE` and its old genotype in FORMAT `WINNOWR_OGT`.
-Re-genotyping to `0/0` is a drop. That order is the threshold rule: with the experimental
-`--expected-f1 indel`, `score` instead flips a call when P(flip) is above 0.5, else re-genotypes it
-when P(re-genotype) is above 0.5, else drops it when P(keep) is below 0.5 (see
-[Scoring](scoring.md#how-score-acts-on-indel-calls)).
+`--mode genotyper`, `score` re-genotypes a call with a diploid genotype (not `./.` or haploid) that
+the length caller disagrees with when P(re-genotype) reaches it and the call is neither dropped nor
+flipped (P(drop) reaching `t_drop` comes first, then P(flip) reaching `t_flip`): the call gets the
+length caller's genotype, with an ALT allele added when needed, the INFO flag `WINNOWR_REGENOTYPE`
+and its old genotype in FORMAT `WINNOWR_OGT`. Re-genotyping to `0/0` is a drop. That order is the
+threshold rule: with the experimental `--expected-f1 indel`, `score` instead flips a call when
+P(flip) is above 0.5, else re-genotypes it when P(re-genotype) is above 0.5, else drops it when
+P(keep) is below 0.5 (see [Scoring](scoring.md#how-score-acts-on-indel-calls)).
 
 ## Scoring
 

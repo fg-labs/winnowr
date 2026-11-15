@@ -28,6 +28,8 @@ struct FaiEntry {
 pub struct IndexedFasta {
     path: PathBuf,
     file: File,
+    /// The FASTA's size in bytes.
+    size: u64,
     entries: HashMap<String, FaiEntry>,
 }
 
@@ -76,13 +78,43 @@ impl IndexedFasta {
             }
         }
         file.rewind()?;
-        Ok(IndexedFasta { path: path.to_path_buf(), file, entries })
+        let size =
+            file.metadata().with_context(|| format!("failed to read {}", path.display()))?.len();
+        Ok(IndexedFasta { path: path.to_path_buf(), file, size, entries })
     }
 
     /// The length of a sequence, or `None` if the index does not have it.
     #[must_use]
     pub fn length(&self, name: &str) -> Option<u64> {
         self.entries.get(name).map(|entry| entry.length)
+    }
+
+    /// The bytes of the file holding `[start, end)` of a sequence (0-based; `start < end`), as
+    /// `(first, last)` (half-open).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if they are not inside the file.
+    fn span(&self, name: &str, entry: &FaiEntry, start: u64, end: u64) -> Result<(u64, u64)> {
+        let byte = |pos: u64| {
+            (pos / entry.line_bases)
+                .checked_mul(entry.line_width)?
+                .checked_add(entry.offset)?
+                .checked_add(pos % entry.line_bases)
+        };
+        // A corrupt index can name a sequence far longer than the file.
+        match byte(start).zip(byte(end - 1).and_then(|byte| byte.checked_add(1))) {
+            Some((first, last)) if last <= self.size => Ok((first, last)),
+            _ => Err(self.mismatch(name)),
+        }
+    }
+
+    /// The error for an index that does not match the FASTA.
+    fn mismatch(&self, name: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "the FASTA index of {} does not match its sequence {name}",
+            self.path.display()
+        )
     }
 
     /// The bases of `[start, end)` of a sequence (0-based), as stored (case preserved); `end` is
@@ -99,10 +131,7 @@ impl IndexedFasta {
         if start >= end {
             return Ok(Vec::new());
         }
-        let byte = |pos: u64| {
-            entry.offset + pos / entry.line_bases * entry.line_width + pos % entry.line_bases
-        };
-        let (first, last) = (byte(start), byte(end - 1) + 1);
+        let (first, last) = self.span(name, &entry, start, end)?;
         let mut raw = vec![0u8; usize::try_from(last - first)?];
         self.file.seek(SeekFrom::Start(first))?;
         self.file
@@ -110,7 +139,7 @@ impl IndexedFasta {
             .with_context(|| format!("failed to read {} from {}", name, self.path.display()))?;
         raw.retain(|&b| b != b'\n' && b != b'\r');
         if raw.len() as u64 != end - start {
-            bail!("the FASTA index of {} does not match its sequence {name}", self.path.display());
+            return Err(self.mismatch(name));
         }
         Ok(raw)
     }
@@ -146,6 +175,23 @@ mod tests {
         assert_eq!(fasta.fetch_all("chr2").unwrap(), b"TTT");
         let message = fasta.fetch("chr9", 0, 1).unwrap_err().to_string();
         assert!(message.starts_with("contig chr9 is not in the FASTA"), "{message}");
+    }
+
+    #[test]
+    fn an_index_longer_than_the_file_is_an_error_before_allocating() {
+        let dir = TempDir::new().unwrap();
+        let path = write_fasta(dir.path(), &[("chr1", "ACGT")]);
+        let fai = dir.path().join("ref.fa.fai");
+        assert!(fai.exists(), "write_fasta names its index {}", fai.display());
+        let expected =
+            format!("the FASTA index of {} does not match its sequence chr1", path.display());
+        // Far past the file, and so long that its byte offsets overflow.
+        for length in [1_000_000_000_000_000, u64::MAX] {
+            std::fs::write(&fai, format!("chr1\t{length}\t6\t60\t61\n")).unwrap();
+            let mut fasta = IndexedFasta::from_path(&path).unwrap();
+            assert_eq!(fasta.fetch_all("chr1").unwrap_err().to_string(), expected, "{length}");
+            assert_eq!(fasta.length("chr1"), Some(length));
+        }
     }
 
     #[test]

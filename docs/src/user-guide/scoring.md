@@ -26,12 +26,12 @@ repeat-length or pileup features need `--strlen` or `--pileup` tables, or `--ali
 - `genotyper` (the default): drop calls with P(drop) at or above `t_drop`, flip the remaining calls
   with P(flip) at or above `t_flip`, and, for re-genotype models, re-genotype the calls still
   remaining that the repeat-length caller disagrees with when P(re-genotype) is at or above
-  `t_regenotype`. Only a `0/1` or `1/1` call can be flipped, and only a call whose length-caller
-  genotype differs from its own, and can be written, can be re-genotyped. A call that cannot take an
-  action goes on to the next: e.g. a `1/2` call with P(flip) at or above `t_flip` is not flipped,
-  but may be re-genotyped, else is left alone or, for an indel, dropped by the keep fallback when
-  P(keep) is below 0.5. That order is the threshold rule; the experimental `--expected-f1` (below)
-  acts on probabilities above 0.5 instead.
+  `t_regenotype`. Only a `0/1` or `1/1` call can be flipped, and only a call with a diploid genotype
+  (not `./.` or haploid) whose length-caller genotype differs from its own, and can be written, can
+  be re-genotyped. A call that cannot take an action goes on to the next: e.g. a `1/2` call with
+  P(flip) at or above `t_flip` is not flipped, but may be re-genotyped, else is left alone or, for
+  an indel, dropped by the keep fallback when P(keep) is below 0.5. That order is the threshold
+  rule; the experimental `--expected-f1` (below) acts on probabilities above 0.5 instead.
 - `veto`: drop calls whose P(drop) + P(flip) (+ P(re-genotype)) is at or above `t_drop`: the call
   as made is wrong. Never flip or re-genotype.
 
