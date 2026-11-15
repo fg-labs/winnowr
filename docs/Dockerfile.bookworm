@@ -6,7 +6,7 @@
 # context is not used, so any directory will do:
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 -f docs/Dockerfile.bookworm \
-#       --build-arg WINNOWR_VERSION=0.1.0 --build-arg WINNOWR_SHA256=<sha256> .
+#       --build-arg WINNOWR_VERSION=0.1.1 --build-arg WINNOWR_SHA256=<sha256> .
 #
 # Each GitHub release of fg-labs/winnowr (from v0.1.0) carries the source tarball,
 # winnowr-<version>-src.tar.gz, and its sha256, in winnowr-<version>-src.tar.gz.sha256: give that
@@ -49,12 +49,15 @@ WORKDIR /src/winnowr
 # RUSTUP_TOOLCHAIN uses the image's toolchain as it is, rather than letting rust-toolchain.toml
 # add the development components (rustfmt, clippy) that a build does not need.
 ENV RUSTUP_TOOLCHAIN=1.100.0
+# The static-link check is the one CI runs; v0.1.0's tarball predates it, so for v0.1.0 the
+# libraries are only listed.
 RUN cargo build --release --locked \
     && install -m 0755 target/release/winnowr /usr/local/bin/winnowr \
     && winnowr --version \
-    && ldd /usr/local/bin/winnowr \
-    && if ldd /usr/local/bin/winnowr | grep -E 'gomp|xgboost|hts|bz2|lzma|deflate'; then \
-           echo "winnowr links OpenMP, XGBoost or htslib dynamically" >&2; exit 1; \
+    && if [ -x .github/scripts/check-static-link.sh ]; then \
+           .github/scripts/check-static-link.sh /usr/local/bin/winnowr; \
+       else \
+           ldd /usr/local/bin/winnowr; \
        fi
 
 # The same Debian release as the build stage, so the C and C++ runtimes match.
