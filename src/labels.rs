@@ -51,24 +51,32 @@ impl Label {
 /// Only the training labels change: evaluation and the cross-validated threshold search score
 /// every call against its hap.py label, and an unfixable flip is an FP whatever it is labelled.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum UnfixableFlips {
     /// Train it as [`Label::Flip`], as hap.py labels it.
+    #[value(help = None::<&str>)]
     #[default]
     Flip,
     /// Train it as [`Label::Drop`]: dropping it is the only action that removes the FP.
+    #[value(help = None::<&str>)]
     Drop,
     /// Leave it out of the fits.
+    #[value(help = None::<&str>)]
     Exclude,
 }
 
 impl UnfixableFlips {
-    /// Every policy.
-    pub const ALL: [UnfixableFlips; 3] =
-        [UnfixableFlips::Flip, UnfixableFlips::Drop, UnfixableFlips::Exclude];
-
     /// The lowercase name, as written in model files and on the command line.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -89,17 +97,6 @@ impl UnfixableFlips {
 impl std::fmt::Display for UnfixableFlips {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for UnfixableFlips {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        let lower = s.to_ascii_lowercase();
-        UnfixableFlips::ALL.into_iter().find(|policy| policy.as_str() == lower).with_context(|| {
-            format!("unknown unfixable-flip policy '{s}' (expected one of: flip, drop, exclude)")
-        })
     }
 }
 
@@ -1496,14 +1493,18 @@ mod tests {
     }
 
     #[test]
-    fn unfixable_flip_policies_parse_and_print() {
-        for policy in UnfixableFlips::ALL {
-            assert_eq!(policy.as_str().parse::<UnfixableFlips>().unwrap(), policy);
+    fn unfixable_flip_policies_are_named_alike_everywhere() {
+        use clap::ValueEnum;
+        let policies = [UnfixableFlips::Flip, UnfixableFlips::Drop, UnfixableFlips::Exclude];
+        assert_eq!(UnfixableFlips::value_variants(), policies);
+        for policy in policies {
+            // The command line (clap), the model file (serde) and messages (Display) agree.
+            assert_eq!(policy.to_possible_value().unwrap().get_name(), policy.as_str());
             assert_eq!(policy.to_string(), policy.as_str());
             assert_eq!(serde_json::to_string(&policy).unwrap(), format!("\"{policy}\""));
         }
-        assert_eq!("DROP".parse::<UnfixableFlips>().unwrap(), UnfixableFlips::Drop);
-        assert!("keep".parse::<UnfixableFlips>().is_err());
+        assert_eq!(UnfixableFlips::from_str("DROP", true).unwrap(), UnfixableFlips::Drop);
+        assert!(UnfixableFlips::from_str("keep", true).is_err());
         assert!(UnfixableFlips::default().is_default());
         assert!(!UnfixableFlips::Exclude.is_default());
     }

@@ -11,9 +11,14 @@ pub static VERSION: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// [`VERSION`] followed by the versions of the statically linked libraries.
-pub static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
+pub static LONG_VERSION: LazyLock<String> =
+    LazyLock::new(|| format!("{}\nXGBoost {}", VERSION.as_str(), XGBOOST_VERSION.as_str()));
+
+/// The version of the linked XGBoost library (e.g. `3.1.2`), as `--version` reports it and models
+/// record it.
+pub static XGBOOST_VERSION: LazyLock<String> = LazyLock::new(|| {
     let (major, minor, patch) = winnowr_xgboost::version();
-    format!("{}\nXGBoost {major}.{minor}.{patch}", VERSION.as_str())
+    format!("{major}.{minor}.{patch}")
 });
 
 /// The package version of a [`VERSION`]-style string: `version` without its `-hash[-dirty]`

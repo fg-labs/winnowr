@@ -253,11 +253,6 @@ pub(crate) struct ExtractArgs {
     pub(crate) reference: Option<PathBuf>,
 }
 
-/// Parses a value ignoring case (e.g. `SNP` or `snp`).
-fn parse_ignoring_case<T: std::str::FromStr<Err = anyhow::Error>>(text: &str) -> Result<T, String> {
-    text.to_ascii_lowercase().parse().map_err(|e: anyhow::Error| e.to_string())
-}
-
 /// The options of `winnowr train`.
 #[derive(Debug, Args)]
 pub(crate) struct TrainArgs {
@@ -267,7 +262,7 @@ pub(crate) struct TrainArgs {
     pub(crate) tables: Vec<PathBuf>,
 
     /// The variant type to train for (snp or indel).
-    #[arg(long, value_parser = parse_ignoring_case::<VariantType>)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub(crate) variant_type: VariantType,
 
     /// The model file to write (`.winnowr.json` is appended if missing).
@@ -276,7 +271,7 @@ pub(crate) struct TrainArgs {
 
     /// genotype trains on PASS calls (drop/keep/flip; needs hap.py labels); promote trains on
     /// non-PASS calls (stay/promote/promote+flip; needs tables extracted with --truth-vcf).
-    #[arg(long, default_value = "genotype", value_parser = parse_ignoring_case::<Task>)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = Task::Genotype)]
     pub(crate) task: Task,
 
     /// Leave out the multi-site neighbourhood features.
@@ -314,7 +309,7 @@ pub(crate) struct TrainArgs {
     /// a call missing the second allele of a het-alt truth): flip trains them as flips, as
     /// hap.py labels them; drop trains them as drops; exclude leaves them out of the fits. They
     /// are scored as FPs in cross-validation either way. Recorded in the model.
-    #[arg(long, default_value = "flip", value_parser = parse_ignoring_case::<UnfixableFlips>)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = UnfixableFlips::Flip)]
     pub(crate) unfixable_flips: UnfixableFlips,
 
     /// Samples to hold out together in cross-validation, one comma-separated group per value
@@ -328,9 +323,8 @@ pub(crate) struct TrainArgs {
     /// chromosomes (--chromosome-folds groups of about equal calls) from every sample at once, so
     /// every fold fits every sample, and related samples' calls at the same site are held out
     /// together. Recorded in the model.
-    #[arg(long, default_value = "samples", ignore_case = true,
-          value_parser = ["samples", "chromosomes"])]
-    pub(crate) cv_folds: String,
+    #[arg(long, value_enum, ignore_case = true, default_value_t = CvFoldKind::Samples)]
+    pub(crate) cv_folds: CvFoldKind,
 
     /// The number of chromosome groups (folds) with --cv-folds chromosomes.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(2..))]
@@ -451,10 +445,8 @@ impl std::str::FromStr for OutsideTDrop {
         if text.eq_ignore_ascii_case("none") {
             return Ok(OutsideTDrop(None));
         }
-        let value: f64 = text.parse().with_context(|| format!("not a number or none: {text}"))?;
-        if !(0.0..=1.0).contains(&value) {
-            bail!("must be between 0 and 1, got {value}");
-        }
+        let value =
+            parse_probability(text).map_err(|error| anyhow::anyhow!("{error} (or none)"))?;
         Ok(OutsideTDrop(Some(value)))
     }
 }
@@ -473,6 +465,68 @@ fn parse_probability(text: &str) -> Result<f64> {
     Ok(value)
 }
 
+/// How `train`'s cross-validation forms its folds (see [`CvFolds`]), as --cv-folds takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum CvFoldKind {
+    /// Hold out each sample group in turn.
+    #[value(help = None::<&str>)]
+    Samples,
+    /// Hold out groups of whole chromosomes from every sample at once.
+    #[value(help = None::<&str>)]
+    Chromosomes,
+}
+
+/// A value of --keep-fallback: a variant type, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum KeepFallback {
+    /// SNP genotype models.
+    #[value(help = None::<&str>)]
+    Snp,
+    /// Indel genotype models.
+    #[value(help = None::<&str>)]
+    Indel,
+    /// No variant type (alone).
+    #[value(help = None::<&str>)]
+    None,
+}
+
+impl KeepFallback {
+    /// The variant type, unless none.
+    fn variant_type(self) -> Option<VariantType> {
+        match self {
+            KeepFallback::Snp => Some(VariantType::Snp),
+            KeepFallback::Indel => Some(VariantType::Indel),
+            KeepFallback::None => None,
+        }
+    }
+}
+
+impl From<VariantType> for KeepFallback {
+    fn from(variant_type: VariantType) -> Self {
+        match variant_type {
+            VariantType::Snp => KeepFallback::Snp,
+            VariantType::Indel => KeepFallback::Indel,
+        }
+    }
+}
+
+/// A value of --abstain-actions: an action withheld outside the confident regions, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum AbstainAction {
+    /// Flipping het <-> hom.
+    #[value(help = None::<&str>)]
+    Flip,
+    /// Re-genotyping repeat-length calls.
+    #[value(help = None::<&str>)]
+    Regenotype,
+    /// Promoting filtered calls.
+    #[value(help = None::<&str>)]
+    Promote,
+    /// No action (alone).
+    #[value(help = None::<&str>)]
+    None,
+}
+
 /// Options that change how genotype and promote models act, beyond their thresholds.
 ///
 /// By default ([`DEFAULT_KEEP_FALLBACK`] and [`DEFAULT_OUTSIDE_INDEL_T_DROP`]), indel genotype
@@ -484,22 +538,22 @@ fn parse_probability(text: &str) -> Result<f64> {
 pub(crate) struct PolicyArgs {
     /// Variant types whose genotype model also drops the calls its thresholds leave alone when
     /// P(keep) is below 0.5 (none, alone: no variant type).
-    #[arg(long, num_args = 1.., default_values_t = DEFAULT_KEEP_FALLBACK.map(|vt| vt.to_string()),
-          ignore_case = true, value_parser = ["snp", "indel", "none"])]
-    pub(crate) keep_fallback: Vec<String>,
+    #[arg(long, num_args = 1.., value_enum, ignore_case = true,
+          default_values_t = DEFAULT_KEEP_FALLBACK.map(KeepFallback::from))]
+    pub(crate) keep_fallback: Vec<KeepFallback>,
 
     /// Experimental: variant types whose genotype model takes the action of greatest expected F1
     /// gain instead of using its thresholds (and in place of --keep-fallback): flip or
     /// re-genotype when its probability is above 0.5, else drop when P(keep) is below 0.5.
-    #[arg(long, num_args = 1.., value_parser = parse_ignoring_case::<VariantType>)]
+    #[arg(long, num_args = 1.., value_enum, ignore_case = true)]
     pub(crate) expected_f1: Vec<VariantType>,
 
     /// Experimental: actions withheld from calls outside the confident regions (--regions
     /// notinalldifficultregions=PATH; calls whose REF span is not inside it are "outside"); none,
     /// alone: no action.
-    #[arg(long, num_args = 1.., default_values = ["none"], ignore_case = true,
-          value_parser = ["flip", "regenotype", "promote", "none"])]
-    pub(crate) abstain_actions: Vec<String>,
+    #[arg(long, num_args = 1.., value_enum, ignore_case = true,
+          default_values_t = [AbstainAction::None])]
+    pub(crate) abstain_actions: Vec<AbstainAction>,
 
     /// The drop threshold of indel calls outside the confident regions: they are dropped when
     /// P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
@@ -532,17 +586,20 @@ impl PolicyArgs {
         regions: &[NamedBed],
         indel_genotype: bool,
     ) -> Result<Policy> {
-        let keep_fallback = without_none("--keep-fallback", &self.keep_fallback)?;
-        let abstain_actions = without_none("--abstain-actions", &self.abstain_actions)?;
+        let keep_fallback =
+            without_none("--keep-fallback", &self.keep_fallback, KeepFallback::None)?;
+        let abstain_actions =
+            without_none("--abstain-actions", &self.abstain_actions, AbstainAction::None)?;
         let mut policy = Policy::new(mode);
-        for vt in &keep_fallback {
-            policy.rules.insert(vt.parse()?, Rule::KeepFallback);
+        for vt in keep_fallback.iter().filter_map(|value| value.variant_type()) {
+            policy.rules.insert(vt, Rule::KeepFallback);
         }
         for &vt in &self.expected_f1 {
             policy.rules.insert(vt, Rule::ExpectedF1);
         }
-        let has = |action: &str| abstain_actions.iter().any(|a| a == action);
-        let (flip, regenotype, promote) = (has("flip"), has("regenotype"), has("promote"));
+        let has = |action: AbstainAction| abstain_actions.contains(&action);
+        let (flip, regenotype, promote) =
+            (has(AbstainAction::Flip), has(AbstainAction::Regenotype), has(AbstainAction::Promote));
         let indel_t_drop = self.outside_indel_t_drop.0;
         let path = regions.iter().find(|r| r.name == CONFIDENT_REGIONS).map(|r| r.path.as_path());
         // Read the confident regions only when something uses them, so an unused BED (e.g. in a
@@ -579,17 +636,25 @@ impl PolicyArgs {
     }
 }
 
-/// The values of a multi-valued option, lower-cased, without `none`, which means no value.
+/// The values of a multi-valued option without `none`, which means no value.
 ///
 /// # Errors
 ///
 /// Returns an error if `none` is given with other values.
-fn without_none(option: &str, values: &[String]) -> Result<Vec<String>> {
-    let values: Vec<String> = values.iter().map(|v| v.to_ascii_lowercase()).collect();
-    if values.len() > 1 && values.iter().any(|v| v == "none") {
-        bail!("{option} none cannot be given with other values, got: {}", values.join(" "));
+fn without_none<T: clap::ValueEnum + Copy + PartialEq>(
+    option: &str,
+    values: &[T],
+    none: T,
+) -> Result<Vec<T>> {
+    if values.len() > 1 && values.contains(&none) {
+        let names: Vec<String> = values
+            .iter()
+            .filter_map(|value| value.to_possible_value())
+            .map(|value| value.get_name().to_string())
+            .collect();
+        bail!("{option} none cannot be given with other values, got: {}", names.join(" "));
     }
-    Ok(values.into_iter().filter(|v| v != "none").collect())
+    Ok(values.iter().copied().filter(|&value| value != none).collect())
 }
 
 /// Whether any of the models is an indel genotype model.
@@ -1074,10 +1139,9 @@ fn training_params(args: &TrainArgs, threads: NonZeroUsize) -> Result<TrainingPa
         unfixable_flips: args.unfixable_flips,
         // Without early stopping the final model already fits every call.
         refit_final: args.refit_final && args.validation_fraction > 0.0,
-        cv_folds: if args.cv_folds.eq_ignore_ascii_case("chromosomes") {
-            CvFolds::Chromosomes { folds: args.chromosome_folds }
-        } else {
-            CvFolds::Samples
+        cv_folds: match args.cv_folds {
+            CvFoldKind::Samples => CvFolds::Samples,
+            CvFoldKind::Chromosomes => CvFolds::Chromosomes { folds: args.chromosome_folds },
         },
     };
     if !params.cv_folds.is_default() && !args.sample_groups.is_empty() {
@@ -1172,6 +1236,8 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
         params,
         groups: &groups,
         threads,
+        strlen_settings: strlen_options,
+        pileup_settings: pileup_options,
     };
     let mut timer = PhaseTimer::start();
     let model = if args.task == Task::Promote {
@@ -1253,9 +1319,6 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
             train_model(&samples, &spec, grid, None, false, None)?
         }
     };
-    let mut model = model;
-    model.info.strlen_settings = strlen_options;
-    model.info.pileup_settings = pileup_options;
     let mut timer = PhaseTimer::start();
     model.save(&output)?;
     timer.lap("saving the model");
@@ -1310,11 +1373,7 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
         write_policy_metrics,
     };
     check_output_dir("--output", &args.output)?;
-    let models = args
-        .models
-        .iter()
-        .map(|path| WinnowrModel::load(path, threads))
-        .collect::<Result<Vec<_>>>()?;
+    let models = load_models(&args.models, threads)?;
     let genotype: Vec<&WinnowrModel> =
         models.iter().filter(|m| m.info.task == Task::Genotype).collect();
     let promote: Vec<&WinnowrModel> =
@@ -1345,23 +1404,7 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
     };
     let table = FeatureTable::read_parquet_selected(&args.table, &selection)?;
     let info = table.info();
-    check_table_reference(&args.table, info, &models, &args.models)?;
-    check_table::<StrlenOptions>(&args.table, info, &models, &args.models)?;
-    check_table::<PileupOptions>(&args.table, info, &models, &args.models)?;
-    let trained_on: Vec<String> = args
-        .models
-        .iter()
-        .zip(&models)
-        .filter(|(_, m)| m.info.training_samples.contains(&info.sample))
-        .map(|(path, _)| path.display().to_string())
-        .collect();
-    if !trained_on.is_empty() {
-        log::warn!(
-            "{} is a training sample of {}: its metrics are in-sample and optimistic, not held-out",
-            info.sample,
-            trained_on.join(", ")
-        );
-    }
+    check_labelled_table(&args.table, info, &models, &args.models)?;
     warn_policy_only_regions(&args.regions);
     // The mode is a placeholder: evaluate reports both.
     let policy = args.policy.policy(
@@ -1443,6 +1486,47 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
     write_policy_metrics(&args.output, &metrics)
 }
 
+/// Loads model files.
+///
+/// # Errors
+///
+/// Returns an error if a model cannot be loaded.
+fn load_models(paths: &[PathBuf], threads: NonZeroUsize) -> Result<Vec<WinnowrModel>> {
+    paths.iter().map(|path| WinnowrModel::load(path, threads)).collect()
+}
+
+/// Checks that a labelled feature table (of `evaluate` or `stratify`) suits the models: that it is
+/// on their reference and has the evidence they need, measured as they need it. Warns if its
+/// sample is a training sample of a model, as its metrics are then in-sample.
+///
+/// # Errors
+///
+/// Returns an error if the table is not on a model's reference or lacks evidence a model needs.
+fn check_labelled_table(
+    table: &Path,
+    info: &FeatureTableInfo,
+    models: &[WinnowrModel],
+    paths: &[PathBuf],
+) -> Result<()> {
+    check_table_reference(table, info, models, paths)?;
+    check_table::<StrlenOptions>(table, info, models, paths)?;
+    check_table::<PileupOptions>(table, info, models, paths)?;
+    let trained_on: Vec<String> = paths
+        .iter()
+        .zip(models)
+        .filter(|(_, m)| m.info.training_samples.contains(&info.sample))
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+    if !trained_on.is_empty() {
+        log::warn!(
+            "{} is a training sample of {}: its metrics are in-sample and optimistic, not held-out",
+            info.sample,
+            trained_on.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Checks a feature table's reference contigs against each model's, warning if the table does
 /// not record them.
 ///
@@ -1497,11 +1581,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
     if let Some(dir) = args.labelled_calls.as_deref().filter(|dir| !dir.is_dir()) {
         bail!("the --labelled-calls directory {} does not exist", dir.display());
     }
-    let models = args
-        .models
-        .iter()
-        .map(|path| WinnowrModel::load(path, threads))
-        .collect::<Result<Vec<_>>>()?;
+    let models = load_models(&args.models, threads)?;
     let names: [String; 2] = [args.truth_names[0].clone(), args.truth_names[1].clone()];
     if names[0] == names[1] {
         bail!("--truth-names must differ, got {} twice", names[0]);
@@ -1536,23 +1616,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
     if second.info().sample != info.sample {
         bail!("--tables are of different samples: {} and {}", info.sample, second.info().sample);
     }
-    check_table_reference(&args.tables[0], info, &models, &args.models)?;
-    check_table::<StrlenOptions>(&args.tables[0], info, &models, &args.models)?;
-    check_table::<PileupOptions>(&args.tables[0], info, &models, &args.models)?;
-    let trained_on: Vec<String> = args
-        .models
-        .iter()
-        .zip(&models)
-        .filter(|(_, m)| m.info.training_samples.contains(&info.sample))
-        .map(|(path, _)| path.display().to_string())
-        .collect();
-    if !trained_on.is_empty() {
-        log::warn!(
-            "{} is a training sample of {}: its metrics are in-sample and optimistic, not held-out",
-            info.sample,
-            trained_on.join(", ")
-        );
-    }
+    check_labelled_table(&args.tables[0], info, &models, &args.models)?;
     let beds = [
         RegionSet::from_bed(&names[0], &args.truth_beds[0])?,
         RegionSet::from_bed(&names[1], &args.truth_beds[1])?,
@@ -1646,11 +1710,7 @@ fn subset(args: &SubsetArgs) -> Result<()> {
 /// Runs `winnowr score`.
 fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
     check_output_dir("--output", &args.output)?;
-    let models = args
-        .models
-        .iter()
-        .map(|path| WinnowrModel::load(path, threads))
-        .collect::<Result<Vec<_>>>()?;
+    let models = load_models(&args.models, threads)?;
     let supplied: Vec<&str> = args.regions.iter().map(|r| r.name.as_str()).collect();
     for (path, model) in args.models.iter().zip(&models) {
         let mut missing: Vec<&str> = model
@@ -1788,13 +1848,14 @@ pub fn run(cli: &Cli) -> Result<()> {
     dispatch(&cli.command, threads)
 }
 
-/// A command line as one string, for the log: the arguments separated by spaces, each quoted
-/// when it is empty or holds whitespace or quotes.
+/// A command line as one string, for the log, that a POSIX shell reads back as the same arguments:
+/// the arguments separated by spaces, each single-quoted unless it is non-empty and holds only
+/// characters a shell takes literally (ASCII letters, digits and `-_./=:,@%+`).
 fn command_line<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> String {
     let quote = |arg: std::ffi::OsString| {
         let arg = arg.to_string_lossy().into_owned();
         let plain = !arg.is_empty()
-            && !arg.chars().any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\'));
+            && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c));
         if plain { arg } else { format!("'{}'", arg.replace('\'', r"'\''")) }
     };
     args.into_iter().map(quote).collect::<Vec<_>>().join(" ")
@@ -1843,6 +1904,11 @@ mod tests {
     #[case::spaces(&["winnowr", "--vcf", "my calls.vcf"], "winnowr --vcf 'my calls.vcf'")]
     #[case::empty(&["winnowr", ""], "winnowr ''")]
     #[case::quote(&["winnowr", "it's"], r"winnowr 'it'\''s'")]
+    #[case::settings(&["winnowr", "--regions", "a=x/b.bed.gz", "chr1:1-2,000"], "winnowr --regions a=x/b.bed.gz chr1:1-2,000")]
+    #[case::metacharacters(
+        &["winnowr", "a;b", "$HOME/x", "*.bed", "a&b", "(x)", "a|b", "~/x", "a>b", "`x`", "é"],
+        "winnowr 'a;b' '$HOME/x' '*.bed' 'a&b' '(x)' 'a|b' '~/x' 'a>b' '`x`' 'é'"
+    )]
     fn command_lines_are_logged_quoted(#[case] args: &[&str], #[case] expected: &str) {
         assert_eq!(command_line(args.iter().map(std::ffi::OsString::from)), expected);
     }
@@ -1958,8 +2024,8 @@ mod tests {
     #[case::train_zero_patience(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--early-stopping-rounds", "0"], ErrorKind::ValueValidation)]
     #[case::train_zero_block_size(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--validation-block-size", "0"], ErrorKind::ValueValidation)]
     #[case::train_huge_seed(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--seed", "9223372036854775808"], ErrorKind::ValueValidation)]
-    #[case::train_bad_unfixable_flips(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--unfixable-flips", "keep"], ErrorKind::ValueValidation)]
-    #[case::train_bad_variant_type(&["train", "--tables", "a", "--variant-type", "mnp", "-o", "m"], ErrorKind::ValueValidation)]
+    #[case::train_bad_unfixable_flips(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--unfixable-flips", "keep"], ErrorKind::InvalidValue)]
+    #[case::train_bad_variant_type(&["train", "--tables", "a", "--variant-type", "mnp", "-o", "m"], ErrorKind::InvalidValue)]
     #[case::score_without_models(&["score", "--vcf", "v", "-o", "o"], ErrorKind::MissingRequiredArgument)]
     #[case::score_bad_mode(&["score", "--vcf", "v", "-o", "o", "--models", "m", "--mode", "x"], ErrorKind::ValueValidation)]
     #[case::score_alignments_without_reference(&["score", "--vcf", "v", "-o", "o", "--models", "m", "--alignments", "a.cram"], ErrorKind::MissingRequiredArgument)]
@@ -2032,7 +2098,7 @@ mod tests {
         .unwrap();
         let Command::Train(args) = cli.command else { panic!("not train") };
         assert_eq!(args.unfixable_flips, UnfixableFlips::Exclude);
-        assert_eq!((args.cv_folds.as_str(), args.chromosome_folds), ("samples", 5));
+        assert_eq!((args.cv_folds, args.chromosome_folds), (CvFoldKind::Samples, 5));
         assert!(args.refit_final);
         let cli = parse(&[
             "train",
@@ -2050,7 +2116,7 @@ mod tests {
         ])
         .unwrap();
         let Command::Train(args) = cli.command else { panic!("not train") };
-        assert!(args.cv_folds.eq_ignore_ascii_case("chromosomes"));
+        assert_eq!(args.cv_folds, CvFoldKind::Chromosomes);
         assert_eq!(args.chromosome_folds, 4);
         assert!(args.refit_final);
         let cli = parse(&[
@@ -2127,10 +2193,8 @@ mod tests {
             dispatch(&cli.command, NonZeroUsize::new(1).unwrap()).unwrap();
         }
 
-        #[test]
-        fn extract_train_evaluate_and_score() {
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = |name: &str| dir.path().join(name).display().to_string();
+        /// Writes the calls (`calls.vcf.gz`) and their hap.py output (`happy.vcf`) to `dir`.
+        fn write_calls(dir: &Path) {
             let (mut vcf, mut happy) = (HEADER.to_string(), HAPPY_HEADER.to_string());
             for i in 0..CALLS {
                 let pos = 1000 + 200 * i;
@@ -2154,8 +2218,15 @@ mod tests {
                     "chr1\t{pos}\t.\tA\tG\t.\t.\t.\tGT:BD:BK:BVT\t0/1:FN:.:SNP\t.:.:.:NOCALL\n"
                 ));
             }
-            write_bgzf_indexed(&dir.path().join("calls.vcf.gz"), &vcf);
-            std::fs::write(dir.path().join("happy.vcf"), happy).unwrap();
+            write_bgzf_indexed(&dir.join("calls.vcf.gz"), &vcf);
+            std::fs::write(dir.join("happy.vcf"), happy).unwrap();
+        }
+
+        #[test]
+        fn extract_train_evaluate_and_score() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_calls(dir.path());
             for sample in ["S1", "S2"] {
                 run(&[
                     "extract",
@@ -2248,6 +2319,61 @@ mod tests {
             let n_dropped = records.iter().filter(|r| r[6] == "WinnowrDrop").count();
             let n_flipped = records.iter().filter(|r| r[7].contains("WINNOWR_FLIP")).count();
             assert_eq!((n_dropped, n_flipped), (dropped, flipped));
+        }
+
+        /// A model trained on pileup features records the tables' pileup settings.
+        #[test]
+        fn train_records_the_pileup_settings() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_calls(dir.path());
+            let mut pileup = format!(
+                "##pileup_settings=mapq20,bq9,flank5\n{}\n",
+                crate::pileup::PILEUP_COLUMNS.join("\t")
+            );
+            for i in 0..CALLS {
+                let (reference, alt) = if is_true(i) { (10, 10) } else { (18, 2) };
+                pileup.push_str(&format!(
+                    "chr1\t{}\tA\tC\t{}\t0\t0\t{reference}\t0\t0\t{alt}\t0\t0\t0\n",
+                    1000 + 200 * i,
+                    reference + alt
+                ));
+            }
+            std::fs::write(dir.path().join("pileup.tsv"), pileup).unwrap();
+            for sample in ["S1", "S2"] {
+                run(&[
+                    "extract",
+                    "--vcf",
+                    &path("calls.vcf.gz"),
+                    "--happy",
+                    &path("happy.vcf"),
+                    "--contigs",
+                    "chr1",
+                    "--sample",
+                    sample,
+                    "--pileup",
+                    &path("pileup.tsv"),
+                    "-o",
+                    &path(&format!("{sample}.parquet")),
+                ]);
+            }
+            run(&[
+                "train",
+                "--tables",
+                &path("S1.parquet"),
+                &path("S2.parquet"),
+                "--variant-type",
+                "snp",
+                "--pileup-features",
+                "--max-rounds",
+                "3",
+                "-o",
+                &path("snp"),
+            ]);
+            let model = WinnowrModel::load(path("snp.winnowr.json"), NonZeroUsize::new(1).unwrap())
+                .unwrap();
+            let expected: PileupOptions = "mapq20,bq9,flank5".parse().unwrap();
+            assert_eq!(model.info.pileup_settings, Some(expected));
         }
     }
 
@@ -2477,7 +2603,8 @@ mod tests {
     fn the_default_policy_options_come_from_the_constants() {
         let cli = parse(&["score", "--vcf", "v", "--models", "m", "-o", "o"]).unwrap();
         let Command::Score(args) = cli.command else { panic!("not score") };
-        let expected: Vec<String> = DEFAULT_KEEP_FALLBACK.iter().map(ToString::to_string).collect();
+        let expected: Vec<KeepFallback> =
+            DEFAULT_KEEP_FALLBACK.iter().map(|&vt| KeepFallback::from(vt)).collect();
         assert_eq!(args.policy.keep_fallback, expected);
         assert_eq!(
             args.policy.outside_indel_t_drop,
@@ -2491,9 +2618,54 @@ mod tests {
             assert!(!arg.is_hide_default_value_set(), "{id}");
             arg.get_default_values().iter().map(|v| v.to_string_lossy().into_owned()).collect()
         };
-        assert_eq!(shown("keep_fallback"), expected);
+        let names: Vec<String> = DEFAULT_KEEP_FALLBACK.iter().map(ToString::to_string).collect();
+        assert_eq!(shown("keep_fallback"), names);
         assert_eq!(shown("outside_indel_t_drop"), [DEFAULT_OUTSIDE_INDEL_T_DROP.to_string()]);
         assert_eq!(OutsideTDrop(None).to_string(), "none");
+    }
+
+    #[rstest]
+    #[case::none("None", Ok(OutsideTDrop(None)))]
+    #[case::probability("0.25", Ok(OutsideTDrop(Some(0.25))))]
+    #[case::not_a_number("x", Err("not a number: x (or none)"))]
+    #[case::above_one("1.5", Err("must be a probability between 0 and 1, got 1.5 (or none)"))]
+    #[case::nan("NaN", Err("must be a probability between 0 and 1, got NaN (or none)"))]
+    fn parses_the_outside_indel_t_drop(
+        #[case] text: &str,
+        #[case] expected: std::result::Result<OutsideTDrop, &str>,
+    ) {
+        let parsed = text.parse::<OutsideTDrop>().map_err(|error| error.to_string());
+        assert_eq!(parsed, expected.map_err(str::to_string));
+    }
+
+    /// The option enums name their values as the types they stand for do.
+    #[test]
+    fn option_values_are_named_as_their_types() {
+        use clap::ValueEnum;
+        let names = |values: &[_]| -> Vec<String> {
+            values
+                .iter()
+                .map(|value: &KeepFallback| {
+                    value.to_possible_value().unwrap().get_name().to_string()
+                })
+                .collect()
+        };
+        let mut expected: Vec<String> = VariantType::ALL.iter().map(ToString::to_string).collect();
+        expected.push("none".to_string());
+        assert_eq!(names(KeepFallback::value_variants()), expected);
+        for vt in VariantType::ALL {
+            assert_eq!(KeepFallback::from(*vt).variant_type(), Some(*vt));
+        }
+        let samples = CvFoldKind::Samples.to_possible_value().unwrap();
+        assert_eq!(
+            serde_json::to_string(&CvFolds::Samples).unwrap(),
+            format!("\"{}\"", samples.get_name())
+        );
+        let chromosomes = CvFoldKind::Chromosomes.to_possible_value().unwrap();
+        assert_eq!(
+            serde_json::to_string(&CvFolds::Chromosomes { folds: 5 }).unwrap(),
+            format!("{{\"{}\":{{\"folds\":5}}}}", chromosomes.get_name())
+        );
     }
 
     #[test]

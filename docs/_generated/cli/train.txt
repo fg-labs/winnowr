@@ -16,6 +16,8 @@ Options:
       --variant-type <VARIANT_TYPE>
           The variant type to train for (snp or indel)
 
+          [possible values: snp, indel]
+
   -o, --output <OUTPUT>
           The model file to write (`.winnowr.json` is appended if missing)
 
@@ -24,6 +26,7 @@ Options:
           non-PASS calls (stay/promote/promote+flip; needs tables extracted with --truth-vcf)
 
           [default: genotype]
+          [possible values: genotype, promote]
 
       --no-neighbourhood
           Leave out the multi-site neighbourhood features
@@ -53,6 +56,7 @@ Options:
           scored as FPs in cross-validation either way. Recorded in the model
 
           [default: flip]
+          [possible values: flip, drop, exclude]
 
       --sample-groups <SAMPLE_GROUPS>...
           Samples to hold out together in cross-validation, one comma-separated group per value

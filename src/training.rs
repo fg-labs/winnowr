@@ -14,14 +14,16 @@ use crate::model::{
     CvFolds, MODEL_FORMAT_VERSION, ModelInfo, TrainingParams, WinnowrModel, num_classes,
     predict_probabilities, to_matrix,
 };
+use crate::pileup::PileupOptions;
 use crate::rescore::{Mode, Probabilities};
 use crate::samples::{PromoteSampleCalls, SampleCalls};
+use crate::strlen::StrlenOptions;
 use crate::stutter::{StutterFit, StutterModel, fit_stutter_from_feature_tables};
 use crate::table::{FeatureTable, FeatureTableInfo};
 use crate::thresholds::{
     FoldPredictions, PromoteFold, Thresholds, search_promote_thresholds, search_thresholds,
 };
-use crate::version::VERSION;
+use crate::version::{VERSION, XGBOOST_VERSION};
 
 /// The columns training and evaluation read besides the model features: the call keys, labels,
 /// the columns selecting calls, and the strlen evidence of length calls.
@@ -398,6 +400,10 @@ pub struct TrainingSpec<'a> {
     pub groups: &'a [Vec<String>],
     /// The XGBoost threads.
     pub threads: NonZeroUsize,
+    /// The read settings of the training tables' repeat-length evidence, if the model uses it.
+    pub strlen_settings: Option<StrlenOptions>,
+    /// The settings of the training tables' pileup evidence, if the model uses it.
+    pub pileup_settings: Option<PileupOptions>,
 }
 
 /// What a cross-validation fold holds out.
@@ -795,7 +801,6 @@ fn model_info(
     stutter: Option<StutterModel>,
     regenotype: bool,
 ) -> ModelInfo {
-    let (major, minor, patch) = winnowr_xgboost::version();
     ModelInfo {
         format_version: MODEL_FORMAT_VERSION,
         variant_type: spec.variant_type,
@@ -810,10 +815,10 @@ fn model_info(
         params: spec.params,
         stutter,
         regenotype,
-        strlen_settings: None,
-        pileup_settings: None,
+        strlen_settings: spec.strlen_settings,
+        pileup_settings: spec.pileup_settings,
         winnowr_version: VERSION.clone(),
-        xgboost_version: format!("{major}.{minor}.{patch}"),
+        xgboost_version: XGBOOST_VERSION.clone(),
     }
 }
 
@@ -1052,6 +1057,8 @@ mod tests {
             params: TrainingParams { max_rounds: 30, ..TrainingParams::default() },
             groups: &[],
             threads,
+            strlen_settings: None,
+            pileup_settings: None,
         }
     }
 
@@ -1108,6 +1115,39 @@ mod tests {
             let fold_spec = toy_spec(&features, split[held_out + 1]);
             assert_eq!(*fold, fold_alone(&samples, held_out, &fold_spec), "fold {held_out}");
         }
+    }
+
+    #[test]
+    fn models_record_the_evidence_settings_of_their_spec() {
+        let features =
+            vec!["a".to_string(), crate::pileup_features::PILEUP_FEATURES[0].to_string()];
+        let strlen = Some(StrlenOptions::default());
+        let pileup = Some(PileupOptions::default());
+        let contigs = ["chr1".to_string()];
+        let spec = TrainingSpec {
+            contigs: &contigs,
+            strlen_settings: strlen,
+            pileup_settings: pileup,
+            ..toy_spec(&features, threads(1))
+        };
+        let thresholds =
+            Thresholds { t_drop: 0.5, t_flip: 0.6, gain: 0.0, t_regenotype: crate::common::NEVER };
+        let thresholds = Mode::ALL.iter().map(|&mode| (mode, thresholds)).collect();
+        let stutter = Some(crate::testing::fit_stutter_model(&[]));
+        let samples = vec!["S1".to_string()];
+        let info =
+            model_info(&spec, samples.clone(), Task::Genotype, thresholds, None, stutter, false);
+        // A model as training returns it is complete: it records its spec, the settings and the
+        // versions, and validates.
+        assert_eq!((info.format_version, info.task), (MODEL_FORMAT_VERSION, Task::Genotype));
+        assert_eq!((info.variant_type, info.params), (spec.variant_type, spec.params));
+        assert_eq!((&info.features[..], &info.contigs[..]), (&features[..], &contigs[..]));
+        assert_eq!(info.training_samples, samples);
+        assert_eq!((info.strlen_settings, info.pileup_settings), (strlen, pileup));
+        assert_eq!(info.winnowr_version, *VERSION);
+        assert_eq!(info.xgboost_version, *XGBOOST_VERSION);
+        assert!(info.stutter.is_some() && !info.regenotype);
+        info.validate().unwrap();
     }
 
     #[test]
