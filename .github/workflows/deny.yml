@@ -12,6 +12,10 @@ on:
     - cron: "0 12 * * 1" # Mondays 12:00 UTC
   workflow_dispatch:
 
+# Both jobs only read the repository; `gh api` reads public data about upstream XGBoost.
+permissions:
+  contents: read
+
 jobs:
   cargo-deny:
     runs-on: ubuntu-22.04

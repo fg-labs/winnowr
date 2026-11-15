@@ -26,7 +26,8 @@
 # default (PIE) build links it, and the binary needs only the C and C++ runtimes (libc6,
 # libstdc++6, libgcc-s1), which debian:bookworm-slim has.
 
-# Debian bookworm with Rust 1.100.0 (rust-toolchain.toml's channel), a multi-arch index digest.
+# Debian bookworm with rust-toolchain.toml's Rust, a multi-arch index digest. CI checks the tag
+# and RUSTUP_TOOLCHAIN below; the digest, which is what Docker pulls, is bumped by hand.
 FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends g++ make cmake libclang-dev \

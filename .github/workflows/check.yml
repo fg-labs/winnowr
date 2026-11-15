@@ -6,6 +6,11 @@ on:
       - main
   pull_request:
 
+# Every job only reads the repository. sccache's GitHub Actions cache authenticates with the
+# runner's ACTIONS_RUNTIME_TOKEN, not with this token, so it needs no `actions` permission.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -160,6 +165,22 @@ jobs:
         run: rustup toolchain install
       - name: Rustfmt check
         run: cargo ci-fmt
+      # docs/Dockerfile.bookworm names the Rust version twice (its base image tag and
+      # RUSTUP_TOOLCHAIN); both must be rust-toolchain.toml's channel. The image's digest is not
+      # checked (see docs/DEVELOPING.md).
+      - name: Dockerfile uses the pinned Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          dockerfile=docs/Dockerfile.bookworm
+          image=$(sed -n 's/^FROM rust:\([^-@]*\)-.*/\1/p' "$dockerfile")
+          toolchain=$(sed -n 's/^ENV RUSTUP_TOOLCHAIN=\(.*\)$/\1/p' "$dockerfile")
+          echo "rust-toolchain.toml: '$channel'; $dockerfile: image '$image', RUSTUP_TOOLCHAIN '$toolchain'"
+          if [ -z "$channel" ] || [ "$image" != "$channel" ] || [ "$toolchain" != "$channel" ]; then
+            echo "::error file=$dockerfile::the rust image and RUSTUP_TOOLCHAIN must be rust-toolchain.toml's channel ($channel)"
+            exit 1
+          fi
 
   # Catches unresolved intra-doc links, which neither `cargo build` nor clippy reports.
   docs:
