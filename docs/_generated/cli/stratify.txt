@@ -67,7 +67,8 @@ Options:
           P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
           model's veto threshold is compared with), in place of the model's threshold, even when
           that is higher (none: the model's threshold). The keep fallback (--keep-fallback) still
-          drops them when P(keep) is below 0.5
+          drops them when P(keep) is below 0.5. With --expected-f1 it applies too, before a flip or
+          re-genotype
 
           [default: 0.6]
 

@@ -186,8 +186,9 @@ pub enum Rule {
     KeepFallback,
     /// The action of greatest expected F1 gain under the vcfeval arithmetic (for F1 near 1):
     /// flip or re-genotype when its probability is above one half, else drop when P(keep) is
-    /// below one half. The thresholds are not used (veto mode drops when P(keep) is below one
-    /// half, or as its threshold says).
+    /// below one half. The model's thresholds are not used in genotyper mode (veto mode drops
+    /// when P(keep) is below one half, or as its threshold says). A call's own drop threshold
+    /// ([`CallLimits::t_drop`]) is used in both modes.
     ExpectedF1,
 }
 
@@ -203,8 +204,10 @@ pub struct CallLimits {
     /// Never re-genotype the call (nor drop it as re-genotyped to `0/0`).
     pub no_regenotype: bool,
     /// The drop threshold of the call, in place of the model's: P(drop) (P(drop) + P(flip)
-    /// (+ P(regenotype)) in veto mode) must be at least this. Drops for a P(keep) below one half
-    /// ([`Rule::KeepFallback`], [`Rule::ExpectedF1`]) and re-genotypes to `0/0` are not affected.
+    /// (+ P(regenotype)) in veto mode) must be at least this. Under [`Rule::ExpectedF1`] in
+    /// genotyper mode, which has no model threshold, the call is dropped at it before a flip or
+    /// re-genotype. Drops for a P(keep) below one half ([`Rule::KeepFallback`],
+    /// [`Rule::ExpectedF1`]) and re-genotypes to `0/0` are not affected.
     pub t_drop: Option<f64>,
 }
 
@@ -282,7 +285,9 @@ pub fn decide_with_rule(
         let can_regenotype = has_regenotype && calls.regenotypable[row] && !limits.no_regenotype;
         let (mut drop, mut flip, mut regenotype) = (false, false, false);
         if rule == Rule::ExpectedF1 {
-            if can_flip && p(row, Label::Flip) > ONE_HALF {
+            if limits.t_drop.is_some_and(|t_drop| p(row, Label::Drop) >= t_drop) {
+                drop = true;
+            } else if can_flip && p(row, Label::Flip) > ONE_HALF {
                 flip = true;
             } else if can_regenotype && p(row, Label::Regenotype) > ONE_HALF {
                 regenotype = true;
@@ -554,6 +559,38 @@ mod tests {
         // with P(keep) < 0.5 are dropped.
         let actions = decide_with_rule(&p, &calls, thresholds, Mode::Genotyper, Rule::KeepFallback);
         assert_eq!(actions.drop, [true, true, true, true, false, true]);
+    }
+
+    #[test]
+    fn expected_f1_uses_the_calls_limits() {
+        let p = probabilities(&[
+            &[0.35, 0.55, 0.1, 0.0], // P(drop) >= the call's 0.3: dropped, as in veto mode
+            &[0.2, 0.3, 0.0, 0.5],   // below it, P(keep) < 0.5: dropped
+            &[0.1, 0.3, 0.6, 0.0],   // flip withheld: falls through to the P(keep) drop
+            &[0.1, 0.3, 0.0, 0.6],   // re-genotype withheld: falls through to the P(keep) drop
+            &[0.0, 0.6, 0.4, 0.0],   // flip withheld, P(keep) >= 0.5: kept
+            &[0.35, 0.55, 0.1, 0.0], // no limits: kept (the model's thresholds are not used)
+            &[0.4, 0.0, 0.0, 0.6],   // re-genotype withheld; P(drop) >= the call's 0.3: dropped
+        ]);
+        let thresholds = DecisionThresholds { t_drop: 0.9, t_flip: 0.9, t_regenotype: 0.9 };
+        let limited = CallLimits { no_flip: true, no_regenotype: true, t_drop: Some(0.3) };
+        let mut limits = [limited; 7];
+        limits[5] = CallLimits::default();
+        let no = [false; 7];
+        let calls = flags(&[true; 7], &[true; 7], &no, Some(&limits));
+        let actions = decide_with_rule(&p, &calls, thresholds, Mode::Genotyper, Rule::ExpectedF1);
+        assert_eq!(actions.drop, [true, true, true, true, false, false, true]);
+        assert_eq!((actions.flip, actions.regenotype), (no.to_vec(), no.to_vec()));
+        // Veto mode drops the first call at the call's threshold too (P(drop) + P(flip) = 0.45).
+        let veto = decide_with_rule(&p, &calls, thresholds, Mode::Veto, Rule::ExpectedF1);
+        assert!(veto.drop[0]);
+        // Fixes allowed: the call's drop threshold comes before a flip or re-genotype.
+        let fixable = [CallLimits { t_drop: Some(0.3), ..CallLimits::default() }; 2];
+        let p = probabilities(&[&[0.35, 0.0, 0.65, 0.0], &[0.2, 0.0, 0.0, 0.8]]);
+        let calls = flags(&[true; 2], &[true; 2], &[false; 2], Some(&fixable));
+        let actions = decide_with_rule(&p, &calls, thresholds, Mode::Genotyper, Rule::ExpectedF1);
+        assert_eq!(actions.drop, [true, false]);
+        assert_eq!(actions.regenotype, [false, true]);
     }
 
     /// The call's drop threshold replaces the model's rather than only raising it: below a high

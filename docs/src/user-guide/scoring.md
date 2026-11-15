@@ -63,9 +63,11 @@ Two more options are experimental:
 
 - `--expected-f1 <snp|indel>`: the genotype models of these variant types take the action of
   greatest expected F1 gain in place of the keep fallback. In genotyper mode this replaces their
-  thresholds: flip when P(flip) is above 0.5, else re-genotype when P(re-genotype) is above 0.5,
-  else drop when P(keep) is below 0.5. In veto mode `t_drop` still applies: a call is dropped when
-  P(drop) + P(flip) (+ P(re-genotype)) reaches `t_drop`, or when P(keep) is below 0.5.
+  thresholds: drop an indel call outside the confident regions when P(drop) reaches
+  `--outside-indel-t-drop`, else flip when P(flip) is above 0.5, else re-genotype when
+  P(re-genotype) is above 0.5, else drop when P(keep) is below 0.5. In veto mode `t_drop` still
+  applies: a call is dropped when P(drop) + P(flip) (+ P(re-genotype)) reaches `t_drop`, or when
+  P(keep) is below 0.5.
 - `--abstain-actions <flip|regenotype|promote>`: withhold these actions from calls outside the
   confident regions.
 

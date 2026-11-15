@@ -93,7 +93,7 @@ Options:
           [default: 0.05]
 
       --max-leaves <MAX_LEAVES>
-          The maximum leaves per tree
+          The maximum leaves per tree (0 = unlimited, bounded by --max-depth)
 
           [default: 31]
 

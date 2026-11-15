@@ -66,9 +66,10 @@ the length caller disagrees with when P(re-genotype) reaches it and the call is 
 flipped (P(drop) reaching `t_drop` comes first, then P(flip) reaching `t_flip`): the call gets the
 length caller's genotype, with an ALT allele added when needed, the INFO flag `WINNOWR_REGENOTYPE`
 and its old genotype in FORMAT `WINNOWR_OGT`. Re-genotyping to `0/0` is a drop. That order is the
-threshold rule: with the experimental `--expected-f1 indel`, `score` instead flips a call when
-P(flip) is above 0.5, else re-genotypes it when P(re-genotype) is above 0.5, else drops it when
-P(keep) is below 0.5 (see [Scoring](scoring.md#how-score-acts-on-indel-calls)).
+threshold rule: with the experimental `--expected-f1 indel`, `score` instead drops a call outside
+the confident regions when P(drop) reaches `--outside-indel-t-drop`, else flips it when P(flip) is
+above 0.5, else re-genotypes it when P(re-genotype) is above 0.5, else drops it when P(keep) is
+below 0.5 (see [Scoring](scoring.md#how-score-acts-on-indel-calls)).
 
 ## Scoring
 
