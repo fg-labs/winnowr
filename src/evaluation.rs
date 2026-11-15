@@ -10,8 +10,7 @@ use crate::labels::Label;
 use crate::numeric::metric_float;
 use crate::policy::withhold_promotions;
 use crate::rescore::{
-    CallLimits, Counts, DecisionThresholds, Mode, Probabilities, Rule, decide_promote,
-    rescore_promote,
+    CallLimits, Counts, DecisionThresholds, Mode, Outcome, Probabilities, Rule, decide_promote,
 };
 use crate::samples::{PromoteSampleCalls, SampleCalls};
 use crate::thresholds::{
@@ -119,11 +118,6 @@ impl PolicyMetric {
     }
 }
 
-/// The number of true values.
-fn count(mask: impl Iterator<Item = bool>) -> i64 {
-    mask.filter(|&v| v).count() as i64
-}
-
 /// Applies one policy to a sample's labelled calls and rescores.
 ///
 /// # Errors
@@ -140,12 +134,8 @@ pub fn evaluate_policy(
 ) -> Result<PolicyMetric> {
     let fold = calls.to_fold(probabilities.clone())?;
     let actions = fold.decide_with_rule(thresholds, mode, acting.rule, acting.limits);
-    let counts = fold.rescore(&actions);
-    let is_tp: Vec<bool> = fold.labels.iter().map(|&label| label == Label::Keep).collect();
-    let both = |a: &[bool], b: &[bool]| count(a.iter().zip(b).map(|(x, y)| *x && *y));
-    let not_tp: Vec<bool> = is_tp.iter().map(|tp| !tp).collect();
-    let regenotype_fixed: Vec<bool> =
-        not_tp.iter().zip(&fold.regenotype_ok).map(|(a, b)| *a && *b).collect();
+    let outcome = Outcome::of_calls(&fold.labels, &fold.flip_ok, &fold.regenotype_ok, &actions);
+    let counts = fold.baseline.plus(outcome.delta);
     Ok(PolicyMetric {
         sample: calls.sample.clone(),
         variant_type: variant_type.to_string(),
@@ -153,11 +143,11 @@ pub fn evaluate_policy(
         mode,
         t_drop: thresholds.t_drop,
         t_flip: thresholds.t_flip,
-        dropped: count(actions.drop.iter().copied()),
-        dropped_tp: both(&actions.drop, &is_tp),
-        flipped: count(actions.flip.iter().copied()),
-        flips_fixed: both(&actions.flip, &fold.flip_ok),
-        flips_broke_tp: both(&actions.flip, &is_tp),
+        dropped: outcome.dropped,
+        dropped_tp: outcome.dropped_tp,
+        flipped: outcome.flipped,
+        flips_fixed: outcome.flips_fixed,
+        flips_broke_tp: outcome.flips_broke_tp,
         counts,
         f1_gain: counts.f1() - fold.baseline.f1(),
         t_promote: NEVER,
@@ -166,9 +156,9 @@ pub fn evaluate_policy(
         promoted_correct: 0,
         promoted_flipped: 0,
         t_regenotype: thresholds.t_regenotype,
-        regenotyped: count(actions.regenotype.iter().copied()),
-        regenotypes_fixed: both(&actions.regenotype, &regenotype_fixed),
-        regenotypes_broke_tp: both(&actions.regenotype, &is_tp),
+        regenotyped: outcome.regenotyped,
+        regenotypes_fixed: outcome.regenotypes_fixed,
+        regenotypes_broke_tp: outcome.regenotypes_broke_tp,
     })
 }
 
@@ -281,15 +271,15 @@ pub fn evaluate_promote_policy(
     if let Some(withheld) = withheld {
         withhold_promotions(&mut promotions, withheld);
     }
-    let start = pass_metric.counts;
-    let counts = rescore_promote(&fold.labels, &promotions, start);
+    let outcome = Outcome::of_candidates(&fold.labels, &promotions);
+    let counts = pass_metric.counts.plus(outcome.delta);
     Ok(PolicyMetric {
         policy: policy.to_string(),
         t_promote,
         t_promote_flip: t_flip,
-        promoted: count(promotions.promote.iter().copied()),
-        promoted_correct: counts.tp - start.tp,
-        promoted_flipped: count(promotions.flip.iter().copied()),
+        promoted: outcome.promoted,
+        promoted_correct: outcome.promoted_correct,
+        promoted_flipped: outcome.promoted_flipped,
         counts,
         f1_gain: counts.f1() - candidates.baseline.f1(),
         ..pass_metric.clone()

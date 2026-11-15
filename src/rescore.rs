@@ -145,6 +145,12 @@ impl Counts {
         let denominator = 2 * self.tp + self.fp + self.fn_;
         if denominator == 0 { 0.0 } else { (2 * self.tp) as f64 / denominator as f64 }
     }
+
+    /// These counts changed by `delta`.
+    #[must_use]
+    pub fn plus(self, delta: Counts) -> Counts {
+        Counts { tp: self.tp + delta.tp, fp: self.fp + delta.fp, fn_: self.fn_ + delta.fn_ }
+    }
 }
 
 /// The counts before any action: calls labelled [`Label::Keep`] are TPs, all others FPs.
@@ -331,6 +337,9 @@ pub fn rescore(
     baseline: Counts,
     regenotype_ok: &[bool],
 ) -> Counts {
+    // The threshold search rescores every candidate thresholds' actions, so this is a lean loop
+    // of four counters rather than an [`Outcome`] (which counts the same way, 30% slower here);
+    // `outcomes_sum_to_rescore` checks that the two agree for every label, action and fix.
     let (mut dropped_tp, mut dropped_fp, mut broke, mut fixed) = (0i64, 0i64, 0i64, 0i64);
     for (i, &label) in labels.iter().enumerate() {
         let is_tp = label == Label::Keep;
@@ -396,17 +405,29 @@ pub fn rescore_promote(
     promotions: &Promotions,
     baseline: Counts,
 ) -> Counts {
-    let (mut correct, mut wrong) = (0i64, 0i64);
+    let mut delta = Counts { tp: 0, fp: 0, fn_: 0 };
     for (i, &label) in labels.iter().enumerate() {
-        if !promotions.promote[i] {
-            continue;
+        if promotions.promote[i] {
+            delta = delta.plus(promotion_delta(label, promotions.flip[i]));
         }
-        let flipped = promotions.flip[i];
-        let right = (label == PromoteLabel::Promote && !flipped)
-            || (label == PromoteLabel::PromoteFlip && flipped);
-        if right { correct += 1 } else { wrong += 1 }
     }
-    Counts { tp: baseline.tp + correct, fp: baseline.fp + wrong, fn_: baseline.fn_ - correct }
+    baseline.plus(delta)
+}
+
+/// How promoting a labelled candidate (and flipping it, with `flip`) changes the counts: one with
+/// the right genotype ([`PromoteLabel::Promote`] not flipped, or [`PromoteLabel::PromoteFlip`]
+/// flipped) turns a truth FN into a TP; any other is a new FP.
+const fn promotion_delta(label: PromoteLabel, flip: bool) -> Counts {
+    if promotion_is_right(label, flip) {
+        Counts { tp: 1, fp: 0, fn_: -1 }
+    } else {
+        Counts { tp: 0, fp: 1, fn_: 0 }
+    }
+}
+
+/// Whether a promoted candidate gets the right genotype (see [`promotion_delta`]).
+const fn promotion_is_right(label: PromoteLabel, flip: bool) -> bool {
+    matches!((label, flip), (PromoteLabel::Promote, false) | (PromoteLabel::PromoteFlip, true))
 }
 
 /// A genotype model's action on a PASS call.
@@ -438,7 +459,8 @@ impl CallAction {
     }
 }
 
-/// The actions on one stratum's labelled calls and their outcomes against one truth set.
+/// The actions on labelled calls (a stratum's in `stratify`, a sample's in `evaluate`) and their
+/// outcomes against one truth set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outcome {
     /// Labelled PASS calls.
@@ -467,13 +489,47 @@ pub struct Outcome {
     pub promoted_correct: i64,
     /// Promotions whose genotype was flipped.
     pub promoted_flipped: i64,
-    /// The counts before any action (FNs from the truth FNs in the stratum).
+    /// The counts before any action (FNs from the truth FNs of the calls' stratum or sample).
     pub before: Counts,
     /// The change in counts from the actions.
     pub delta: Counts,
 }
 
 impl Outcome {
+    /// The outcome of actions on labelled PASS calls, with no FNs before them.
+    ///
+    /// # Arguments
+    ///
+    /// * `labels` - the [`Label`] of each call.
+    /// * `flip_ok` - per call, whether flipping it gives the truth genotype.
+    /// * `regenotype_ok` - per call, whether re-genotyping it gives the truth genotype.
+    /// * `actions` - the actions (a call in more than one mask takes the first: drop, flip,
+    ///   re-genotype).
+    #[must_use]
+    pub fn of_calls(
+        labels: &[Label],
+        flip_ok: &[bool],
+        regenotype_ok: &[bool],
+        actions: &Actions,
+    ) -> Outcome {
+        let mut outcome = Outcome::default();
+        for (i, &label) in labels.iter().enumerate() {
+            let action = CallAction::of(actions.drop[i], actions.flip[i], actions.regenotype[i]);
+            outcome.add_call(label, flip_ok[i], regenotype_ok[i], action);
+        }
+        outcome
+    }
+
+    /// The outcome of promotions of labelled candidates, with no counts before them.
+    #[must_use]
+    pub fn of_candidates(labels: &[PromoteLabel], promotions: &Promotions) -> Outcome {
+        let mut outcome = Outcome::default();
+        for (i, &label) in labels.iter().enumerate() {
+            outcome.add_candidate(label, promotions.promote[i], promotions.flip[i]);
+        }
+        outcome
+    }
+
     /// Adds a labelled PASS call and the action taken on it.
     pub fn add_call(
         &mut self,
@@ -503,18 +559,17 @@ impl Outcome {
                 }
             }
             CallAction::Flip | CallAction::Regenotype => {
-                let ok = if action == CallAction::Flip {
-                    self.flipped += 1;
-                    flip_ok
+                let (count, fixed, broke, ok) = if action == CallAction::Flip {
+                    (&mut self.flipped, &mut self.flips_fixed, &mut self.flips_broke_tp, flip_ok)
                 } else {
-                    self.regenotyped += 1;
-                    regenotype_ok
+                    (
+                        &mut self.regenotyped,
+                        &mut self.regenotypes_fixed,
+                        &mut self.regenotypes_broke_tp,
+                        regenotype_ok,
+                    )
                 };
-                let (fixed, broke) = if action == CallAction::Flip {
-                    (&mut self.flips_fixed, &mut self.flips_broke_tp)
-                } else {
-                    (&mut self.regenotypes_fixed, &mut self.regenotypes_broke_tp)
-                };
+                *count += 1;
                 if is_tp {
                     *broke += 1;
                     d.tp -= 1;
@@ -540,25 +595,16 @@ impl Outcome {
         if flip {
             self.promoted_flipped += 1;
         }
-        let right = (label == PromoteLabel::Promote && !flip)
-            || (label == PromoteLabel::PromoteFlip && flip);
-        if right {
+        if promotion_is_right(label, flip) {
             self.promoted_correct += 1;
-            self.delta.tp += 1;
-            self.delta.fn_ -= 1;
-        } else {
-            self.delta.fp += 1;
         }
+        self.delta = self.delta.plus(promotion_delta(label, flip));
     }
 
     /// The counts after the actions.
     #[must_use]
     pub fn after(&self) -> Counts {
-        Counts {
-            tp: self.before.tp + self.delta.tp,
-            fp: self.before.fp + self.delta.fp,
-            fn_: self.before.fn_ + self.delta.fn_,
-        }
+        self.before.plus(self.delta)
     }
 
     /// Adds another outcome's counts.
@@ -576,11 +622,8 @@ impl Outcome {
         self.promoted += other.promoted;
         self.promoted_correct += other.promoted_correct;
         self.promoted_flipped += other.promoted_flipped;
-        for (sum, part) in [(&mut self.before, other.before), (&mut self.delta, other.delta)] {
-            sum.tp += part.tp;
-            sum.fp += part.fp;
-            sum.fn_ += part.fn_;
-        }
+        self.before = self.before.plus(other.before);
+        self.delta = self.delta.plus(other.delta);
     }
 }
 
