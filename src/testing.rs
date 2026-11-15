@@ -196,6 +196,16 @@ pub(crate) fn separable_model(
     task: crate::common::Task,
     variant_type: crate::common::VariantType,
 ) -> crate::model::WinnowrModel {
+    separable_model_of(task, variant_type, "x")
+}
+
+/// A [`separable_model`] of the one feature `feature` rather than `x`; a pileup feature's model
+/// has the default pileup settings.
+pub(crate) fn separable_model_of(
+    task: crate::common::Task,
+    variant_type: crate::common::VariantType,
+    feature: &str,
+) -> crate::model::WinnowrModel {
     use std::num::NonZeroUsize;
 
     use winnowr_xgboost::{Booster, DMatrix};
@@ -209,7 +219,7 @@ pub(crate) fn separable_model(
     let values: Vec<f32> = (0..rows).map(|i| (i % 3) as f32).collect();
     let mut train = DMatrix::from_dense(&values, rows, 1, f32::NAN).unwrap();
     train.set_labels(&values).unwrap();
-    train.set_feature_names(&["x"]).unwrap();
+    train.set_feature_names(&[feature]).unwrap();
     let threads = NonZeroUsize::new(1).unwrap();
     let mut booster = Booster::new(&[&train], threads).unwrap();
     booster
@@ -232,7 +242,7 @@ pub(crate) fn separable_model(
         format_version: MODEL_FORMAT_VERSION,
         variant_type,
         task,
-        features: vec!["x".to_string()],
+        features: vec![feature.to_string()],
         region_names: vec![],
         thresholds,
         promote_thresholds,
@@ -243,7 +253,9 @@ pub(crate) fn separable_model(
         stutter: None,
         regenotype: false,
         strlen_settings: None,
-        pileup_settings: None,
+        pileup_settings: crate::pileup_features::PILEUP_FEATURES
+            .contains(&feature)
+            .then(crate::pileup::PileupOptions::default),
         winnowr_version: env!("CARGO_PKG_VERSION").to_string(),
         xgboost_version: "test".to_string(),
     };

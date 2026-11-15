@@ -191,14 +191,28 @@ mod tests {
         assert_eq!(apply(patch), Ok("one\ntwo\nTHREE\nfour\n".to_string()));
     }
 
+    /// The whole output is compared, so that a hunk that only adds lines keeps every original line
+    /// after it, in order.
     #[rstest]
-    #[case::adds_at_the_start("--- a/src/a.cc\n+++ b/src/a.cc\n@@ -0,0 +1 @@\n+zero\n", "zero\n")]
+    #[case::adds_at_the_start(
+        "--- a/src/a.cc\n+++ b/src/a.cc\n@@ -0,0 +1 @@\n+zero\n",
+        "zero\none\ntwo\nthree\nfour\n"
+    )]
     #[case::adds_after_a_line(
         "--- a/src/a.cc\n+++ b/src/a.cc\n@@ -1,0 +2 @@\n+one and a half\n",
-        "one\none and a half\n"
+        "one\none and a half\ntwo\nthree\nfour\n"
     )]
-    fn applies_hunks_that_only_add(#[case] patch: &str, #[case] start: &str) {
-        assert!(apply(patch).unwrap().starts_with(start));
+    #[case::adds_at_the_end(
+        "--- a/src/a.cc\n+++ b/src/a.cc\n@@ -4,0 +5,2 @@\n+five\n+six\n",
+        "one\ntwo\nthree\nfour\nfive\nsix\n"
+    )]
+    #[case::adds_twice(
+        "--- a/src/a.cc\n+++ b/src/a.cc\n@@ -1,0 +2 @@\n+one and a half\n\
+         @@ -3,0 +5 @@\n+three and a half\n",
+        "one\none and a half\ntwo\nthree\nthree and a half\nfour\n"
+    )]
+    fn applies_hunks_that_only_add(#[case] patch: &str, #[case] expected: &str) {
+        assert_eq!(apply(patch), Ok(expected.to_string()));
     }
 
     #[rstest]

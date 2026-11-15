@@ -474,4 +474,104 @@ mod tests {
         assert_eq!(read_for_models::<PileupOptions>(&[], &models, &paths).unwrap(), None);
         assert_eq!(read_for_models::<PileupOptions>(&tables, &models[1..2], &paths).unwrap(), None);
     }
+
+    /// `score --alignments` decides as `score --pileup` does with the same evidence measured
+    /// beforehand, including which model's decision a call scored by two models keeps: the model
+    /// that uses the evidence is first, though it scores after the one that does not.
+    #[test]
+    fn measuring_while_scoring_decides_as_scoring_measured_evidence() {
+        use tempfile::TempDir;
+
+        use crate::common::{Task, VariantType};
+        use crate::rescore::Mode;
+        use crate::testing::{
+            CALL_FIELDS, TestRead, call_table, separable_model, separable_model_of, vcf_header,
+            write_bam, write_fasta, write_indexed_vcf,
+        };
+
+        let dir = TempDir::new().unwrap();
+        // 80 bp of flank, an A10 tract and 80 bp of flank; 0-based 122, 130 and 138 are Gs.
+        let reference = format!("{}{}{}", "CGTC".repeat(20), "A".repeat(10), "GCTG".repeat(20));
+        let fasta = write_fasta(dir.path(), &[("chr1", &reference), ("chr2", "ACGT")]);
+        let header = vcf_header(&[CALL_FIELDS], &["S1"]);
+        let records = [
+            "chr1\t123\t.\tG\tT\t50\tPASS\t.\tGT\t0/1",
+            "chr1\t131\t.\tG\tT\t50\tPASS\t.\tGT\t0/1",
+            "chr1\t139\t.\tG\tT\t50\tPASS\t.\tGT\t0/1",
+        ];
+        let vcf = write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &records);
+        // Alternate reads at MAPQ 60: one at 123, two at 131 and none at 139.
+        let with_alts = |positions: &[usize]| {
+            let mut bases = reference.as_bytes()[90..160].to_vec();
+            for &pos in positions {
+                bases[pos - 90] = b'T';
+            }
+            String::from_utf8(bases).unwrap()
+        };
+        let (both, one) = (with_alts(&[122, 130]), with_alts(&[130]));
+        let read = |name, bases| TestRead {
+            name,
+            pos: 90,
+            cigar: "70M",
+            flag: 0,
+            mapq: 60,
+            qual: 30,
+            bases: Some(bases),
+        };
+        let reads = [read("both", &both), read("one", &one)];
+        let bam = write_bam(dir.path(), "reads.bam", reference.len() as u64, &reads);
+        let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
+
+        // The SNP model's class is the number of alternate reads at MAPQ 20 or more (drop, keep,
+        // flip); the indel model's is `x`. The indel call shares its key with the SNP at 131, so
+        // both models decide it.
+        let calls = [
+            (("chr1", 123, "G", "T", "PASS", "snp", "0/1", false), 0.0),
+            (("chr1", 131, "G", "T", "PASS", "snp", "0/1", false), 0.0),
+            (("chr1", 139, "G", "T", "PASS", "snp", "0/1", false), 0.0),
+            (("chr1", 131, "G", "T", "PASS", "indel", "0/1", false), 0.0),
+        ];
+        let keys: Vec<_> = calls.iter().map(|(row, _)| *row).collect();
+        let table = call_table(&keys)
+            .with_f64_column("x", calls.iter().map(|(_, x)| *x).collect())
+            .unwrap()
+            .with_bool_column("flippable", vec![true; calls.len()])
+            .unwrap();
+        let options = PileupOptions::default();
+        let snp = separable_model_of(Task::Genotype, VariantType::Snp, "pu_alt_mqhigh");
+        assert_eq!(snp.info.pileup_settings, Some(options));
+        let models = [snp, separable_model(Task::Genotype, VariantType::Indel)];
+        let policy = Policy::new(Mode::Genotyper);
+
+        let contigs = ["chr1".to_string()];
+        let rows = measure_pileup(&inputs, &contigs, &options).unwrap();
+        let measured = add_pileup_features(table.clone(), &PileupTables { options, rows }).unwrap();
+        let expected = crate::policy::decide_calls(&measured, &models, &policy).unwrap();
+        let measuring =
+            Measuring { inputs: &inputs, strlen: None, pileup: Some(options), contigs: &contigs };
+        let threads = NonZeroUsize::new(2).unwrap();
+        let got = measure_and_decide(
+            table,
+            &models,
+            &policy,
+            &measuring,
+            threads,
+            &mut PhaseTimer::start(),
+        )
+        .unwrap();
+        assert_eq!(got, expected);
+
+        let mut actions: Vec<(u64, Task, bool, bool)> =
+            got.iter().map(|(key, d)| (key.1, d.task, d.drop, d.flip)).collect();
+        actions.sort_unstable_by_key(|action| action.0);
+        // 131 is flipped by the SNP model, not dropped by the indel model.
+        assert_eq!(
+            actions,
+            [
+                (123, Task::Genotype, false, false),
+                (131, Task::Genotype, false, true),
+                (139, Task::Genotype, true, false),
+            ]
+        );
+    }
 }
