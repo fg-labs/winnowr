@@ -1,0 +1,20 @@
+[book]
+title = "winnowr"
+description = "Machine-learned genotyping and filtering of germline small-variant calls"
+authors = ["Fulcrum Genomics"]
+
+[build]
+# Rebuild `mdbook serve` when the generated CLI help changes.
+extra-watch-dirs = ["_generated"]
+
+[output.html]
+git-repository-url = "https://github.com/fg-labs/winnowr"
+edit-url-template = "https://github.com/fg-labs/winnowr/edit/main/docs/{path}"
+no-section-label = true
+
+# Fails the build on links to pages that do not exist (mdBook alone only warns); links to missing
+# anchors are not checked. The checker is the mdbook-linkcheck2 fork, which reads mdBook 0.5's
+# output; its version is pinned in docs/build.sh. Web links are not followed, so the build needs no
+# network. With a second output configured, mdBook writes the HTML to book/html/.
+[output.linkcheck2]
+follow-web-links = false

@@ -1,0 +1,31 @@
+Restrict a labelled feature table to some of its contigs, or away from some regions.
+
+Keeps the calls on --contigs whose REF span does not overlap --exclude-bed, and recounts the truth
+FNs from the hap.py VCF on the same terms, so that training on the table (e.g. a sample's even
+chromosomes, to evaluate on its odd ones) sees no label from elsewhere. Features are kept as
+extracted: per-sample features (e.g. the depth normalization) still come from all of the sample's
+calls, and the table still lists all its contigs.
+
+Usage: winnowr subset [OPTIONS] --table <TABLE> --happy <HAPPY> --output <OUTPUT>
+
+Options:
+  -t, --threads <THREADS>
+          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+
+      --table <TABLE>
+          The labelled feature table (from `extract --happy`)
+
+      --happy <HAPPY>
+          The hap.py output VCF the table was labelled from (to recount its truth FNs)
+
+      --contigs <CONTIGS>...
+          The contigs to keep [default: all the table's contigs]
+
+      --exclude-bed <EXCLUDE_BED>
+          A BED of regions to drop calls and truth FNs in (those whose REF span overlaps it)
+
+  -o, --output <OUTPUT>
+          The feature table to write (Parquet)
+
+  -h, --help
+          Print help (see a summary with '-h')

@@ -26,3 +26,6 @@ Session.vim
 .idea
 *.iml
 .vscode
+
+# The user guide built by mdBook
+docs/book/

@@ -1,0 +1,16 @@
+# Read the Docs build of the user guide (docs/), published at https://winnowr.readthedocs.io.
+version: 2
+
+build:
+  os: ubuntu-24.04
+  # The schema needs a tool, though the build runs only the commands below; Python is the
+  # lightest. There is no Rust build: the CLI help the guide includes (docs/_generated/cli/) is
+  # committed, and a test checks it against the binary.
+  tools:
+    python: "3.12"
+  commands:
+    # Downloads the pinned, checksummed mdbook and mdbook-linkcheck2 and builds the book, failing
+    # on links to pages that do not exist. CI (.github/workflows/docs.yml) runs the same script.
+    - docs/build.sh
+    - mkdir -p _readthedocs/html
+    - cp -r docs/book/html/. _readthedocs/html/

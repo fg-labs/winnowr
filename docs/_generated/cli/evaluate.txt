@@ -1,0 +1,41 @@
+Report F1 for models' decisions on a labelled sample
+
+Usage: winnowr evaluate [OPTIONS] --models <MODELS>... --table <TABLE> --output <OUTPUT>
+
+Options:
+      --models <MODELS>...
+          The model files of one variant type: a genotype model, a promote model, or one of each
+  -t, --threads <THREADS>
+          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+      --table <TABLE>
+          A labelled feature table (from `extract --happy`, plus --truth-vcf for promote models) of
+          a held-out sample (a training sample of the models gives optimistic metrics, with a
+          warning)
+  -o, --output <OUTPUT>
+          The metrics file to write (TSV)
+      --tuned
+          Also report thresholds tuned on this sample (optimistic: they peek at the labels)
+      --keep-fallback <KEEP_FALLBACK>...
+          Variant types whose genotype model also drops the calls its thresholds leave alone when
+          P(keep) is below 0.5 (none, alone: no variant type) [default: indel] [possible values:
+          snp, indel, none]
+      --expected-f1 <EXPECTED_F1>...
+          Experimental: variant types whose genotype model takes the action of greatest expected F1
+          gain instead of using its thresholds (and in place of --keep-fallback): flip or
+          re-genotype when its probability is above 0.5, else drop when P(keep) is below 0.5
+      --abstain-actions <ABSTAIN_ACTIONS>...
+          Experimental: actions withheld from calls outside the confident regions (--regions
+          notinalldifficultregions=PATH; calls whose REF span is not inside it are "outside"); none,
+          alone: no action [default: none] [possible values: flip, regenotype, promote, none]
+      --outside-indel-t-drop <P|none>
+          The drop threshold of indel calls outside the confident regions: they are dropped when
+          P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
+          model's veto threshold is compared with), in place of the model's threshold, even when
+          that is higher (none: the model's threshold). The keep fallback (--keep-fallback) still
+          drops them when P(keep) is below 0.5 [default: 0.6]
+      --regions <NAME=PATH>...
+          The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
+          with these. Only the confident regions (notinalldifficultregions) are read; the models'
+          region features come from the table
+  -h, --help
+          Print help
