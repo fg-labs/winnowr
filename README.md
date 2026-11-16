@@ -3,7 +3,20 @@
 
 # winnowr
 
-Machine-learned genotyping and filtering of germline small-variant calls.
+<!-- The opening below is repeated in docs/src/index.md: change both together. -->
+
+**winnowr post-processes single-sample GATK HaplotypeCaller VCFs with models you train on
+truth-labelled samples.**
+
+**What sets winnowr apart**
+
+- **Works on a single sample:** no cohort or joint calling.
+- **Fixes calls, not just filters them:** it can drop false calls, flip wrong zygosity,
+  re-genotype indels in repeats, and rescue true calls that were filtered.
+- **Uses evidence the VCF lacks:** repeat-tract lengths and reads below HaplotypeCaller's MAPQ
+  cut-off.
+- **Tuned for F1:** cross-validation against your truth data picks each model's thresholds.
+- **Drops in after HaplotypeCaller:** no re-calling.
 
 **The user guide is at [winnowr.readthedocs.io](https://winnowr.readthedocs.io).**
 
@@ -36,8 +49,8 @@ power your bioinformatics with winnowr and beyond.
 
 ## Overview
 
-winnowr post-processes single-sample GATK HaplotypeCaller calls. For each PASS call, a
-per-variant-type (SNP, indel) XGBoost model predicts one of three classes:
+A genotype model scores the PASS calls of one variant type (SNP or indel), and predicts one of
+three classes:
 
 | class | meaning                      | action                            |
 |-------|------------------------------|-----------------------------------|
@@ -45,18 +58,17 @@ per-variant-type (SNP, indel) XGBoost model predicts one of three classes:
 | keep  | the call is right            | none                              |
 | flip  | right allele, wrong zygosity | switch GT between `0/1` and `1/1` |
 
-Training labels come from hap.py run against a truth set, such as the GIAB benchmarks. Models can
-also use repeat-tract lengths and per-allele read counts by MAPQ measured in the reads. The
-[user guide](https://winnowr.readthedocs.io) explains the classes, labels, training and scoring in
-full.
+An indel genotype model trained with `--regenotype` has a fourth class, re-genotype. A promote model
+scores non-PASS calls that do not overlap a PASS call instead, and predicts stay, promote, or
+promote and flip.
 
-## Highlights
+By default `score` also applies two indel rules that are fixed, not chosen by cross-validation. An
+indel call that the thresholds leave alone is dropped when its P(keep) is below 0.5. Given GIAB's
+confident regions (`--regions notinalldifficultregions=...`), an indel call outside them is dropped
+at a threshold of 0.6, in place of the model's drop threshold.
 
-- **One self-contained binary.** XGBoost and its OpenMP runtime are built from source and linked
-  statically: nothing to install alongside the release binaries. A source build on a Linux
-  distribution whose `libgomp.a` is not position-independent (e.g. RHEL, Amazon Linux) links the
-  shared libgomp instead, with a warning, unless built with
-  `RUSTFLAGS='-C relocation-model=static'` (see `xgboost/build.rs`).
+The [user guide](https://winnowr.readthedocs.io) explains the classes, labels, training and scoring
+in full.
 
 ## Install
 
@@ -64,6 +76,11 @@ From source, with Rust 1.88 or newer, CMake, a C++ compiler (Apple clang with
 `brew install libomp` on macOS, or GCC on Linux) and libclang, which builds htslib's bindings
 (`apt-get install libclang-dev` on Debian or Ubuntu; Apple clang provides it on macOS). See
 [DEVELOPING](https://github.com/fg-labs/winnowr/blob/main/docs/DEVELOPING.md) for details.
+XGBoost and htslib are built from source and linked statically, with the OpenMP runtime's static
+library (`libomp.a` from Homebrew on macOS, GCC's `libgomp.a` on Linux). A source build on a Linux
+distribution whose `libgomp.a` is not position-independent (e.g. RHEL, Amazon Linux) links the
+shared libgomp instead, with a warning, unless built with `RUSTFLAGS='-C relocation-model=static'`
+and an explicit `--target`; so does any build whose static-link test fails (see `xgboost/build.rs`).
 
 ```console
 git clone --recursive https://github.com/fg-labs/winnowr.git
