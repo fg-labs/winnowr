@@ -4,20 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [0.1.0] - 2026-11-15
 
-The first release of the Rust rewrite of winnowr. Its outputs and models differ from the Python
-version's by design; see
-[Coming from the Python version](https://winnowr.readthedocs.io/en/latest/getting-started/python-version.html)
-for the changes in the defaults.
+The first release of winnowr: machine-learned filtering and genotyping of germline small-variant
+calls, with XGBoost models trained on hap.py-labelled feature tables.
 
 ### Features
 
 - `extract`, `strlen`, `pileup`, `train`, `score`, `evaluate`, `stratify` and `subset`.
 - Models are one `<name>.winnowr.json` file (model format 3) with the XGBoost booster embedded.
-  Models from the Python version (formats 1 and 2) are not read.
 - Training holds out whole 10 kb genomic blocks for early stopping, then refits the final model on
   every call (`--refit-final`, on by default).
+- In `score`, `evaluate` and `stratify`, indel genotype models also drop the calls their thresholds
+  leave alone when P(keep) is below 0.5 (`--keep-fallback indel`). Given GIAB's
+  `notinalldifficultregions` stratification (`--regions notinalldifficultregions=PATH`), they drop
+  indel calls outside it when P(drop) is at least 0.6, in place of the model's drop threshold
+  (`--outside-indel-t-drop`).
 - Repeat-length features (`winnowr strlen`) measure reads with `--reads mapq20,flank5` by default;
-  `--reads legacy` measures as the Python version did.
+  `--reads legacy` measures reads of any MAPQ with two flank bases.
 - Pileup features (`winnowr pileup`, `train --pileup-features`) count reference, alternate and
   other reads at MAPQ 0, 1-19 and 20 or more, with the settings `mapq20,bq10,flank5`. The settings
   are recorded in the pileup table and in each model trained with them, and `score` refuses

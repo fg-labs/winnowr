@@ -26,8 +26,9 @@ pub fn xgboost_params(params: &TrainingParams, num_class: usize) -> Vec<(&'stati
     ]
 }
 
-/// The validation mlogloss in an XGBoost evaluation line (e.g. `[3]\tvalidation-mlogloss:0.21`),
-/// parsed as the Python package parses it.
+/// The validation mlogloss in an XGBoost evaluation line (e.g. `[3]\tvalidation-mlogloss:0.21`):
+/// the value after `validation-mlogloss:` in the first tab-separated field that starts with it,
+/// trimmed and parsed as an `f64`.
 fn parse_validation_loss(line: &str) -> Result<f64> {
     line.split('\t')
         .find_map(|field| field.strip_prefix("validation-mlogloss:"))

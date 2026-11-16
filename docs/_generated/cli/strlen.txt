@@ -21,8 +21,8 @@ Options:
                                  still cover every spanning read) and flankN (N aligned flank bases
                                  on each side), plus the experimental mates (count a read pair once)
                                  and unit (at least one repeat unit of flank). `legacy`
-                                 (mapq0,flank2) measures as winnowr did before the settings were
-                                 recorded, for models trained then. The settings are recorded in the
-                                 table; a model scores only tables measured as its training tables
-                                 were [default: mapq20,flank5]
+                                 (mapq0,flank2) measures reads of any MAPQ with two flank bases, the
+                                 settings of tables and models that record none. The settings are
+                                 recorded in the table; a model scores only tables measured as its
+                                 training tables were [default: mapq20,flank5]
   -h, --help                     Print help

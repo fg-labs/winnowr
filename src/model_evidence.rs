@@ -375,13 +375,10 @@ mod tests {
         let new = Some(StrlenOptions::default());
         let (a, b) = (info("A", true, new), info("B", true, new));
         assert_eq!(shared_options::<StrlenOptions>(&[&a, &b]).unwrap(), StrlenOptions::default());
-        // Tables without recorded settings were measured with the legacy settings.
-        let (old, older) = (info("C", true, None), info("D", true, None));
-        assert_eq!(
-            shared_options::<StrlenOptions>(&[&old, &older]).unwrap(),
-            StrlenOptions::LEGACY
-        );
-        let message = shared_options::<StrlenOptions>(&[&a, &old]).unwrap_err().to_string();
+        // Tables without recorded settings are read as measured with the legacy settings.
+        let (c, d) = (info("C", true, None), info("D", true, None));
+        assert_eq!(shared_options::<StrlenOptions>(&[&c, &d]).unwrap(), StrlenOptions::LEGACY);
+        let message = shared_options::<StrlenOptions>(&[&a, &c]).unwrap_err().to_string();
         assert!(message.contains("A's with mapq20,flank5, C's with mapq0,flank2"), "{message}");
         let none = info("E", false, None);
         let message = shared_options::<StrlenOptions>(&[&a, &none]).unwrap_err().to_string();

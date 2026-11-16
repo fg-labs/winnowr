@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use crate::alleles::{Genotype, allele_deltas};
 use crate::common::VariantType;
 use crate::evidence::Evidence as _;
-use crate::numeric::numpy_sum;
+use crate::numeric::pairwise_sum;
 use crate::strlen::{Histogram, StrlenOptions, StrlenRow, StrlenTables, parse_histogram};
 use crate::table::FeatureTable;
 
@@ -150,13 +150,13 @@ pub fn histogram_features(
     features[6] = frac(count_of(0));
     let fractions: Vec<f64> = ranked.iter().map(|&(_, count)| frac(count)).collect();
     let entropy_terms: Vec<f64> = fractions.iter().map(|&f| f * f.log2()).collect();
-    features[7] = -numpy_sum(&entropy_terms);
+    features[7] = -pairwise_sum(&entropy_terms);
     let deltas: Vec<f64> = ranked.iter().map(|&(delta, _)| delta as f64).collect();
     let weighted: Vec<f64> = deltas.iter().zip(&fractions).map(|(d, f)| d * f).collect();
-    let mean = numpy_sum(&weighted);
+    let mean = pairwise_sum(&weighted);
     let squares: Vec<f64> =
         deltas.iter().zip(&fractions).map(|(d, f)| (d - mean).powi(2) * f).collect();
-    features[8] = numpy_sum(&squares).max(0.0).sqrt();
+    features[8] = pairwise_sum(&squares).max(0.0).sqrt();
     if let Some((low, high)) = called {
         let mut alts: Vec<i64> = [low, high].into_iter().filter(|&d| d != 0).collect();
         alts.sort_unstable();
