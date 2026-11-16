@@ -38,10 +38,12 @@ non-PASS call is at the record's position, since hap.py run with `--pass-only` l
 calls. If the hap.py VCF also labels non-PASS calls (hap.py ran without `--pass-only`), a label at a
 non-PASS call's position stays that call's, as does a record split from a non-PASS call.
 
-The hap.py VCF does not record whether hap.py ran with `--pass-only`, so `extract` infers it: it
-takes hap.py to have run without `--pass-only` only if some label at a non-PASS call's position
-cannot be a PASS call's. Otherwise it joins the labels as if hap.py ran with `--pass-only`, and a
-non-PASS call's label may go to a PASS call. Run hap.py with `--pass-only` for reliable labels.
+The hap.py VCF does not record whether hap.py ran with `--pass-only`. `extract --happy-pass-only
+yes` or `no` says how it ran; the default, `auto`, infers it: it takes hap.py to have run without
+`--pass-only` only if some label at a non-PASS call's position cannot be a PASS call's. Otherwise it
+joins the labels as if hap.py ran with `--pass-only`, and a non-PASS call's label may go to a PASS
+call. `extract` logs which way it joined the labels, and why. Run hap.py with `--pass-only` for
+reliable labels.
 
 ## Flips that a flip cannot fix
 

@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 
 use crate::common::PhaseTimer;
 use crate::features::derive_features;
-use crate::labels::{attach_labels, check_label_join, read_happy_labels};
+use crate::labels::{HappyPassOnly, attach_labels, check_label_join, read_happy_labels};
 use crate::pileup::PileupTables;
 use crate::pileup_features::add_pileup_features;
 use crate::promote_labels::{attach_promote_labels, read_truth_variants};
@@ -20,8 +20,11 @@ use crate::vcf::VcfSummary;
 /// The truth inputs that label a feature table.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TruthInputs<'a> {
-    /// The hap.py output VCF (vcfeval engine, `--pass-only`), which labels PASS calls.
+    /// The hap.py output VCF (vcfeval engine, preferably `--pass-only`; see `happy_pass_only`),
+    /// which labels PASS calls.
     pub happy: Option<&'a Path>,
+    /// Whether hap.py was run with `--pass-only` (see [`attach_labels`]).
+    pub happy_pass_only: HappyPassOnly,
     /// The truth VCF; with `truth_bed` and `happy`, labels non-PASS calls for promote models.
     pub truth_vcf: Option<&'a Path>,
     /// The truth confident regions.
@@ -126,7 +129,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
         timer.lap("joining the pileup features");
     }
     if let (Some(labels), Some(happy)) = (labels, inputs.truth.happy) {
-        let (labelled, join) = attach_labels(table, &labels)?;
+        let (labelled, join) = attach_labels(table, &labels, inputs.truth.happy_pass_only)?;
         check_label_join(&join, &happy.display().to_string())?;
         table = labelled;
         timer.lap("attaching the hap.py labels");
@@ -412,6 +415,7 @@ mod tests {
             truth_vcf: Some(&truth_vcf),
             truth_bed: Some(&truth_bed),
             reference: None,
+            ..TruthInputs::default()
         };
         let inputs = TableInputs { truth, ..TableInputs::default() };
         let table = build_feature_table("S1", &vcf, &["chr1", "chr2"], &summary, &inputs).unwrap();
@@ -439,6 +443,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.starts_with("promote labels need --truth-vcf, --truth-bed and --happy"));
+    }
+
+    /// `happy_pass_only` reaches the labels: a label at a LowQual SNP call's position that a
+    /// padded PASS SNP was trimmed to is the PASS call's with `--pass-only`, and the LowQual
+    /// call's without.
+    #[rstest::rstest]
+    #[case::yes(HappyPassOnly::Yes, ["1", "NaN"])]
+    #[case::no(HappyPassOnly::No, ["NaN", "NaN"])]
+    fn happy_pass_only_decides_whose_label_it_is(
+        #[case] happy_pass_only: HappyPassOnly,
+        #[case] expected: [&str; 2],
+    ) {
+        let dir = TempDir::new().unwrap();
+        let records = [
+            "chr1 300 . TTAGA TTCGA 50 PASS RAW_MQandDP=400,1 GT 0/1",
+            "chr1 302 . A C 20 LowQual RAW_MQandDP=400,1 GT 0/1",
+        ];
+        let vcf = write_vcf(&dir, &["S1"], &records);
+        let happy = dir.path().join("happy.vcf");
+        let happy_text = [
+            "##fileformat=VCFv4.2",
+            "##contig=<ID=chr1,length=100000>",
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+            "##FORMAT=<ID=BD,Number=1,Type=String,Description=\"Decision\">",
+            "##FORMAT=<ID=BK,Number=1,Type=String,Description=\"Match kind\">",
+            "##FORMAT=<ID=BVT,Number=1,Type=String,Description=\"Variant type\">",
+            "#CHROM POS ID REF ALT QUAL FILTER INFO FORMAT TRUTH QUERY",
+            "chr1 302 . A C . . . GT:BD:BK:BVT 0/1:TP:gm:SNP 0/1:TP:gm:SNP",
+        ]
+        .map(|line| line.replace(' ', "\t") + "\n")
+        .concat();
+        std::fs::write(&happy, happy_text).unwrap();
+        let summary = VcfSummary::read(&vcf).unwrap();
+        let truth = TruthInputs { happy: Some(&happy), happy_pass_only, ..TruthInputs::default() };
+        let inputs = TableInputs { truth, ..TableInputs::default() };
+        let table = build_feature_table("S1", &vcf, &["chr1"], &summary, &inputs).unwrap();
+        let shown: Vec<String> =
+            table.f64_column("label").unwrap().iter().map(|v| format!("{v}")).collect();
+        assert_eq!(shown, expected);
     }
 
     #[test]

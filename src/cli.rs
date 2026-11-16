@@ -15,7 +15,7 @@ use crate::common::{AUTOSOMES, PhaseTimer, Task, VariantType, repeated};
 use crate::evidence::read_tables;
 use crate::extraction::{TableInputs, TruthInputs, build_feature_table};
 use crate::features::feature_names;
-use crate::labels::UnfixableFlips;
+use crate::labels::{HappyPassOnly, UnfixableFlips};
 use crate::model::{CvFolds, MODEL_SUFFIX, TrainingParams, WinnowrModel, check_reference};
 use crate::model_evidence::{
     Measuring, check_supplied, check_table, measure_and_decide, models_options, models_using,
@@ -238,10 +238,24 @@ pub(crate) struct ExtractArgs {
     #[arg(long, num_args = 1..)]
     pub(crate) pileup: Vec<PathBuf>,
 
-    /// The hap.py output VCF for this sample (run with --engine vcfeval --pass-only), which
-    /// labels PASS calls; needed for training and evaluation tables.
+    /// The hap.py output VCF for this sample (run with --engine vcfeval, preferably with
+    /// --pass-only; see --happy-pass-only), which labels PASS calls; needed for training and
+    /// evaluation tables.
     #[arg(long)]
     pub(crate) happy: Option<PathBuf>,
+
+    /// Whether hap.py was run with --pass-only: yes, no, or auto to infer it from the labels. It
+    /// decides whether a --happy label at a non-PASS call's position is that call's own or a PASS
+    /// call's that hap.py represented there.
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        value_name = "MODE",
+        default_value_t = HappyPassOnly::Auto,
+        requires = "happy"
+    )]
+    pub(crate) happy_pass_only: HappyPassOnly,
 
     /// The indexed truth VCF (e.g. a GIAB benchmark); with --truth-bed and --happy, labels
     /// non-PASS calls for training promote models.
@@ -966,6 +980,7 @@ fn extract(args: &ExtractArgs) -> Result<()> {
     check_output_dir("--output", &args.output)?;
     let truth = TruthInputs {
         happy: args.happy.as_deref(),
+        happy_pass_only: args.happy_pass_only,
         truth_vcf: args.truth_vcf.as_deref(),
         truth_bed: args.truth_bed.as_deref(),
         reference: args.reference.as_deref(),
@@ -2020,6 +2035,8 @@ mod tests {
     #[case::unknown_subcommand(&["rescore"], ErrorKind::InvalidSubcommand)]
     #[case::extract_without_vcf(&["extract", "-o", "t.parquet"], ErrorKind::MissingRequiredArgument)]
     #[case::extract_bad_region(&["extract", "--vcf", "v", "-o", "t", "--regions", "x"], ErrorKind::ValueValidation)]
+    #[case::extract_bad_happy_pass_only(&["extract", "--vcf", "v", "-o", "t", "--happy", "h", "--happy-pass-only", "maybe"], ErrorKind::InvalidValue)]
+    #[case::extract_happy_pass_only_without_happy(&["extract", "--vcf", "v", "-o", "t", "--happy-pass-only", "no"], ErrorKind::MissingRequiredArgument)]
     #[case::train_nan_grid(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--grid", "nan"], ErrorKind::ValueValidation)]
     #[case::train_infinite_grid(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--grid", "0.5", "inf"], ErrorKind::ValueValidation)]
     #[case::train_negative_grid(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--grid=-0.1"], ErrorKind::ValueValidation)]
@@ -2029,6 +2046,26 @@ mod tests {
     #[case::stratify_bad_report_region(&["stratify", "--models", "m", "--truth-names", "a", "b", "--tables", "a", "b", "--truth-beds", "a", "b", "--happy", "a", "b", "-o", "o", "--report-region", "MHC"], ErrorKind::ValueValidation)]
     fn invalid_command_lines_are_rejected(#[case] args: &[&str], #[case] kind: ErrorKind) {
         assert_eq!(parse(args).unwrap_err().kind(), kind);
+    }
+
+    #[rstest]
+    #[case::default(&[], HappyPassOnly::Auto)]
+    #[case::auto(&["--happy-pass-only", "auto"], HappyPassOnly::Auto)]
+    #[case::yes(&["--happy-pass-only", "yes"], HappyPassOnly::Yes)]
+    #[case::no(&["--happy-pass-only=no"], HappyPassOnly::No)]
+    #[case::ignoring_case(&["--happy-pass-only", "YES"], HappyPassOnly::Yes)]
+    fn extract_happy_pass_only_parses(#[case] option: &[&str], #[case] expected: HappyPassOnly) {
+        let extract = ["extract", "--vcf", "v", "-o", "t", "--happy", "h"];
+        let Command::Extract(args) = parse(&[&extract[..], option].concat()).unwrap().command
+        else {
+            panic!("not extract")
+        };
+        assert_eq!(args.happy_pass_only, expected);
+        // The default does not need --happy.
+        let Command::Extract(args) = parse(&extract[..5]).unwrap().command else {
+            panic!("not extract")
+        };
+        assert_eq!(args.happy_pass_only, HappyPassOnly::Auto);
     }
 
     #[test]

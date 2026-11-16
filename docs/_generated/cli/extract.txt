@@ -24,9 +24,13 @@ Options:
       --pileup <PILEUP>...      Allele read count tables from `winnowr pileup` (e.g. one per shard),
                                 joined as pileup features of SNP and indel calls; needed to train or
                                 apply models that use them
-      --happy <HAPPY>           The hap.py output VCF for this sample (run with --engine vcfeval
-                                --pass-only), which labels PASS calls; needed for training and
-                                evaluation tables
+      --happy <HAPPY>           The hap.py output VCF for this sample (run with --engine vcfeval,
+                                preferably with --pass-only; see --happy-pass-only), which labels
+                                PASS calls; needed for training and evaluation tables
+      --happy-pass-only <MODE>  Whether hap.py was run with --pass-only: yes, no, or auto to infer
+                                it from the labels. It decides whether a --happy label at a non-PASS
+                                call's position is that call's own or a PASS call's that hap.py
+                                represented there [default: auto] [possible values: auto, yes, no]
       --truth-vcf <TRUTH_VCF>   The indexed truth VCF (e.g. a GIAB benchmark); with --truth-bed and
                                 --happy, labels non-PASS calls for training promote models
       --truth-bed <TRUTH_BED>   The truth confident-regions BED
