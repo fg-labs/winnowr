@@ -28,10 +28,19 @@ Training labels come from the hap.py output VCF given to `extract --happy`, from
 Calls that hap.py does not label TP or FP (e.g. outside the truth set's confident regions) are left
 out of training and evaluation. The truth FNs are counted too, since F1 needs them.
 
-hap.py splits a multi-allelic call into one record per ALT allele. `extract` labels such a call from
-all of its records: it is *keep* only when every record of it is a TP. hap.py also trims a padded
-call, where `extract` looks for its label: a padded SNP (e.g. `TTAGA>TTCGA`) to its differing base,
-and a padded indel (e.g. `ACGT>ACT`) to the base before its trimmed alleles (`CG>C`, one base on).
+hap.py splits a multi-allelic call into one record per ALT allele that its genotype calls. `extract`
+labels such a call from all of its records: it is *keep* only when every record of it is a TP.
+hap.py also trims a padded call, where `extract` looks for its label: a padded SNP (e.g.
+`TTAGA>TTCGA`) to its differing base, and a padded indel (e.g. `ACGT>ACT`) to the base before its
+trimmed alleles (`CG>C`, one base on). A padded call takes the label there only if it has no record
+(TP, FP or UNK) at its own position, and a padded indel only if every record there has its length
+change: `extract` merges hap.py's records at a position, so with another length change the label is
+partly another call's. A PASS indel call takes the label at its own position only if every length
+change of the records there belongs to a PASS indel call whose REF allele covers that position (the
+call itself included): hap.py may write one record that joins the call's allele with one of an
+overlapping PASS call (as for a GATK het-alt call split into two records with `*`), but any other
+length change is another call's record, and the call is then left unlabelled, even by the records
+split from it. SNP records all have a length change of 0, so this cannot tell SNP records apart.
 
 A record split from a PASS call, or trimmed from a PASS padded call, labels that call even when a
 non-PASS call is at the record's position, since hap.py run with `--pass-only` labels only PASS
@@ -39,11 +48,29 @@ calls. If the hap.py VCF also labels non-PASS calls (hap.py ran without `--pass-
 non-PASS call's position stays that call's, as does a record split from a non-PASS call.
 
 The hap.py VCF does not record whether hap.py ran with `--pass-only`. `extract --happy-pass-only
-yes` or `no` says how it ran; the default, `auto`, infers it: it takes hap.py to have run without
-`--pass-only` only if some label at a non-PASS call's position cannot be a PASS call's. Otherwise it
-joins the labels as if hap.py ran with `--pass-only`, and a non-PASS call's label may go to a PASS
-call. `extract` logs which way it joined the labels, and why. Run hap.py with `--pass-only` for
-reliable labels.
+yes` or `no` says how it ran; the default, `auto`, infers it. Without `--pass-only`, hap.py writes a
+record (TP, FP, or UNK outside the confident regions) for each call it could score: one with a
+non-reference allele in its genotype, on a contig hap.py was run on. With `--pass-only`, it writes
+them only for PASS calls. So `auto` counts the non-PASS calls that hap.py could have scored (with a
+non-reference allele, on a contig with hap.py records, including one at a PASS call's position),
+and takes hap.py to have run without
+`--pass-only` when at least half of them have a record that cannot be a PASS call's. A record at no
+call's position counts for the non-PASS multi-allelic call it was most likely split from (of
+several, the one with the greatest position). A record at the position hap.py trims a non-PASS
+padded call to counts for that call when no call is at that position (or only a PASS call, and no
+PASS indel call covering it has the record's length change) and the padded call has no record at
+its own position. Fewer such records are taken to be PASS calls' records that hap.py placed at
+non-PASS calls: `extract` joins the labels as if hap.py ran with `--pass-only`, and
+warns only if there are any. With `--happy-pass-only yes`, it warns if at least half have such a
+record; with `no`, if fewer than half do. It logs which way it joined the labels, and the counts
+behind it.
+
+`auto` cannot see every call hap.py could have scored. The feature table keeps a diploid genotype,
+and a haploid or partly missing one is `./.` there, so those non-PASS calls are not counted. A
+hap.py run restricted to regions (`-T`, `-R`, or `-l` with a range such as `chr20:1-10000000`)
+scores no call outside them. Either way `auto` may take a run without `--pass-only` for one with
+it: on haploid contigs (e.g. a male chrX), or for such a run, say how hap.py was run with
+`--happy-pass-only`. Run hap.py with `--pass-only` for reliable labels.
 
 ## Flips that a flip cannot fix
 

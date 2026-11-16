@@ -184,8 +184,26 @@ pub const TRUTH_DELTA_COLUMNS: [&str; 2] = ["truth_delta_lo", "truth_delta_hi"];
 /// More hap.py labels than this fraction matching no call means hap.py ran on another VCF.
 pub const MAX_UNMATCHED_LABEL_FRACTION: f64 = 0.5;
 
+/// With [`HappyPassOnly::Auto`], hap.py is taken to have run without `--pass-only` when at least
+/// this fraction of the non-PASS calls it could have scored (with a non-reference allele in their
+/// genotype, on a contig with a hap.py query record) have a hap.py query record that no PASS call
+/// explains (see [`attach_labels`]). Run without `--pass-only`, hap.py writes a query record (TP,
+/// FP or UNK) for each of those calls; run with it, only for PASS calls, so such a record is then
+/// a rare artefact of hap.py representing a PASS call differently. Half sits far from both.
+///
+/// The genotype is the feature table's normalized diploid one (see [`Genotype`]), where a haploid
+/// or partly missing genotype is `./.`, so non-PASS calls with one are not counted. A hap.py run
+/// restricted to regions (`-T`, `-R`, or `-l` with a range such as `chr20:1-10000000`) scores no
+/// call outside them. Either pulls the fraction down: on haploid contigs (e.g. a male chrX), or
+/// for such a run, `--happy-pass-only` then says how hap.py was run.
+pub const MIN_NON_PASS_RECORD_FRACTION: f64 = 0.5;
+
 /// A call's `(chrom, pos, variant type)`, the key labels join on.
 pub type LabelKey = (String, u64, VariantType);
+
+/// The unscored query records of one contig (see [`HappyLabels::unscored`]): per
+/// `(pos, variant type)`, the sorted, distinct length changes of their query alleles.
+pub type UnscoredRecords = HashMap<(u64, VariantType), Box<[i64]>>;
 
 /// One call's label (NaN if none), `flip_ok`, truth allele length changes (NaN if none), the
 /// position its label came from, and whether that was a padded call's trimmed position.
@@ -274,6 +292,11 @@ pub struct HappyLabels {
     /// (`None` when an allele is not a sequence (see [`crate::alleles::allele_deltas`]): symbolic,
     /// a breakend or `*`).
     pub truth_deltas: IndexMap<LabelKey, Option<(i64, i64)>>,
+    /// The query records that hap.py did not score TP or FP (e.g. `UNK`, outside the confident
+    /// regions), per contig. They label no call, but show which calls hap.py was given (see
+    /// [`attach_labels`]). Keyed by contig first, so that the records (about a million for a
+    /// whole-genome sample) do not each hold a copy of its name.
+    pub unscored: HashMap<String, UnscoredRecords>,
 }
 
 impl HappyLabels {
@@ -285,6 +308,45 @@ impl HappyLabels {
         }
     }
 
+    /// The length changes of the unscored query records at `(chrom, pos, variant type)`, if any
+    /// (see [`HappyLabels::unscored`]).
+    #[must_use]
+    pub fn unscored_deltas(
+        &self,
+        chrom: &str,
+        pos: u64,
+        variant_type: VariantType,
+    ) -> Option<&[i64]> {
+        self.unscored.get(chrom)?.get(&(pos, variant_type)).map(AsRef::as_ref)
+    }
+
+    /// Every query record, by `(chrom, pos, variant type)`, with the length changes of its query
+    /// alleles: the TP and FP records (in record order), then the unscored ones.
+    fn query_records(&self) -> impl Iterator<Item = (KeyRef<'_>, &[i64])> {
+        let scored = self.labels.iter().map(|((chrom, pos, variant_type), query_label)| {
+            (KeyRef(chrom, *pos, *variant_type), query_label.alt_deltas.as_slice())
+        });
+        let unscored = self.unscored.iter().flat_map(|(chrom, records)| {
+            records.iter().map(|(&(pos, variant_type), deltas)| {
+                (KeyRef(chrom, pos, variant_type), deltas.as_ref())
+            })
+        });
+        scored.chain(unscored)
+    }
+
+    /// The contigs with a query record (TP, FP or unscored): those hap.py scored calls on.
+    fn query_contigs(&self) -> HashSet<&str> {
+        let mut contigs: HashSet<&str> = self.unscored.keys().map(String::as_str).collect();
+        let mut last = None;
+        for (chrom, _, _) in self.labels.keys() {
+            if last != Some(chrom) {
+                contigs.insert(chrom);
+                last = Some(chrom);
+            }
+        }
+        contigs
+    }
+
     /// Adds the labels of other contigs (keys are disjoint, as they include the contig).
     fn merge(&mut self, other: HappyLabels) {
         self.labels.extend(other.labels);
@@ -293,6 +355,7 @@ impl HappyLabels {
         }
         self.fn_positions.extend(other.fn_positions);
         self.truth_deltas.extend(other.truth_deltas);
+        self.unscored.extend(other.unscored);
     }
 }
 
@@ -358,7 +421,21 @@ where
             labels.fn_positions.insert((record.chrom.clone(), record.pos, truth_type));
         }
         let Some(query_type) = variant_type_of_bvt(&record.query_bvt) else { continue };
+        let alt_deltas = query_alt_deltas(&record);
         if record.query_bd != "TP" && record.query_bd != "FP" {
+            let records = labels.unscored.entry(record.chrom).or_default();
+            match records.entry((record.pos, query_type)) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(alt_deltas.into_boxed_slice());
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let mut deltas = entry.get().to_vec();
+                    deltas.extend(alt_deltas);
+                    deltas.sort_unstable();
+                    deltas.dedup();
+                    entry.insert(deltas.into_boxed_slice());
+                }
+            }
             continue;
         }
         let flip_ok = record.query_bd == "FP"
@@ -371,17 +448,6 @@ where
         } else {
             Label::Drop
         };
-        let mut alt_deltas: Vec<i64> = match record.query_gt.alleles() {
-            Some((first, second)) => [first, second]
-                .into_iter()
-                .filter(|&index| index > 0)
-                .filter_map(|index| record.alleles.get(index as usize))
-                .filter_map(|allele| length_change(record.alleles[0].as_bytes(), allele))
-                .collect(),
-            None => Vec::new(),
-        };
-        alt_deltas.sort_unstable();
-        alt_deltas.dedup();
         let query_label = QueryLabel { label, flip_ok, alt_deltas };
         match labels.labels.entry((record.chrom, record.pos, query_type)) {
             indexmap::map::Entry::Occupied(mut entry) => entry.get_mut().add(query_label),
@@ -391,6 +457,23 @@ where
         }
     }
     Ok(n_on_contigs)
+}
+
+/// The sorted, distinct length changes of a hap.py record's query alleles, other than the
+/// reference and `*`.
+fn query_alt_deltas(record: &HappyRecord) -> Vec<i64> {
+    let mut alt_deltas: Vec<i64> = match record.query_gt.alleles() {
+        Some((first, second)) => [first, second]
+            .into_iter()
+            .filter(|&index| index > 0)
+            .filter_map(|index| record.alleles.get(index as usize))
+            .filter_map(|allele| length_change(record.alleles[0].as_bytes(), allele))
+            .collect(),
+        None => Vec::new(),
+    };
+    alt_deltas.sort_unstable();
+    alt_deltas.dedup();
+    alt_deltas
 }
 
 /// Checks that some hap.py records were on the contigs, and keeps `flip_ok` only for flips.
@@ -666,7 +749,8 @@ pub struct LabelJoin {
     pub happy_pass_only: HappyPassOnly,
     /// hap.py query records scored TP or FP (one per `(chrom, pos, variant type)`).
     pub n_labels: usize,
-    /// Those that labelled a PASS call.
+    /// Those that labelled a PASS call, or that a PASS call matched without taking the label
+    /// (as its label at its key was left out; see [`attach_labels`]).
     pub n_pass: usize,
     /// Of `n_pass`, those found at the differing base of a padded SNP.
     pub n_padded_snp: usize,
@@ -674,13 +758,46 @@ pub struct LabelJoin {
     pub n_padded_indel: usize,
     /// Of `n_pass`, those that hap.py split from a multi-allelic call.
     pub n_multiallelic: usize,
-    /// Those at a non-PASS call only (hap.py was run without `--pass-only`).
+    /// Those that labelled no PASS call but are a non-PASS call's: at its key, at the position a
+    /// non-PASS padded call was trimmed to, or split from a non-PASS multi-allelic call (as for
+    /// [`LabelJoin::n_non_pass_unexplained`]). They label no call.
     pub n_non_pass: usize,
     /// Those at no call.
     pub n_unmatched: usize,
-    /// Those at a non-PASS call's key that no PASS call can explain. With
-    /// [`HappyPassOnly::Auto`], any one of them means hap.py was run without `--pass-only`.
-    pub n_without_pass_only: usize,
+    /// The non-PASS calls that hap.py could have scored, one per `(chrom, pos, variant type)`
+    /// (a PASS call may be at it too): those with a non-reference allele in their genotype, on a contig
+    /// with a hap.py query record (TP, FP or unscored). A haploid or partly missing genotype is
+    /// `./.` in the table, so those calls are not counted.
+    pub n_non_pass_calls: usize,
+    /// Of those, the ones that hap.py evidently scored: with a query record (TP, FP or unscored) at
+    /// their key that no PASS call explains, or the call that such a record at no call's key (or at
+    /// a PASS call's, with a length change that no PASS indel call covering the key has) belongs
+    /// to: the non-PASS padded call trimmed to it, with no record at its own POS, or else the
+    /// non-PASS multi-allelic call that [`attach_labels`] would take as its source, each chosen
+    /// among the non-PASS calls that hap.py could have scored. With
+    /// [`HappyPassOnly::Auto`], hap.py was run without `--pass-only` if they are at least
+    /// [`MIN_NON_PASS_RECORD_FRACTION`] of `n_non_pass_calls`.
+    pub n_non_pass_unexplained: usize,
+}
+
+/// Whether `n_unexplained` of the `n_calls` non-PASS calls that hap.py could have scored show
+/// that it was run with `--pass-only`: fewer than [`MIN_NON_PASS_RECORD_FRACTION`] of them (see
+/// [`LabelJoin::n_non_pass_unexplained`]). With no such calls, it was.
+fn looks_pass_only(n_unexplained: usize, n_calls: usize) -> bool {
+    n_calls == 0 || (n_unexplained as f64) < MIN_NON_PASS_RECORD_FRACTION * n_calls as f64
+}
+
+/// The length changes of a merged query record's alleles, one at a time (`None` if it has none).
+fn each_delta(deltas: &[i64]) -> impl Iterator<Item = Option<i64>> + '_ {
+    deltas.is_empty().then_some(None).into_iter().chain(deltas.iter().copied().map(Some))
+}
+
+/// Whether a genotype from a feature table's `gt` column has a non-reference allele. The column
+/// holds the normalized diploid genotype (see [`Genotype`]: e.g. `0/1` or `1/2`), where a haploid
+/// or partly missing genotype is `./.`, so such a call does not have one, nor does `0/0`. No other
+/// column tells a haploid ALT call from a no-call reliably.
+fn has_alt_allele(gt: &str) -> bool {
+    gt.parse::<Genotype>().ok().and_then(Genotype::alleles).is_some_and(|(_, high)| high > 0)
 }
 
 /// The offset of the differing base of a SNP record (0 if its alternates differ at other bases).
@@ -702,7 +819,8 @@ struct MultiAllelicCall {
     end: u64,
     /// Its row in the feature table.
     row: usize,
-    /// The length changes of its ALT alleles other than `*`.
+    /// The length changes of its called ALT alleles other than `*` (all of them, if its genotype
+    /// is missing).
     alt_deltas: Vec<i64>,
 }
 
@@ -714,15 +832,35 @@ struct MultiAllelicCalls<'a> {
 }
 
 impl<'a> MultiAllelicCalls<'a> {
-    /// Indexes the calls with more than one ALT allele.
-    fn new(chroms: &[&'a str], positions: &[i64], refs: &[&str], alts: &[&str]) -> Self {
+    /// Indexes the calls with more than one ALT allele, by the ALT alleles their genotype
+    /// (`gts`, normalized) calls: hap.py writes no record for an uncalled allele. A missing
+    /// genotype (`./.`, which a haploid or partly missing one is too) may call any of them, so all
+    /// are indexed.
+    fn new(
+        chroms: &[&'a str],
+        positions: &[i64],
+        refs: &[&str],
+        alts: &[&str],
+        gts: &[&str],
+    ) -> Self {
         let mut index = MultiAllelicCalls::default();
         for row in (0..chroms.len()).filter(|&row| alts[row].contains(',')) {
             let reference = refs[row].as_bytes();
             let start = positions[row] as u64;
             let ref_len = reference.len().max(1) as u64;
-            let alt_deltas =
-                alts[row].split(',').filter_map(|alt| length_change(reference, alt)).collect();
+            let called = gts[row].parse::<Genotype>().ok().and_then(Genotype::alleles);
+            let is_called = |allele: usize| {
+                called.is_none_or(|(first, second)| [first, second].contains(&(allele as u32 + 1)))
+            };
+            let alt_deltas: Vec<i64> = alts[row]
+                .split(',')
+                .enumerate()
+                .filter(|&(allele, _)| is_called(allele))
+                .filter_map(|(_, alt)| length_change(reference, alt))
+                .collect();
+            if alt_deltas.is_empty() {
+                continue;
+            }
             let (calls, longest) = index.by_contig.entry(chroms[row]).or_default();
             calls.push(MultiAllelicCall { start, end: start + ref_len - 1, row, alt_deltas });
             *longest = (*longest).max(ref_len);
@@ -734,7 +872,7 @@ impl<'a> MultiAllelicCalls<'a> {
     }
 
     /// The row of the call that hap.py split a record at `pos` from: the multi-allelic call whose
-    /// REF allele covers `pos`, that has ALT alleles with every length change of the record's
+    /// REF allele covers `pos`, that calls ALT alleles with every length change of the record's
     /// query alleles, and whose row is `eligible`. Of several, the one with the greatest POS, then
     /// the first row.
     fn owner(
@@ -767,18 +905,26 @@ impl<'a> MultiAllelicCalls<'a> {
 /// Adds `label` (NaN where unlabelled), `flip_ok` and the truth allele length changes to a
 /// feature table.
 ///
-/// Labels attach to PASS calls, and truth allele length changes to every call, by
-/// `(chrom, pos, variant type)`. A padded call with no label at its POS takes the label at the
-/// position hap.py may have trimmed it to, unless a PASS call of its variant type is at that
-/// position (or any call of its variant type, when hap.py was run without `--pass-only`; see
-/// below): a padded SNP whose differing base is not its first (e.g. `TTAGA>TTCGA`) the label at
-/// that base, and a padded biallelic indel (e.g. `ACGT>ACT`, trimmed to `CG>C` one base on) the
-/// label at the base before its trimmed alleles, if that label has its length change.
+/// Labels attach to PASS calls, and truth allele length changes to every call, by `(chrom, pos,
+/// variant type)`. A PASS indel call takes the label at its key only if every length change of the
+/// records there is that of an ALT allele of a PASS indel call whose REF allele covers the key
+/// (itself included): hap.py may write one record that joins its allele with one of an overlapping
+/// PASS call, but a length change of no such call is another call's record, and the merged label is
+/// then not its own, so it is left unlabelled (and a record split from it does not label it
+/// either). SNP records all have a length change of 0, so this cannot tell them apart. A padded
+/// call with no record at its POS (TP, FP or unscored) takes the label at the position hap.py may
+/// have trimmed it to, unless a PASS call of its variant type is at that position (or any call of
+/// its variant type, when hap.py was run without `--pass-only`; see below): a padded SNP whose
+/// differing base is not its first (e.g. `TTAGA>TTCGA`) the label at that base, and a padded
+/// biallelic indel (e.g. `ACGT>ACT`, trimmed to `CG>C` one base on) the label at the base before
+/// its trimmed alleles, if the records there have its length change only (with another, they
+/// include another call's record, and their label is not its own).
 ///
 /// A label that matches no PASS call (of its variant type, at its position) labels the PASS
 /// multi-allelic call that hap.py split it from, if there is one: a PASS call with more than one
-/// ALT allele whose REF allele covers the label's position, and whose ALT alleles have the length
-/// changes of the label's query alleles (of several, the one with the greatest POS). Such a label
+/// ALT allele whose REF allele covers the label's position, and whose called ALT alleles (all of
+/// them, if its genotype is missing) have the length changes of the label's query alleles (of
+/// several, the one with the greatest POS). Such a label
 /// makes a call unlabelled at its own key take its label, and a `Keep` call take a label other
 /// than `Keep` (a call is `Keep` only if every allele is TP). It does not set `flip_ok`, which it
 /// computed for the split record's genotype rather than the call's.
@@ -788,11 +934,23 @@ impl<'a> MultiAllelicCalls<'a> {
 /// PASS calls only). Without `--pass-only`, a label at a non-PASS call's key is that call's, and
 /// a multi-allelic source is chosen among all calls, labelling it only if it is PASS. hap.py's
 /// output does not say which way it was run, so `happy_pass_only` does: [`HappyPassOnly::Yes`]
-/// or [`HappyPassOnly::No`], or [`HappyPassOnly::Auto`] to infer it. Inferred, it was run
-/// without `--pass-only` if a label at a non-PASS call's key can come from no PASS call (neither
-/// a padded call nor a multi-allelic call). Run without `--pass-only` and every such label
-/// explained by a PASS call, the labels are inferred to be joined as if run with it, and a
-/// non-PASS call's label may go to a PASS call: hap.py should be run with `--pass-only`.
+/// or [`HappyPassOnly::No`], or [`HappyPassOnly::Auto`] to infer it from how many of the
+/// non-PASS calls that hap.py could have scored it evidently did. It could have scored those
+/// with a non-reference allele in their genotype, on a contig with a hap.py query record (one
+/// per key, though a PASS call may be at it too). It evidently scored those with a query record at their key
+/// (TP, FP or unscored) that no PASS call explains, the non-PASS multi-allelic call that a
+/// record at no call's key was most likely split from (of several, the one with the greatest
+/// POS, as for labels), and the non-PASS padded call with a record at the position hap.py trims
+/// it to (as for a PASS one, with no call there). A PASS call explains a record at its key with
+/// a length change that it, or a PASS indel call covering the key, has (any record, for a
+/// SNP), split from it as a multi-allelic call, or at the position it was trimmed to as a padded call with no record at
+/// its POS (as for labels, but counting unscored records at the trimmed position). Records at one
+/// key are merged, so each length change of their query alleles is explained, and attributed to
+/// a non-PASS call, on its own. hap.py was run without `--pass-only` if they are at least
+/// [`MIN_NON_PASS_RECORD_FRACTION`] of the calls it could have scored, and with it otherwise, as
+/// one is then most likely a PASS call that hap.py represented differently. Run without
+/// `--pass-only` and inferred to be run with it, a non-PASS call's label may go to a PASS call:
+/// hap.py should be run with `--pass-only`.
 ///
 /// # Errors
 ///
@@ -805,7 +963,8 @@ pub fn attach_labels(
     let n = table.num_rows();
     let (chroms, positions) = (table.str_column("chrom")?, table.i64_column("pos")?);
     let (types, filters) = (table.str_column("variant_type")?, table.str_column("filter")?);
-    let (refs, alts) = (table.str_column("ref")?, table.str_column("alt")?);
+    let (refs, alts, gts) =
+        (table.str_column("ref")?, table.str_column("alt")?, table.str_column("gt")?);
     let variant_types: Vec<Option<VariantType>> =
         types.par_iter().map(|t| t.parse().ok()).collect();
     let key = |i: usize, pos: u64| variant_types[i].map(|vt| KeyRef(chroms[i], pos, vt));
@@ -815,16 +974,11 @@ pub fn attach_labels(
         .filter_map(|i| key(i, positions[i] as u64))
         .collect();
     let on_call: HashSet<KeyRef<'_>> = (0..n).filter_map(|i| key(i, positions[i] as u64)).collect();
-    // The position that hap.py may have trimmed a PASS padded call unlabelled at its POS to, if a
-    // label there may be its: no other PASS call of its type is there (a non-PASS one may be, see
-    // `pass_only`). For a padded SNP (`TTAGA>TTCGA`), its differing base; for a padded biallelic
-    // indel (`ACGT>ACT`), the base before its trimmed alleles, with a label of its length change.
-    let padded_source = |i: usize| -> Option<u64> {
+    // The position that hap.py may have trimmed a PASS padded call to, and the length change a
+    // record there must have (for an indel): for a padded SNP (`TTAGA>TTCGA`), its differing
+    // base; for a padded biallelic indel (`ACGT>ACT`), the base before its trimmed alleles.
+    let trimmed = |i: usize| -> Option<(KeyRef<'_>, Option<i64>)> {
         let variant_type = variant_types[i]?;
-        if filters[i] != PASS {
-            return None;
-        }
-        let (chrom, pos) = (chroms[i], positions[i] as u64);
         let (offset, delta) = match variant_type {
             VariantType::Snp => (snp_offset(refs[i], alts[i]), None),
             VariantType::Indel if !alts[i].contains(',') => {
@@ -834,41 +988,162 @@ pub fn attach_labels(
             }
             VariantType::Indel => return None,
         };
-        let shifted = pos + offset as u64;
-        let shifted_key = KeyRef(chrom, shifted, variant_type);
-        (offset > 0
-            && !labels.labels.contains_key(&KeyRef(chrom, pos, variant_type))
-            && !on_pass_call.contains(&shifted_key)
-            && labels.labels.get(&shifted_key).is_some_and(|query_label| {
-                delta.is_none_or(|delta| query_label.alt_deltas.contains(&delta))
-            }))
-        .then_some(shifted)
+        let shifted = KeyRef(chroms[i], positions[i] as u64 + offset as u64, variant_type);
+        (offset > 0).then_some((shifted, delta))
     };
-    let padded_labels: HashSet<KeyRef<'_>> = (0..n)
-        .filter_map(|i| Some(KeyRef(chroms[i], padded_source(i)?, variant_types[i]?)))
-        .collect();
-    let multiallelic = MultiAllelicCalls::new(&chroms, positions, &refs, &alts);
+    // The same for a PASS padded call, if no other PASS call of its type is there.
+    let padded_shift = |i: usize| {
+        trimmed(i).filter(|(shifted, _)| filters[i] == PASS && !on_pass_call.contains(shifted))
+    };
+    // A padded call has its record at the position hap.py trims it to only if it has none at its
+    // POS (TP, FP or unscored).
+    let has_record_at_pos = |i: usize, variant_type: VariantType| {
+        let (chrom, pos) = (chroms[i], positions[i] as u64);
+        labels.labels.contains_key(&KeyRef(chrom, pos, variant_type))
+            || labels.unscored_deltas(chrom, pos, variant_type).is_some()
+    };
+    // The position whose label a PASS padded call with no record at its POS takes, if a label
+    // there may be its: no other PASS call of its type is there (a non-PASS one may be, see
+    // `pass_only`), and its records have the indel's length change only (with another, the
+    // merged label includes another call's record).
+    let padded_source = |i: usize| -> Option<u64> {
+        let (shifted, delta) = padded_shift(i)?;
+        (!has_record_at_pos(i, shifted.2)
+            && labels
+                .labels
+                .get(&shifted)
+                .is_some_and(|label| delta.is_none_or(|delta| label.alt_deltas == [delta])))
+        .then_some(shifted.1)
+    };
+    let multiallelic = MultiAllelicCalls::new(&chroms, positions, &refs, &alts, &gts);
     let is_pass = |row: usize| filters[row] == PASS;
+    // The length changes of the ALT alleles of the PASS indel calls whose REF allele covers each
+    // PASS indel call's key (hap.py may write an overlapping PASS call's allele there).
+    let pass_indels: Vec<usize> = (0..n)
+        .filter(|&i| filters[i] == PASS && variant_types[i] == Some(VariantType::Indel))
+        .collect();
+    // Per contig: the PASS indel calls' `(POS, end of REF, row)`, sorted, and the longest REF.
+    type Spans = (Vec<(u64, u64, usize)>, u64);
+    let mut spans: HashMap<&str, Spans> = HashMap::new();
+    for &i in &pass_indels {
+        let (start, len) = (positions[i] as u64, refs[i].len().max(1) as u64);
+        let (calls, longest) = spans.entry(chroms[i]).or_default();
+        calls.push((start, start + len - 1, i));
+        *longest = (*longest).max(len);
+    }
+    for (calls, _) in spans.values_mut() {
+        calls.sort_unstable();
+    }
+    let mut pass_deltas: HashMap<KeyRef<'_>, Vec<i64>> = HashMap::new();
+    for &i in &pass_indels {
+        let Some(call_key) = key(i, positions[i] as u64) else { continue };
+        let (calls, longest) = &spans[chroms[i]];
+        let pos = call_key.1;
+        let after = calls.partition_point(|&(start, _, _)| start <= pos);
+        let deltas = pass_deltas.entry(call_key).or_default();
+        for &(_, end, j) in calls[..after].iter().rev().take_while(|c| c.0 + longest > pos) {
+            if end >= pos {
+                deltas.extend(
+                    alts[j].split(',').filter_map(|alt| length_change(refs[j].as_bytes(), alt)),
+                );
+            }
+        }
+    }
+    // Whether a record at a PASS call's key, with a length change (`None` if not known), can be
+    // that call's: any SNP record can, and an indel record if a PASS indel call covering the key
+    // (it included) has the length change.
+    let pass_call_has = |record_key: &KeyRef<'_>, delta: Option<i64>| {
+        on_pass_call.contains(record_key)
+            && (record_key.2 == VariantType::Snp
+                || delta
+                    .is_none_or(|d| pass_deltas.get(record_key).is_some_and(|ds| ds.contains(&d))))
+    };
+
     // hap.py run with --pass-only labels only PASS calls, so a label at a non-PASS call's key is
     // then a PASS call's: a padded call's, or that of a PASS multi-allelic call it was split from.
     // Without --pass-only, it is the non-PASS call's own. hap.py's output does not say which, so
-    // it is told from the run: a label at a non-PASS call's key that no PASS call can explain
-    // only comes without --pass-only.
-    let n_without_pass_only = labels
-        .labels
-        .iter()
-        .filter(|((chrom, pos, variant_type), query_label)| {
-            let label_key = KeyRef(chrom, *pos, *variant_type);
-            !on_pass_call.contains(&label_key)
-                && on_call.contains(&label_key)
-                && !padded_labels.contains(&label_key)
-                && multiallelic.owner(chrom, *pos, &query_label.alt_deltas, is_pass).is_none()
-        })
-        .count();
+    // unless told, it is inferred from how many of the non-PASS calls that hap.py could have
+    // scored (with a non-reference allele, on a contig with a query record) it evidently did:
+    // those that hap.py wrote a query record (TP, FP or unscored) for that no PASS call explains.
+    // Each counts once, by its key. The counts are logged whichever way the labels are joined.
+    let query_contigs = labels.query_contigs();
+    let non_pass_keys: HashSet<KeyRef<'_>> = (0..n)
+        .filter(|&i| filters[i] != PASS && has_alt_allele(gts[i]))
+        .filter(|&i| query_contigs.contains(chroms[i]))
+        .filter_map(|i| key(i, positions[i] as u64))
+        .collect();
+    // Each query record is taken by its key and one length change of its query alleles (records
+    // at one key are merged, so a match on one length change must not hide another).
+    let records = labels
+        .query_records()
+        .flat_map(|(record_key, deltas)| each_delta(deltas).map(move |delta| (record_key, delta)));
+    // The record (key and length change, `None` for a SNP) at the position each padded call was
+    // trimmed to, with its row (a PASS one's, if both a PASS and a non-PASS call are trimmed to
+    // it).
+    let scorable = |row: usize| {
+        key(row, positions[row] as u64).is_some_and(|call_key| non_pass_keys.contains(&call_key))
+    };
+    let padded_rank = |row: usize| (is_pass(row), scorable(row));
+    let mut padded_records: HashMap<(KeyRef<'_>, Option<i64>), usize> = HashMap::new();
+    for (i, &filter) in filters.iter().enumerate() {
+        let shifted = if filter == PASS { padded_shift(i) } else { trimmed(i) };
+        if let Some((shifted, delta)) = shifted
+            && !has_record_at_pos(i, shifted.2)
+        {
+            // A PASS call first, then a non-PASS call that hap.py could have scored.
+            let row = padded_records.entry((shifted, delta)).or_insert(i);
+            if padded_rank(i) > padded_rank(*row) {
+                *row = i;
+            }
+        }
+    }
+    let padded_row = |record_key: KeyRef<'_>, delta: Option<i64>| {
+        let snp = padded_records.get(&(record_key, None));
+        snp.or_else(|| delta.and_then(|d| padded_records.get(&(record_key, Some(d))))).copied()
+    };
+    // Whether a PASS call explains a record: it is at a PASS call's key with a length change of
+    // its ALT alleles, at the position a PASS padded call was trimmed to, or split from a PASS
+    // multi-allelic call.
+    let explained_by_pass = |record_key: KeyRef<'_>, delta: Option<i64>| {
+        let KeyRef(chrom, pos, _) = record_key;
+        pass_call_has(&record_key, delta)
+            || padded_row(record_key, delta).is_some_and(is_pass)
+            || multiallelic.owner(chrom, pos, delta.as_slice(), is_pass).is_some()
+    };
+    // The non-PASS call a record that no PASS call explains is from: the non-PASS call at its
+    // key, or (with none there) the non-PASS padded call trimmed to it, or the non-PASS
+    // multi-allelic call it was split from. The evidence and the label counts both use it.
+    let on_non_pass_call: HashSet<KeyRef<'_>> = (0..n)
+        .filter(|&i| filters[i] != PASS)
+        .filter_map(|i| key(i, positions[i] as u64))
+        .collect();
+    // With `only_scorable`, the padded and multi-allelic sources are chosen among the non-PASS
+    // calls that hap.py could have scored, so that one it could not have (e.g. `./.`) does not
+    // hide one it could.
+    let non_pass_source = |record_key, delta: Option<i64>, only_scorable: bool| {
+        let KeyRef(chrom, pos, _) = record_key;
+        if on_non_pass_call.contains(&record_key) {
+            return Some(record_key);
+        }
+        let eligible = |row: usize| !is_pass(row) && (!only_scorable || scorable(row));
+        let row = padded_row(record_key, delta)
+            .filter(|&row| eligible(row))
+            .or_else(|| multiallelic.owner(chrom, pos, delta.as_slice(), eligible))?;
+        key(row, positions[row] as u64)
+    };
+    // It counts as scored if hap.py could have scored it.
+    let scored_call = |record_key, delta: Option<i64>| {
+        non_pass_source(record_key, delta, true).filter(|call_key| non_pass_keys.contains(call_key))
+    };
+    let unexplained: HashSet<KeyRef<'_>> = records
+        .filter(|&(record_key, delta)| !explained_by_pass(record_key, delta))
+        .filter_map(|(record_key, delta)| scored_call(record_key, delta))
+        .collect();
+    let (n_non_pass_calls, n_non_pass_unexplained) = (non_pass_keys.len(), unexplained.len());
     let pass_only = match happy_pass_only {
         HappyPassOnly::Yes => true,
         HappyPassOnly::No => false,
-        HappyPassOnly::Auto => n_without_pass_only == 0,
+        HappyPassOnly::Auto => looks_pass_only(n_non_pass_unexplained, n_non_pass_calls),
     };
 
     // Per call: its label, flip_ok, truth deltas, the position its label came from, and whether
@@ -886,7 +1161,11 @@ pub fn attach_labels(
                 return row;
             }
             if let Some(query_label) = labels.labels.get(&call_key) {
-                (row.0, row.1) = (query_label.label.index() as f64, query_label.flip_ok);
+                // A length change that no PASS indel call covering the key has is another call's
+                // record, and the merged label is then not this call's own.
+                if query_label.alt_deltas.iter().all(|&d| pass_call_has(&call_key, Some(d))) {
+                    (row.0, row.1) = (query_label.label.index() as f64, query_label.flip_ok);
+                }
             } else if let Some(shifted) = padded_source(i)
                 // Without --pass-only, a label at a non-PASS call's key is that call's.
                 && (pass_only || !on_call.contains(&KeyRef(chroms[i], shifted, call_key.2)))
@@ -898,21 +1177,21 @@ pub fn attach_labels(
         })
         .collect();
 
+    // The keys whose label labelled a PASS call (at its key or as a padded call's), and those at a
+    // PASS call's key whose label it did not take, as it includes another call's record.
+    let labelled_pass = |i: usize| filters[i] == PASS && !rows[i].0.is_nan();
     let on_pass: HashSet<KeyRef<'_>> =
-        (0..n).filter(|&i| filters[i] == PASS).filter_map(|i| key(i, rows[i].3)).collect();
-    let mut join = LabelJoin {
-        pass_only,
-        happy_pass_only,
-        n_labels: labels.labels.len(),
-        n_padded_snp: (0..n)
-            .filter(|&i| rows[i].4 && variant_types[i] == Some(VariantType::Snp))
-            .count(),
-        n_padded_indel: (0..n)
-            .filter(|&i| rows[i].4 && variant_types[i] == Some(VariantType::Indel))
-            .count(),
-        n_without_pass_only,
-        ..LabelJoin::default()
-    };
+        (0..n).filter(|&i| labelled_pass(i)).filter_map(|i| key(i, rows[i].3)).collect();
+    let refused_rows: Vec<bool> = (0..n)
+        .map(|i| {
+            filters[i] == PASS
+                && rows[i].0.is_nan()
+                && key(i, positions[i] as u64).is_some_and(|k| labels.labels.contains_key(&k))
+        })
+        .collect();
+    let refused: HashSet<KeyRef<'_>> =
+        (0..n).filter(|&i| refused_rows[i]).filter_map(|i| key(i, positions[i] as u64)).collect();
+    let (mut n_pass, mut n_multiallelic, mut n_non_pass, mut n_unmatched) = (0, 0, 0, 0);
     // In record order, so that a call takes the first label other than `Keep`.
     for ((chrom, pos, variant_type), query_label) in &labels.labels {
         let label_key = KeyRef(chrom, *pos, *variant_type);
@@ -930,21 +1209,42 @@ pub fn attach_labels(
             }
         };
         if on_pass.contains(&label_key) {
-            join.n_pass += 1;
-        } else if let Some(row) = pass_owner() {
-            join.n_pass += 1;
-            join.n_multiallelic += 1;
+            n_pass += 1;
+        } else if let Some(row) = pass_owner().filter(|_| !refused.contains(&label_key)) {
+            n_pass += 1;
+            n_multiallelic += 1;
+            // A call whose label at its key was left out stays unlabelled: its own records there
+            // may include an FP that the merged label no longer shows.
             let call = &mut rows[row];
             let is_keep = call.0 == Label::Keep.index() as f64;
-            if call.0.is_nan() || (is_keep && query_label.label != Label::Keep) {
+            if !refused_rows[row]
+                && (call.0.is_nan() || (is_keep && query_label.label != Label::Keep))
+            {
                 (call.0, call.1) = (query_label.label.index() as f64, false);
             }
-        } else if on_call.contains(&label_key) || any_owner().is_some() {
-            join.n_non_pass += 1;
+        } else if each_delta(deltas).any(|delta| non_pass_source(label_key, delta, false).is_some())
+        {
+            n_non_pass += 1;
         } else {
-            join.n_unmatched += 1;
+            n_unmatched += 1;
         }
     }
+    let n_padded = |variant_type| {
+        (0..n).filter(|&i| rows[i].4 && variant_types[i] == Some(variant_type)).count()
+    };
+    let join = LabelJoin {
+        pass_only,
+        happy_pass_only,
+        n_labels: labels.labels.len(),
+        n_pass,
+        n_padded_snp: n_padded(VariantType::Snp),
+        n_padded_indel: n_padded(VariantType::Indel),
+        n_multiallelic,
+        n_non_pass,
+        n_unmatched,
+        n_non_pass_calls,
+        n_non_pass_unexplained,
+    };
 
     let mut label = Vec::with_capacity(n);
     let mut flip_ok = Vec::with_capacity(n);
@@ -964,21 +1264,92 @@ pub fn attach_labels(
     Ok((table, join))
 }
 
+/// The evidence for how hap.py was run: how many of the non-PASS calls it could have scored have
+/// a query record that no PASS call explains.
+fn pass_only_evidence(join: &LabelJoin) -> String {
+    format!(
+        "{} of {} non-PASS calls that hap.py could have scored (with a non-reference allele, on a \
+         contig with hap.py query records) have a query record that no PASS call explains",
+        join.n_non_pass_unexplained, join.n_non_pass_calls
+    )
+}
+
+/// Whether the evidence reaches [`MIN_NON_PASS_RECORD_FRACTION`], in words.
+fn threshold_side(join: &LabelJoin) -> String {
+    let side = if looks_pass_only(join.n_non_pass_unexplained, join.n_non_pass_calls) {
+        "under"
+    } else {
+        "at least"
+    };
+    format!(
+        "{side} the {:.0}% that shows a run without --pass-only",
+        100.0 * MIN_NON_PASS_RECORD_FRACTION
+    )
+}
+
 /// How the labels were joined, as to hap.py's `--pass-only`, and why.
 fn pass_only_mode(join: &LabelJoin) -> String {
     let mode = if join.pass_only { "with" } else { "without" };
-    let n = join.n_without_pass_only;
+    let evidence = pass_only_evidence(join);
     match join.happy_pass_only {
         HappyPassOnly::Yes | HappyPassOnly::No => format!(
-            "joined as hap.py run {mode} --pass-only, as set by --happy-pass-only {} ({n} TP/FP \
-             query records are at a non-PASS call that no PASS call explains)",
-            if join.pass_only { "yes" } else { "no" }
+            "joined as hap.py run {mode} --pass-only, as set by --happy-pass-only {} ({evidence})",
+            join.happy_pass_only
         ),
         HappyPassOnly::Auto => format!(
-            "joined as hap.py run {mode} --pass-only, inferred from the labels: {n} TP/FP query \
-             records are at a non-PASS call that no PASS call explains"
+            "joined as hap.py run {mode} --pass-only, inferred from the labels: {evidence} ({})",
+            threshold_side(join)
         ),
     }
+}
+
+/// The warning, if any, that the labels may have been joined the wrong way: inferred as hap.py
+/// run with `--pass-only` although some non-PASS calls have a query record that no PASS call
+/// explains, set so by `--happy-pass-only yes` although enough of them do to show a run without
+/// it, or set by `--happy-pass-only no` although too few of the non-PASS calls that hap.py could
+/// have scored (if any) do.
+fn pass_only_warning(join: &LabelJoin) -> Option<String> {
+    let evidence = pass_only_evidence(join);
+    match join.happy_pass_only {
+        HappyPassOnly::Auto if join.pass_only && join.n_non_pass_unexplained > 0 => Some(format!(
+            "{evidence} (each most likely a PASS call's record that hap.py placed at a non-PASS \
+             call): {}, so the labels were joined as hap.py run with it. If hap.py was run \
+             without --pass-only, pass --happy-pass-only no; if with it, pass --happy-pass-only \
+             yes",
+            threshold_side(join)
+        )),
+        HappyPassOnly::Yes
+            if !looks_pass_only(join.n_non_pass_unexplained, join.n_non_pass_calls) =>
+        {
+            Some(format!(
+                "{evidence} ({}): the labels contradict --happy-pass-only yes",
+                threshold_side(join)
+            ))
+        }
+        HappyPassOnly::No
+            if join.n_non_pass_calls > 0
+                && looks_pass_only(join.n_non_pass_unexplained, join.n_non_pass_calls) =>
+        {
+            Some(format!(
+                "{evidence} ({}): the labels contradict --happy-pass-only no (with it, a PASS \
+                 call's record that hap.py placed at a non-PASS call does not label the PASS call)",
+                threshold_side(join)
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The note, when the labels were joined as hap.py run with `--pass-only`, that the TP/FP query
+/// records at non-PASS calls only label no call.
+fn left_out_note(join: &LabelJoin) -> Option<String> {
+    (join.pass_only && join.n_non_pass > 0).then(|| {
+        format!(
+            "{} TP/FP query records at non-PASS calls only are left out of the labels, as they \
+             were joined as hap.py run with --pass-only",
+            join.n_non_pass
+        )
+    })
 }
 
 /// Logs how the hap.py labels joined to the calls, and fails when most of them matched no call.
@@ -994,6 +1365,12 @@ pub fn check_label_join(join: &LabelJoin, source: &str) -> Result<()> {
         join.n_labels, join.n_pass, join.n_padded_snp, join.n_padded_indel, join.n_multiallelic
     );
     info!("{source}: {}", pass_only_mode(join));
+    if let Some(warning) = pass_only_warning(join) {
+        warn!("{source}: {warning}");
+    }
+    if let Some(note) = left_out_note(join) {
+        info!("{source}: {note}");
+    }
     if !join.pass_only && join.n_non_pass > 0 {
         warn!(
             "{source} scores {} non-PASS calls: hap.py must be run with --pass-only, or a truth \
@@ -1138,6 +1515,10 @@ mod tests {
         // The first truth record at a key gives its deltas.
         assert_eq!(labels.truth_deltas[&key(500, VariantType::Snp)], Some((0, 0)));
         assert!(!labels.truth_deltas.contains_key(&key(800, VariantType::Snp)));
+        // A query record that hap.py did not score TP or FP, with its query alleles' changes.
+        assert_eq!(labels.unscored.len(), 1);
+        assert_eq!(labels.unscored["chr1"].len(), 1);
+        assert_eq!(labels.unscored_deltas("chr1", 800, VariantType::Snp), Some(&[0][..]));
     }
 
     #[test]
@@ -1200,11 +1581,13 @@ mod tests {
             .replace("##contig=<ID=chr1,length=100000>\n", "##contig=<ID=chr1,length=100000>\n##contig=<ID=chr2,length=100000>\n##contig=<ID=chr3,length=100000>\n");
         let records = [
             "chr1 100 . A C . . . GT:BD:BK:BVT 0/1:TP:gm:SNP 0/1:TP:gm:SNP",
+            "chr1 150 . A C . . . GT:BD:BK:BVT .:.:.:NOCALL 0/1:UNK:.:SNP",
             // Two records at one (chrom, pos, type): the first label wins, flip_ok is OR'd.
             "chr1 200 . A G . . . GT:BD:BK:BVT 1/1:FN:am:SNP 0/1:FP:am:SNP",
             "chr1 200 . A T . . . GT:BD:BK:BVT 0/1:FN:am:SNP 0/1:FP:lm:SNP",
             "chr2 300 . AT A . . . GT:BD:BK:BVT 1/1:FN:.:INDEL .:.:.:NOCALL",
             "chr2 400 . C A . . . GT:BD:BK:BVT 0/1:TP:gm:SNP 0/1:TP:gm:SNP",
+            "chr2 450 . CA C . . . GT:BD:BK:BVT .:.:.:NOCALL 1/1:UNK:.:INDEL",
             // Not an extracted contig.
             "chr3 500 . C A . . . GT:BD:BK:BVT 0/1:FN:.:SNP .:.:.:NOCALL",
         ];
@@ -1224,6 +1607,10 @@ mod tests {
         );
         assert_eq!(from_index.fn_counts[&VariantType::Snp], 2);
         assert_eq!(from_index.fn_counts[&VariantType::Indel], 1);
+        // The unscored records of each contig are merged.
+        assert_eq!(from_index.unscored.len(), 2);
+        assert_eq!(from_index.unscored_deltas("chr1", 150, VariantType::Snp), Some(&[0][..]));
+        assert_eq!(from_index.unscored_deltas("chr2", 450, VariantType::Indel), Some(&[-1][..]));
         let message = read_happy_labels(&indexed, &["chr9"]).err().unwrap();
         assert!(
             format!("{message:#}").contains("no hap.py records on the extracted contigs: chr9")
@@ -1285,7 +1672,8 @@ mod tests {
                 n_multiallelic: 0,
                 n_non_pass: 2,
                 n_unmatched: 1,
-                n_without_pass_only: 1
+                n_non_pass_calls: 2,
+                n_non_pass_unexplained: 1,
             }
         );
         check_label_join(&join, "happy.vcf").unwrap();
@@ -1359,7 +1747,9 @@ mod tests {
                 n_multiallelic: 7,
                 n_non_pass: 1,
                 n_unmatched: 2,
-                n_without_pass_only: 0
+                // The 703 record can only have been split from the LowQual call at 700.
+                n_non_pass_calls: 3,
+                n_non_pass_unexplained: 1,
             }
         );
     }
@@ -1502,8 +1892,8 @@ mod tests {
     #[test]
     fn without_pass_only_a_label_split_from_a_non_pass_call_is_its_own() {
         let rows = [
-            ("chr1", 1000, "CAAAAA", "C,CAAAA", "PASS", "indel", "0/1", false),
-            ("chr1", 1003, "AAA", "AA,AAAA", "LowQual", "indel", "0/1", false),
+            ("chr1", 1000, "CAAAAA", "C,CAAAA", "PASS", "indel", "1/2", false),
+            ("chr1", 1003, "AAA", "AA,AAAA", "LowQual", "indel", "1/2", false),
             ("chr1", 2000, "G", "GA", "LowQual", "indel", "0/1", false),
         ];
         let attach = |n: usize, happy_pass_only: HappyPassOnly| {
@@ -1551,11 +1941,35 @@ mod tests {
             table.f64_column("label").unwrap().iter().map(|l| format!("{l}")).collect();
         // The 903 label is the PASS multi-allelic call's.
         assert_eq!(shown, ["0", "NaN", "NaN", "NaN"]);
-        assert!(join.pass_only);
-        assert_eq!(join.happy_pass_only, HappyPassOnly::Yes);
-        assert_eq!(join.n_multiallelic, 1);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Yes,
+                n_labels: 4,
+                n_pass: 2,
+                n_multiallelic: 1,
+                n_non_pass: 2,
+                n_non_pass_calls: 3,
+                n_non_pass_unexplained: 2,
+                ..LabelJoin::default()
+            }
+        );
         assert!(
             pass_only_mode(&join).contains("with --pass-only, as set by --happy-pass-only yes")
+        );
+        // 2 of 3 is enough to show a run without --pass-only.
+        assert_eq!(
+            pass_only_warning(&join).unwrap(),
+            "2 of 3 non-PASS calls that hap.py could have scored (with a non-reference allele, on \
+             a contig with hap.py query records) have a query record that no PASS call explains \
+             (at least the 50% that shows a run without --pass-only): the labels contradict \
+             --happy-pass-only yes"
+        );
+        assert_eq!(
+            left_out_note(&join).unwrap(),
+            "2 TP/FP query records at non-PASS calls only are left out of the labels, as they \
+             were joined as hap.py run with --pass-only"
         );
     }
 
@@ -1580,16 +1994,846 @@ mod tests {
             table.f64_column("label").unwrap().iter().map(|l| format!("{l}")).collect();
         // The 402 and 903 labels are the LowQual calls'.
         assert_eq!(shown, ["NaN", "NaN", "1", "NaN"]);
-        assert!(!join.pass_only);
-        assert_eq!(join.happy_pass_only, HappyPassOnly::No);
-        assert_eq!((join.n_padded_snp, join.n_multiallelic, join.n_non_pass), (0, 0, 2));
+        let no = LabelJoin {
+            pass_only: false,
+            happy_pass_only: HappyPassOnly::No,
+            n_labels: 3,
+            n_pass: 1,
+            n_non_pass: 2,
+            n_non_pass_calls: 2,
+            ..LabelJoin::default()
+        };
+        assert_eq!(join, no);
         assert!(
             pass_only_mode(&join).contains("without --pass-only, as set by --happy-pass-only no")
         );
+        // Which the labels contradict.
+        assert!(
+            pass_only_warning(&join)
+                .unwrap()
+                .starts_with("0 of 2 non-PASS calls that hap.py could have scored")
+        );
+        assert_eq!(left_out_note(&join), None);
         // Without the option, the labels show nothing of non-PASS calls: joined as with it.
         let (_, join) = attach_labels(call_table(&rows), &labels, HappyPassOnly::Auto).unwrap();
-        assert!(join.pass_only);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_pass: 3,
+                n_padded_snp: 1,
+                n_multiallelic: 1,
+                n_non_pass: 0,
+                ..no
+            }
+        );
         assert!(pass_only_mode(&join).contains("with --pass-only, inferred from the labels"));
+    }
+
+    /// The calls of the `auto` tests: a padded PASS SNP trimmed to a LowQual SNP call's position,
+    /// a PASS multi-allelic call split into a LowQual call's position, and `n` more LowQual calls.
+    fn auto_rows(n: usize) -> Vec<crate::testing::CallRow<'static>> {
+        let mut rows = vec![
+            ("chr1", 400, "TTAGA", "TTCGA", "PASS", "snp", "0/1", false),
+            ("chr1", 402, "A", "C", "LowQual", "snp", "0/1", false),
+            ("chr1", 900, "CTATA", "CTA,CTATATA", "PASS", "indel", "1/2", false),
+            ("chr1", 903, "T", "TAT", "LowQual", "indel", "0/1", false),
+        ];
+        rows.extend(
+            (0..n).map(|i| {
+                ("chr1", 2000 + 10 * i as i64, "G", "GA", "LowQual", "indel", "0/1", false)
+            }),
+        );
+        rows
+    }
+
+    /// The records of the PASS calls of [`auto_rows`], and `bd` records at the first `n` of its
+    /// other LowQual calls.
+    fn auto_records(n: usize, bd: &str) -> Vec<HappyRecord> {
+        let mut records = vec![
+            record("chr1", 402, "A,C", "0/1:TP:gm:SNP", "0/1:TP:gm:SNP"),
+            record("chr1", 900, "CTA,C", "0/1:TP:gm:INDEL", "0/1:TP:gm:INDEL"),
+            record("chr1", 903, "T,TAT", "./.:.:.:NOCALL", "0/1:FP:lm:INDEL"),
+        ];
+        let query = format!("0/1:{bd}:.:INDEL");
+        records.extend(
+            (0..n).map(|i| record("chr1", 2000 + 10 * i as u64, "G,GA", "./.:.:.:NOCALL", &query)),
+        );
+        records
+    }
+
+    fn attach_auto(
+        rows: &[crate::testing::CallRow<'_>],
+        records: Vec<HappyRecord>,
+    ) -> (Vec<String>, LabelJoin) {
+        let labels = labels_from_happy_records(records.into_iter().map(Ok), &["chr1"]).unwrap();
+        let (table, join) = attach_labels(call_table(rows), &labels, HappyPassOnly::Auto).unwrap();
+        let shown = table.f64_column("label").unwrap().iter().map(|l| format!("{l}")).collect();
+        (shown, join)
+    }
+
+    /// One label at a non-PASS call that no PASS call explains (e.g. a PASS call that hap.py
+    /// represented differently), among many non-PASS calls, does not show that hap.py was run
+    /// without --pass-only: the padded SNP and the multi-allelic call keep their labels, with a
+    /// warning.
+    #[test]
+    fn auto_one_stray_label_among_many_non_pass_calls_joins_as_run_with_pass_only() {
+        let (shown, join) = attach_auto(&auto_rows(20), auto_records(1, "FP"));
+        assert_eq!(&shown[..4], ["1", "NaN", "0", "NaN"]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_labels: 4,
+                n_pass: 3,
+                n_padded_snp: 1,
+                n_multiallelic: 1,
+                n_non_pass: 1,
+                n_non_pass_calls: 22,
+                n_non_pass_unexplained: 1,
+                ..LabelJoin::default()
+            }
+        );
+        assert_eq!(
+            pass_only_mode(&join),
+            "joined as hap.py run with --pass-only, inferred from the labels: 1 of 22 non-PASS \
+             calls that hap.py could have scored (with a non-reference allele, on a contig with \
+             hap.py query records) have a query record that no PASS call explains (under the 50% \
+             that shows a run without --pass-only)"
+        );
+        assert_eq!(
+            pass_only_warning(&join).unwrap(),
+            "1 of 22 non-PASS calls that hap.py could have scored (with a non-reference allele, on \
+             a contig with hap.py query records) have a query record that no PASS call explains \
+             (each most likely a PASS call's record that hap.py placed at a non-PASS call): under \
+             the 50% that shows a run without --pass-only, so the labels were joined as hap.py \
+             run with it. If hap.py was run without --pass-only, pass --happy-pass-only no; if \
+             with it, pass --happy-pass-only yes"
+        );
+        assert_eq!(
+            left_out_note(&join).unwrap(),
+            "1 TP/FP query records at non-PASS calls only are left out of the labels, as they \
+             were joined as hap.py run with --pass-only"
+        );
+    }
+
+    /// Records (TP, FP or UNK) at most non-PASS calls, that no PASS call explains, show that
+    /// hap.py was run without --pass-only: labels at non-PASS calls' positions are theirs.
+    #[rstest::rstest]
+    #[case::fp("FP")]
+    #[case::unk("UNK")]
+    fn auto_records_at_most_non_pass_calls_join_as_run_without_pass_only(#[case] bd: &str) {
+        let (shown, join) = attach_auto(&auto_rows(4), auto_records(3, bd));
+        assert_eq!(&shown[..4], ["NaN", "NaN", "1", "NaN"]);
+        // The 402 and 903 labels are explained by PASS calls: 3 of 6 is half.
+        let without = LabelJoin {
+            pass_only: false,
+            happy_pass_only: HappyPassOnly::Auto,
+            n_labels: 3,
+            n_pass: 1,
+            n_non_pass: 2,
+            n_non_pass_calls: 6,
+            n_non_pass_unexplained: 3,
+            ..LabelJoin::default()
+        };
+        let fp = usize::from(bd == "FP");
+        assert_eq!(join, LabelJoin { n_labels: 3 + 3 * fp, n_non_pass: 2 + 3 * fp, ..without });
+        assert_eq!(pass_only_warning(&join), None);
+        assert_eq!(
+            pass_only_mode(&join),
+            "joined as hap.py run without --pass-only, inferred from the labels: 3 of 6 non-PASS \
+             calls that hap.py could have scored (with a non-reference allele, on a contig with \
+             hap.py query records) have a query record that no PASS call explains (at least the \
+             50% that shows a run without --pass-only)"
+        );
+        // One record fewer is under half.
+        let (_, join) = attach_auto(&auto_rows(4), auto_records(2, bd));
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_labels: 3 + 2 * fp,
+                n_pass: 3,
+                n_padded_snp: 1,
+                n_multiallelic: 1,
+                n_non_pass: 2 * fp,
+                n_non_pass_calls: 6,
+                n_non_pass_unexplained: 2,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A record at no call's position that only a non-PASS multi-allelic call can have been split
+    /// into shows that hap.py looked at that call: it counts once, as that call.
+    #[test]
+    fn auto_a_record_split_only_from_a_non_pass_call_counts_as_that_call() {
+        let rows = [
+            ("chr1", 700, "CTATA", "CTA,CTATATA", "LowQual", "indel", "1/2", false),
+            ("chr1", 2000, "G", "GA", "LowQual", "indel", "0/1", false),
+        ];
+        let split = |alleles: &str| {
+            vec![
+                record("chr1", 700, "CTA,C", "0/1:TP:gm:INDEL", "0/1:TP:gm:INDEL"),
+                record("chr1", 703, alleles, "./.:.:.:NOCALL", "0/1:UNK:.:INDEL"),
+            ]
+        };
+        let joined = |pass_only: bool, n_labels: usize, n_non_pass_unexplained: usize| LabelJoin {
+            pass_only,
+            happy_pass_only: HappyPassOnly::Auto,
+            n_labels,
+            n_non_pass: n_labels,
+            n_non_pass_calls: 2,
+            n_non_pass_unexplained,
+            ..LabelJoin::default()
+        };
+        let (_, join) = attach_auto(&rows, split("T,TAT"));
+        assert_eq!(join, joined(false, 1, 1));
+        // Only the 703 record: still the call at 700.
+        let (_, join) = attach_auto(&rows, split("T,TAT")[1..].to_vec());
+        assert_eq!(join, joined(false, 0, 1));
+        // A record whose length change is none of the call's alleles' is not the call's.
+        let (_, join) = attach_auto(&rows, split("T,TA")[1..].to_vec());
+        assert_eq!(join, joined(true, 0, 0));
+        // A PASS multi-allelic call that covers 703 explains it.
+        let mut with_pass = rows.to_vec();
+        with_pass
+            .insert(0, ("chr1", 699, "CCTATA", "CCTA,CCTATATA", "PASS", "indel", "1/2", false));
+        let (_, join) = attach_auto(&with_pass, split("T,TAT")[1..].to_vec());
+        assert_eq!(join, joined(true, 0, 0));
+    }
+
+    /// Non-PASS calls on a contig with no hap.py query record (e.g. hap.py was run on chr1 only)
+    /// do not count, so extracting another contig does not change the labels.
+    #[test]
+    fn auto_counts_only_non_pass_calls_on_contigs_with_happy_records() {
+        let expected = LabelJoin {
+            pass_only: false,
+            happy_pass_only: HappyPassOnly::Auto,
+            n_labels: 3,
+            n_pass: 1,
+            n_non_pass: 2,
+            n_non_pass_calls: 6,
+            n_non_pass_unexplained: 3,
+            ..LabelJoin::default()
+        };
+        let chr1 = auto_rows(4);
+        let (chr1_labels, join) = attach_auto(&chr1, auto_records(3, "UNK"));
+        assert_eq!(join, expected);
+        let mut both = chr1.clone();
+        both.push(("chr2", 50, "A", "C", "PASS", "snp", "0/1", false));
+        both.extend(
+            (0..10).map(|i| ("chr2", 100 + 10 * i, "G", "GA", "LowQual", "indel", "0/1", false)),
+        );
+        let (labels, join) = attach_auto(&both, auto_records(3, "UNK"));
+        assert_eq!(join, expected);
+        assert_eq!(labels[..chr1.len()], chr1_labels);
+    }
+
+    /// Non-PASS calls with no non-reference allele in their genotype (e.g. `0/0` or `./.`
+    /// `RefCall`s) do not count: hap.py writes no query record for them.
+    #[test]
+    fn auto_counts_only_non_pass_calls_with_a_non_reference_genotype() {
+        let mut rows = auto_rows(4);
+        rows.extend((0..10).map(|i| {
+            let gt = if i % 2 == 0 { "0/0" } else { "./." };
+            ("chr1", 3000 + 10 * i, "G", "GA", "RefCall", "indel", gt, false)
+        }));
+        let (_, join) = attach_auto(&rows, auto_records(3, "UNK"));
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: false,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_labels: 3,
+                n_pass: 1,
+                n_non_pass: 2,
+                n_non_pass_calls: 6,
+                n_non_pass_unexplained: 3,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// An unscored (`UNK`) record at the position hap.py trimmed a padded PASS SNP or indel to is
+    /// that call's, unless the padded call has a record at its own POS, or the record's length
+    /// change is not the indel's.
+    #[rstest::rstest]
+    #[case::trimmed(&[], 0)]
+    #[case::snp_recorded_at_its_pos(&[("chr1", 400, "TTAGA,TTCGA", "SNP")], 1)]
+    #[case::indel_recorded_at_its_pos(&[("chr1", 100, "ACGT,ACT", "INDEL")], 1)]
+    #[case::other_length_change(&[("chr1", 101, "C,CA", "INDEL")], 1)]
+    fn an_unscored_record_at_a_padded_pass_calls_trimmed_position_is_its(
+        #[case] more: &[(&str, u64, &str, &str)],
+        #[case] n_unexplained: usize,
+    ) {
+        let rows = [
+            // hap.py trims `ACGT>ACT` to `CG>C` at 101, and `TTAGA>TTCGA` to `A>C` at 402.
+            ("chr1", 100, "ACGT", "ACT", "PASS", "indel", "0/1", false),
+            ("chr1", 101, "CG", "C", "LowQual", "indel", "0/1", false),
+            ("chr1", 400, "TTAGA", "TTCGA", "PASS", "snp", "0/1", false),
+            ("chr1", 402, "A", "C", "LowQual", "snp", "0/1", false),
+        ];
+        let unk = |(chrom, pos, alleles, bvt): (&str, u64, &str, &str)| {
+            record(chrom, pos, alleles, "./.:.:.:NOCALL", &format!("0/1:UNK:.:{bvt}"))
+        };
+        let mut records =
+            vec![unk(("chr1", 101, "CG,C", "INDEL")), unk(("chr1", 402, "A,C", "SNP"))];
+        // A record with another length change at 101 replaces the trimmed one.
+        if more.first().is_some_and(|m| m.1 == 101) {
+            records.remove(0);
+        }
+        records.extend(more.iter().copied().map(unk));
+        let (shown, join) = attach_auto(&rows, records);
+        assert_eq!(shown, ["NaN"; 4]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                // 1 of 2 is half.
+                pass_only: n_unexplained == 0,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_non_pass_calls: 2,
+                n_non_pass_unexplained: n_unexplained,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A record at a padded PASS indel's trimmed position with its length change does not hide
+    /// another record there with another length change: that one is the non-PASS call's. Nor
+    /// does the padded call take the label of the two records together, which is not its own.
+    #[test]
+    fn a_padded_pass_indels_record_does_not_hide_another_at_its_trimmed_position() {
+        let rows = [
+            // hap.py trims `ACGT>ACT` to `CG>C` at 101, where a LowQual insertion is.
+            ("chr1", 100, "ACGT", "ACT", "PASS", "indel", "0/1", false),
+            ("chr1", 101, "C", "CAA", "LowQual", "indel", "0/1", false),
+        ];
+        let records = |both: bool| {
+            let mut records =
+                vec![record("chr1", 101, "CG,C", "0/1:TP:gm:INDEL", "0/1:TP:gm:INDEL")];
+            if both {
+                records.push(record("chr1", 101, "C,CAA", "./.:.:.:NOCALL", "0/1:FP:lm:INDEL"));
+            }
+            labels_from_happy_records(records.into_iter().map(Ok), &["chr1"]).unwrap()
+        };
+        let attach = |both: bool, happy_pass_only: HappyPassOnly| {
+            let (table, join) =
+                attach_labels(call_table(&rows), &records(both), happy_pass_only).unwrap();
+            let shown: Vec<String> =
+                table.f64_column("label").unwrap().iter().map(|l| format!("{l}")).collect();
+            (shown, join)
+        };
+        let joined =
+            |pass_only: bool, happy_pass_only: HappyPassOnly, n_unexplained: usize| LabelJoin {
+                pass_only,
+                happy_pass_only,
+                n_labels: 1,
+                n_non_pass: 1,
+                n_non_pass_calls: 1,
+                n_non_pass_unexplained: n_unexplained,
+                ..LabelJoin::default()
+            };
+        // The insertion's FP record shows that hap.py scored the LowQual call.
+        let (shown, join) = attach(true, HappyPassOnly::Auto);
+        assert_eq!(shown, ["NaN", "NaN"]);
+        assert_eq!(join, joined(false, HappyPassOnly::Auto, 1));
+        // Joined as with --pass-only, the PASS deletion does not take the merged drop label.
+        let (shown, join) = attach(true, HappyPassOnly::Yes);
+        assert_eq!(shown, ["NaN", "NaN"]);
+        assert_eq!(join, joined(true, HappyPassOnly::Yes, 1));
+        // With its own record only, it takes its keep label.
+        let (shown, join) = attach(false, HappyPassOnly::Yes);
+        assert_eq!(shown, ["1", "NaN"]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Yes,
+                n_labels: 1,
+                n_pass: 1,
+                n_padded_indel: 1,
+                n_non_pass_calls: 1,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A record at a PASS indel call's key with a length change that no PASS indel call covering
+    /// the key has is not that call's: here hap.py trimmed a LowQual padded deletion to it. Nor does the PASS
+    /// call take the label of the two records together, which is not its own.
+    #[test]
+    fn a_pass_indel_does_not_explain_another_length_change_at_its_key() {
+        let rows = [
+            // hap.py trims `ACGT>ACT` to `CG>C` at 101, where a PASS insertion is.
+            ("chr1", 100, "ACGT", "ACT", "LowQual", "indel", "0/1", false),
+            ("chr1", 101, "C", "CAA", "PASS", "indel", "0/1", false),
+        ];
+        let attach = |both: bool, happy_pass_only: HappyPassOnly| {
+            let mut records =
+                vec![record("chr1", 101, "C,CAA", "0/1:TP:gm:INDEL", "0/1:TP:gm:INDEL")];
+            if both {
+                records.push(record("chr1", 101, "CG,C", "./.:.:.:NOCALL", "0/1:FP:lm:INDEL"));
+            }
+            let labels = labels_from_happy_records(records.into_iter().map(Ok), &["chr1"]).unwrap();
+            let (table, join) = attach_labels(call_table(&rows), &labels, happy_pass_only).unwrap();
+            let shown: Vec<String> =
+                table.f64_column("label").unwrap().iter().map(|l| format!("{l}")).collect();
+            (shown, join)
+        };
+        let joined = |pass_only: bool, happy_pass_only: HappyPassOnly| LabelJoin {
+            pass_only,
+            happy_pass_only,
+            n_labels: 1,
+            n_non_pass: 1,
+            n_non_pass_calls: 1,
+            n_non_pass_unexplained: 1,
+            ..LabelJoin::default()
+        };
+        // The deletion's FP record shows that hap.py scored the LowQual call.
+        assert_eq!(
+            attach(true, HappyPassOnly::Auto),
+            (vec!["NaN".into(), "NaN".into()], joined(false, HappyPassOnly::Auto))
+        );
+        // Joined as with --pass-only, the PASS insertion does not take the merged drop label.
+        assert_eq!(
+            attach(true, HappyPassOnly::Yes),
+            (vec!["NaN".into(), "NaN".into()], joined(true, HappyPassOnly::Yes))
+        );
+        // With its own record only, it takes its keep label.
+        assert_eq!(
+            attach(false, HappyPassOnly::Yes),
+            (
+                vec!["NaN".into(), "1".into()],
+                LabelJoin {
+                    pass_only: true,
+                    happy_pass_only: HappyPassOnly::Yes,
+                    n_labels: 1,
+                    n_pass: 1,
+                    n_non_pass_calls: 1,
+                    ..LabelJoin::default()
+                }
+            )
+        );
+    }
+
+    /// A record at a PASS indel call's key may join its allele with one of an overlapping PASS
+    /// call (as hap.py writes a GATK het-alt call split into two records): the call takes its
+    /// label, though the record has a length change that none of its own ALT alleles has.
+    #[test]
+    fn a_pass_indel_takes_a_record_joining_its_allele_with_an_overlapping_pass_calls() {
+        let rows = [
+            ("chr1", 136, "TAAA", "T,TAAAA", "PASS", "indel", "1/2", false),
+            ("chr1", 139, "A", "ATT", "PASS", "indel", "0/1", false),
+        ];
+        let records = vec![
+            record("chr1", 136, "TAAA,T", "0/1:TP:gm:INDEL", "0/1:TP:gm:INDEL"),
+            // `TAAA>TAAAA` at 136 written as `A>AA` at 139, with the call at 139's `A>ATT`.
+            record("chr1", 139, "A,AA,ATT", "1/2:TP:gm:INDEL", "1/2:TP:gm:INDEL"),
+        ];
+        let (shown, join) = attach_auto(&rows, records);
+        assert_eq!(shown, ["1", "1"]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_labels: 2,
+                n_pass: 2,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// As `a_pass_indel_does_not_explain_another_length_change_at_its_key`, but the padded
+    /// deletion is PASS and hap.py writes one record joining both calls' alleles at 101: the
+    /// insertion takes its label.
+    #[test]
+    fn a_pass_indel_takes_a_record_joining_its_allele_with_a_pass_padded_calls() {
+        let rows = [
+            ("chr1", 100, "ACGT", "ACT", "PASS", "indel", "0/1", false),
+            ("chr1", 101, "C", "CAA", "PASS", "indel", "0/1", false),
+        ];
+        // `CG>C` is the deletion trimmed to 101, and `CG>CAAG` the insertion.
+        let records = vec![record("chr1", 101, "CG,CAAG,C", "./.:.:.:NOCALL", "1/2:FP:lm:INDEL")];
+        let (shown, join) = attach_auto(&rows, records);
+        assert_eq!(shown, ["NaN", "0"]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_labels: 1,
+                n_pass: 1,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A padded PASS call with a record at its POS, even an unscored one, does not take the label
+    /// at its trimmed position: hap.py writes one record per call.
+    #[test]
+    fn a_padded_pass_call_with_an_unscored_record_at_its_pos_takes_no_trimmed_label() {
+        let rows = [("chr1", 400, "TTAGA", "TTCGA", "PASS", "snp", "0/1", false)];
+        let records = [
+            record("chr1", 400, "TTAGA,TTCGA", "./.:.:.:NOCALL", "0/1:UNK:.:SNP"),
+            record("chr1", 402, "A,C", "0/1:TP:gm:SNP", "0/1:TP:gm:SNP"),
+        ];
+        let labels = labels_from_happy_records(records.into_iter().map(Ok), &["chr1"]).unwrap();
+        let (table, join) = attach_labels(call_table(&rows), &labels, HappyPassOnly::Yes).unwrap();
+        assert!(table.f64_column("label").unwrap()[0].is_nan());
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Yes,
+                n_labels: 1,
+                n_unmatched: 1,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A record at the position a padded PASS SNP was trimmed to is the PASS call's, though a
+    /// non-PASS multi-allelic call covering it could also have been split into it.
+    #[rstest::rstest]
+    #[case::with_the_pass_call(true, 0)]
+    #[case::without(false, 1)]
+    fn a_padded_pass_snp_explains_a_record_a_non_pass_multiallelic_call_could_own(
+        #[case] with_pass: bool,
+        #[case] n_unexplained: usize,
+    ) {
+        let mut rows = vec![("chr1", 401, "TAGA", "TCGA,TGGA", "LowQual", "snp", "1/2", false)];
+        if with_pass {
+            rows.insert(0, ("chr1", 400, "TTAGA", "TTCGA", "PASS", "snp", "0/1", false));
+        }
+        let records = vec![record("chr1", 402, "A,C", "./.:.:.:NOCALL", "0/1:UNK:.:SNP")];
+        let (_, join) = attach_auto(&rows, records);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: n_unexplained == 0,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_non_pass_calls: 1,
+                n_non_pass_unexplained: n_unexplained,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A record at the position a non-PASS padded indel is trimmed to is a PASS multi-allelic
+    /// call's, if one can have been split into it.
+    #[rstest::rstest]
+    #[case::with_the_pass_call(true, 0)]
+    #[case::without(false, 1)]
+    fn a_pass_multiallelic_call_explains_a_record_at_a_non_pass_padded_calls_trimmed_position(
+        #[case] with_pass: bool,
+        #[case] n_unexplained: usize,
+    ) {
+        // hap.py trims `ACGT>ACT` at 102 to `CG>C` at 103, which the PASS call at 100 covers.
+        let mut rows = vec![("chr1", 102, "ACGT", "ACT", "LowQual", "indel", "0/1", false)];
+        if with_pass {
+            rows.insert(
+                0,
+                ("chr1", 100, "GTACGT", "GTACT,GTACGTGT", "PASS", "indel", "1/2", false),
+            );
+        }
+        let records = vec![record("chr1", 103, "CG,C", "./.:.:.:NOCALL", "0/1:UNK:.:INDEL")];
+        let (_, join) = attach_auto(&rows, records);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: n_unexplained == 0,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_non_pass_calls: 1,
+                n_non_pass_unexplained: n_unexplained,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// With no non-PASS calls, the labels are joined as hap.py run with --pass-only.
+    #[test]
+    fn auto_with_no_non_pass_calls_joins_as_run_with_pass_only() {
+        let (shown, join) = attach_auto(&auto_rows(0)[..1], auto_records(0, "FP"));
+        assert_eq!(shown, ["1"]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_labels: 3,
+                n_pass: 1,
+                n_padded_snp: 1,
+                n_unmatched: 2,
+                ..LabelJoin::default()
+            }
+        );
+        assert_eq!(pass_only_warning(&join), None);
+    }
+
+    /// A forced mode logs the evidence, and warns only when it contradicts
+    /// `--happy-pass-only yes` (see `happy_pass_only_yes_joins_as_run_with_pass_only`).
+    #[rstest::rstest]
+    #[case::yes(HappyPassOnly::Yes)]
+    #[case::no(HappyPassOnly::No)]
+    fn a_forced_mode_warns_only_when_the_labels_contradict_it(
+        #[case] happy_pass_only: HappyPassOnly,
+    ) {
+        let attach = |rows: usize, records: usize| {
+            let records = auto_records(records, "FP").into_iter().map(Ok);
+            let labels = labels_from_happy_records(records, &["chr1"]).unwrap();
+            attach_labels(call_table(&auto_rows(rows)), &labels, happy_pass_only).unwrap().1
+        };
+        let is_yes = happy_pass_only == HappyPassOnly::Yes;
+        // 1 of 22 is under the threshold: it contradicts `no`.
+        let join = attach(20, 1);
+        assert_eq!((join.n_non_pass_calls, join.n_non_pass_unexplained), (22, 1));
+        assert!(pass_only_mode(&join).contains(&format!(
+            "--happy-pass-only {happy_pass_only} (1 of 22 non-PASS calls that hap.py could"
+        )));
+        let evidence = |n: usize, of: usize, side: &str| {
+            format!(
+                "{n} of {of} non-PASS calls that hap.py could have scored (with a non-reference \
+                 allele, on a contig with hap.py query records) have a query record that no PASS \
+                 call explains ({side} the 50% that shows a run without --pass-only)"
+            )
+        };
+        let no = |n: usize, of: usize| {
+            format!(
+                "{}: the labels contradict --happy-pass-only no (with it, a PASS call's record that \
+                 hap.py placed at a non-PASS call does not label the PASS call)",
+                evidence(n, of, "under")
+            )
+        };
+        assert_eq!(pass_only_warning(&join), (!is_yes).then(|| no(1, 22)));
+        // 0 of 22 contradicts it too.
+        let join = attach(20, 0);
+        assert_eq!(pass_only_warning(&join), (!is_yes).then(|| no(0, 22)));
+        // 3 of 6 reaches the threshold: it contradicts `yes`.
+        let join = attach(4, 3);
+        assert_eq!((join.n_non_pass_calls, join.n_non_pass_unexplained), (6, 3));
+        let yes =
+            format!("{}: the labels contradict --happy-pass-only yes", evidence(3, 6, "at least"));
+        assert_eq!(pass_only_warning(&join), is_yes.then_some(yes));
+        // With no non-PASS calls that hap.py could have scored, nothing contradicts either.
+        let records = auto_records(0, "FP").into_iter().map(Ok);
+        let labels = labels_from_happy_records(records, &["chr1"]).unwrap();
+        let rows = &auto_rows(0)[..1];
+        let join = attach_labels(call_table(rows), &labels, happy_pass_only).unwrap().1;
+        assert_eq!((join.n_non_pass_calls, pass_only_warning(&join)), (0, None));
+    }
+
+    /// A multi-allelic call is the source of records only of the ALT alleles its genotype calls:
+    /// a `0/1` PASS `CTATA>CTA,CTATATA` explains no `+2` record, which is the LowQual call's.
+    #[test]
+    fn a_multiallelic_call_is_the_source_of_its_called_alleles_only() {
+        let rows = [
+            ("chr1", 900, "CTATA", "CTA,CTATATA", "PASS", "indel", "0/1", false),
+            ("chr1", 903, "T", "TAT", "LowQual", "indel", "0/1", false),
+        ];
+        let records = vec![
+            record("chr1", 900, "CTA,C", "0/1:TP:gm:INDEL", "0/1:TP:gm:INDEL"),
+            record("chr1", 903, "T,TAT", "./.:.:.:NOCALL", "0/1:FP:lm:INDEL"),
+        ];
+        let labels = labels_from_happy_records(records.into_iter().map(Ok), &["chr1"]).unwrap();
+        let (table, join) = attach_labels(call_table(&rows), &labels, HappyPassOnly::Yes).unwrap();
+        let shown: Vec<String> =
+            table.f64_column("label").unwrap().iter().map(|l| format!("{l}")).collect();
+        // The PASS call keeps its own keep label: the FP is not split from it.
+        assert_eq!(shown, ["1", "NaN"]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Yes,
+                n_labels: 2,
+                n_pass: 1,
+                n_non_pass: 1,
+                n_non_pass_calls: 1,
+                n_non_pass_unexplained: 1,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A call that hap.py could not have scored (`0/0` or `./.`) does not hide the source it
+    /// shadows: a multi-allelic call with a greater POS, or a padded call trimmed to the same
+    /// position.
+    #[rstest::rstest]
+    #[case::hom_ref_multiallelic("0/0", false)]
+    #[case::no_call_multiallelic("./.", false)]
+    #[case::no_call_padded("./.", true)]
+    fn auto_an_ineligible_call_does_not_hide_an_eligible_source(
+        #[case] gt: &'static str,
+        #[case] padded: bool,
+    ) {
+        let (rows, records) = if padded {
+            // Both are trimmed to `CG>C` at 101; the ineligible one comes first.
+            let rows = vec![
+                ("chr1", 99, "TACGT", "TACT", "RefCall", "indel", gt, false),
+                ("chr1", 100, "ACGT", "ACT", "LowQual", "indel", "0/1", false),
+            ];
+            (rows, vec![record("chr1", 101, "CG,C", "./.:.:.:NOCALL", "0/1:UNK:.:INDEL")])
+        } else {
+            // Both cover 703 with a `+2` allele; the ineligible one has the greater POS.
+            let rows = vec![
+                ("chr1", 700, "CTATA", "CTA,CTATATA", "LowQual", "indel", "1/2", false),
+                ("chr1", 701, "TATA", "TA,TATATA", "RefCall", "indel", gt, false),
+            ];
+            (rows, vec![record("chr1", 703, "T,TAT", "./.:.:.:NOCALL", "0/1:UNK:.:INDEL")])
+        };
+        let (_, join) = attach_auto(&rows, records);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: false,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_non_pass_calls: 1,
+                n_non_pass_unexplained: 1,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A TP or FP record at the position hap.py trimmed a non-PASS padded call to is that call's
+    /// in the label counts too, not one that matches no call.
+    #[test]
+    fn a_scored_record_at_a_non_pass_padded_calls_trimmed_position_is_its() {
+        let rows = [("chr1", 100, "ACGT", "ACT", "LowQual", "indel", "0/1", false)];
+        let records = vec![record("chr1", 101, "CG,C", "./.:.:.:NOCALL", "0/1:FP:lm:INDEL")];
+        let (shown, join) = attach_auto(&rows, records);
+        assert_eq!(shown, ["NaN"]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: false,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_labels: 1,
+                n_non_pass: 1,
+                n_non_pass_calls: 1,
+                n_non_pass_unexplained: 1,
+                ..LabelJoin::default()
+            }
+        );
+        check_label_join(&join, "happy.vcf").unwrap();
+    }
+
+    /// A PASS multi-allelic call whose label at its key was left out (a record there has a
+    /// length change of another call's) is not labelled by a record split from it either: its
+    /// own records at its key may include an FP.
+    #[test]
+    fn a_split_record_does_not_label_a_call_whose_label_was_left_out() {
+        let rows = [
+            ("chr1", 100, "CTATA", "CTA,CTATATA", "PASS", "indel", "1/2", false),
+            ("chr1", 100, "C", "CA", "LowQual", "indel", "0/1", false),
+        ];
+        let records = [
+            record("chr1", 100, "CTA,C", "0/1:FN:.:INDEL", "0/1:FP:lm:INDEL"),
+            record("chr1", 100, "C,CA", "./.:.:.:NOCALL", "0/1:FP:lm:INDEL"),
+            record("chr1", 103, "T,TAT", "0/1:TP:gm:INDEL", "0/1:TP:gm:INDEL"),
+        ];
+        let labels = labels_from_happy_records(records.into_iter().map(Ok), &["chr1"]).unwrap();
+        let (table, join) = attach_labels(call_table(&rows), &labels, HappyPassOnly::Yes).unwrap();
+        let shown: Vec<String> =
+            table.f64_column("label").unwrap().iter().map(|l| format!("{l}")).collect();
+        assert_eq!(shown, ["NaN", "NaN"]);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: true,
+                happy_pass_only: HappyPassOnly::Yes,
+                n_labels: 2,
+                n_pass: 1,
+                n_multiallelic: 1,
+                n_non_pass: 1,
+                n_non_pass_calls: 1,
+                n_non_pass_unexplained: 1,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// A non-PASS call at a PASS call's key counts among the calls hap.py could have scored, and
+    /// a record there with a length change that no PASS call covering the key has is its own.
+    #[rstest::rstest]
+    #[case::no_record(&[], 1, 3)]
+    #[case::its_record(&[(2000, "G,GTT")], 2, 3)]
+    fn auto_counts_a_non_pass_call_at_a_pass_calls_key(
+        #[case] more: &[(u64, &str)],
+        #[case] n_unexplained: usize,
+        #[case] n_calls: usize,
+    ) {
+        let rows = [
+            ("chr1", 2000, "G", "GA", "PASS", "indel", "0/1", false),
+            ("chr1", 2000, "G", "GTT", "LowQual", "indel", "0/1", false),
+            ("chr1", 3000, "G", "GA", "LowQual", "indel", "0/1", false),
+            ("chr1", 4000, "G", "GA", "LowQual", "indel", "0/1", false),
+        ];
+        let unk = |pos: u64, alleles: &str| {
+            record("chr1", pos, alleles, "./.:.:.:NOCALL", "0/1:UNK:.:INDEL")
+        };
+        let mut records = vec![unk(3000, "G,GA")];
+        records.extend(more.iter().map(|&(pos, alleles)| unk(pos, alleles)));
+        let (_, join) = attach_auto(&rows, records);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: looks_pass_only(n_unexplained, n_calls),
+                happy_pass_only: HappyPassOnly::Auto,
+                n_non_pass_calls: n_calls,
+                n_non_pass_unexplained: n_unexplained,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    /// hap.py writes the record of a non-PASS padded call, as of a PASS one, at the position it
+    /// trims the call to: it shows that hap.py scored the call, unless another call is there or
+    /// the record has another length change.
+    #[rstest::rstest]
+    #[case::trimmed("CG,C", &[], 2)]
+    #[case::other_length_change("C,CA", &[], 1)]
+    #[case::a_call_at_the_trimmed_position("CG,C", &[("chr1", 402, "A", "C", "LowQual", "snp", "0/1", false)], 2)]
+    fn auto_a_non_pass_padded_call_has_the_record_at_its_trimmed_position(
+        #[case] indel_record: &str,
+        #[case] more: &[crate::testing::CallRow<'static>],
+        #[case] n_unexplained: usize,
+    ) {
+        let mut rows = vec![
+            // hap.py trims `ACGT>ACT` to `CG>C` at 101, and `TTAGA>TTCGA` to `A>C` at 402.
+            ("chr1", 100, "ACGT", "ACT", "LowQual", "indel", "0/1", false),
+            ("chr1", 400, "TTAGA", "TTCGA", "LowQual", "snp", "0/1", false),
+        ];
+        rows.extend_from_slice(more);
+        let records = vec![
+            record("chr1", 101, indel_record, "./.:.:.:NOCALL", "0/1:UNK:.:INDEL"),
+            record("chr1", 402, "A,C", "./.:.:.:NOCALL", "0/1:UNK:.:SNP"),
+        ];
+        let (_, join) = attach_auto(&rows, records);
+        assert_eq!(
+            join,
+            LabelJoin {
+                pass_only: false,
+                happy_pass_only: HappyPassOnly::Auto,
+                n_non_pass_calls: rows.len(),
+                n_non_pass_unexplained: n_unexplained,
+                ..LabelJoin::default()
+            }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::het("0/1", true)]
+    #[case::hom_alt("1/1", true)]
+    #[case::multi_allelic("1/2", true)]
+    #[case::hom_ref("0/0", false)]
+    #[case::missing("./.", false)]
+    fn genotypes_with_a_non_reference_allele(#[case] gt: &str, #[case] expected: bool) {
+        assert_eq!(has_alt_allele(gt), expected);
     }
 
     #[test]
