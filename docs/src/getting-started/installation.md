@@ -31,11 +31,20 @@ build whose static-link test fails (see `xgboost/build.rs`).
 in more detail, including `WINNOWR_LIBOMP_PREFIX` for a libomp installed elsewhere
 on macOS.
 
+## From crates.io
+
+From version 0.1.1, winnowr can also be installed from
+[crates.io](https://crates.io/crates/winnowr), with the same build requirements:
+
+```console
+cargo install --locked winnowr
+```
+
 ## Releases
 
-Releases will also be published to [crates.io](https://crates.io), to
-[bioconda](https://bioconda.github.io) and as prebuilt binaries for macOS (Apple silicon) and Linux
-(x86_64 and aarch64) on the [releases page](https://github.com/fg-labs/winnowr/releases).
+Prebuilt binaries for macOS (Apple silicon) and Linux (x86_64 and aarch64) are on the
+[releases page](https://github.com/fg-labs/winnowr/releases). winnowr will also be published to
+[bioconda](https://bioconda.github.io).
 
 ## Check the install
 
