@@ -108,6 +108,64 @@ cargo install --locked winnowr
 Prebuilt binaries are on the [releases page](https://github.com/fg-labs/winnowr/releases), and
 releases will also be published to [bioconda](https://bioconda.github.io).
 
+## Quick start
+
+No trained models are distributed, so first [train your own](#train-your-own-models).
+
+### Score a sample
+
+```console
+# Optional: measure repeat-tract read lengths, for models with repeat-length features
+winnowr strlen --vcf sample.vcf.gz --alignments sample.cram --reference ref.fa -o sample.strlen.tsv.gz
+# Optional: count each allele's reads by MAPQ, for models with pileup features
+winnowr pileup --vcf sample.vcf.gz --alignments sample.cram --reference ref.fa -o sample.pileup.tsv.gz
+# Score the calls and write the filtered VCF
+winnowr score --vcf sample.vcf.gz --gvcf sample.g.vcf.gz --models snp.winnowr.json indel.winnowr.json \
+  --regions segdups=segdups.bed.gz notinalldifficultregions=GRCh38_notinalldifficultregions.bed.gz \
+  --strlen sample.strlen.tsv.gz --pileup sample.pileup.tsv.gz --mode genotyper -o sample.winnowr.vcf.gz
+```
+
+Give `score` `--strlen` and `--pileup` only if the models use those features (it warns about tables
+no model uses), measured with the settings the models were trained with (`strlen --reads`, `pileup
+--settings`); `score` stops with an error when they differ. In place of them, `score --alignments
+sample.cram --reference ref.fa` measures the evidence itself. `--mode genotyper` (the default) lets
+the genotype models drop, flip and re-genotype calls; `--mode veto` lets them only drop calls. Give
+`--regions` the region names the models were trained with.
+
+### Train your own models
+
+Run hap.py (`--engine vcfeval --pass-only`) on each sample to train or evaluate on, against its
+GIAB truth set.
+
+```console
+# Extract a labelled feature table per sample (--truth-vcf and --truth-bed label non-PASS calls too)
+winnowr extract --vcf HG001.vcf.gz --gvcf HG001.g.vcf.gz --happy HG001.happy.vcf.gz \
+  --truth-vcf HG001.truth.vcf.gz --truth-bed HG001.truth.bed --reference ref.fa \
+  --regions segdups=segdups.bed.gz -o HG001.parquet
+# Train a model per variant type; a trio is held out together in cross-validation
+winnowr train --tables HG001.parquet HG005.parquet HG006.parquet HG007.parquet \
+  --sample-groups HG005,HG006,HG007 --variant-type snp -o snp
+winnowr train --tables HG001.parquet HG005.parquet HG006.parquet HG007.parquet \
+  --sample-groups HG005,HG006,HG007 --variant-type indel -o indel
+# Report F1 on a held-out sample, one variant type at a time
+winnowr evaluate --models snp.winnowr.json --table HG002.parquet \
+  --regions notinalldifficultregions=GRCh38_notinalldifficultregions.bed.gz -o HG002.snp.tsv
+winnowr evaluate --models indel.winnowr.json --table HG002.parquet \
+  --regions notinalldifficultregions=GRCh38_notinalldifficultregions.bed.gz -o HG002.indel.tsv
+```
+
+`evaluate` needs the confident regions to decide indel calls as `score` does; without them its
+indel F1 is not that of the calls `score` writes. Then score with the models as above. For
+repeat-length or pileup features, give `extract` the `--strlen` or `--pileup` tables and `train`
+`--repeat-length` (or `--regenotype`) or `--pileup-features`.
+
+To train on only some contigs of a sample, e.g. to evaluate it on the others, `subset` keeps them
+and recounts the table's truth FNs on them:
+
+```console
+winnowr subset --table HG002.parquet --happy HG002.happy.vcf.gz --contigs chr1 chr2 -o HG002.chr1-2.parquet
+```
+
 ## Commands
 
 ```console
