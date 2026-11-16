@@ -2,7 +2,7 @@
 
 ## Getting Started
 
-The development toolchain is pinned in `rust-toolchain.toml`; install it with `rustup toolchain install` in the repository. The oldest Rust the crates support is the `rust-version` in `Cargo.toml`, which CI tests too (the `msrv` job).
+The development toolchain is pinned in `rust-toolchain.toml`; install it with `rustup toolchain install` in the repository. `docs/Dockerfile.bookworm` builds with the same Rust: when you change the channel, change its `rust` base image tag and `RUSTUP_TOOLCHAIN` too (CI fails while they differ), and its digest, by hand. Docker builds the image the digest names, whatever the tag says, and CI does not check the digest: that would need the registry, and Docker Hub moves the tag to each rebuild of the image, so a pinned digest is soon no longer the tag's. Take the new digest from `docker buildx imagetools inspect rust:<channel>-slim-bookworm` (the multi-arch index). The oldest Rust the crates support is the `rust-version` in `Cargo.toml`, which CI tests too (the `msrv` job).
 If you do not have `rustup`, install it with (assuming [`curl`](https://everything.curl.dev/get) is installed):
 
 ```console

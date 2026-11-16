@@ -56,7 +56,8 @@ Each call is in one stratum by whether its REF span is inside each truth set's c
 (`--mode`, default `genotyper`). It writes:
 
 - `<output>.strata.tsv`: the actions, outcomes and F1 of the labelled calls per truth set and
-  stratum (the `all` rows match `evaluate`),
+  stratum (the `all` rows match `evaluate`'s, except with a genotype and a promote model in veto
+  mode, which `evaluate` does not report),
 - `<output>.rates.tsv`: the action rates of every scored call per stratum, variant type and
   chromosome, which need no truth,
 - `<output>.calibration.tsv`: binned P(keep) against the observed keep rate.

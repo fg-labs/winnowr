@@ -140,7 +140,8 @@ pub(crate) enum Command {
     /// Each call is in one stratum by whether its REF span is inside each of two truth sets'
     /// confident regions: both, <second>-only, <first>-only or neither. Calls are scored as
     /// `score` does. Writes <output>.strata.tsv (actions, outcomes and F1 of the labelled calls
-    /// per truth set and stratum; the `all` rows match `evaluate`), <output>.rates.tsv (action
+    /// per truth set and stratum; the `all` rows match `evaluate`'s, except with a genotype and a
+    /// promote model in veto mode, which `evaluate` does not report), <output>.rates.tsv (action
     /// rates of every scored call per stratum, variant type and chromosome, with no truth needed)
     /// and <output>.calibration.tsv (binned P(keep) against the observed keep rate).
     ///
@@ -2418,11 +2419,16 @@ mod tests {
             args.policy.outside_indel_t_drop,
             OutsideTDrop(Some(DEFAULT_OUTSIDE_INDEL_T_DROP))
         );
-        // The help shows them.
-        let help =
-            Cli::command().find_subcommand_mut("score").unwrap().render_long_help().to_string();
-        assert!(help.contains("[default: indel]"), "{help}");
-        assert!(help.contains("[default: 0.6]"), "{help}");
+        // The help shows them, as each argument's default.
+        let command = Cli::command();
+        let score = command.find_subcommand("score").unwrap();
+        let shown = |id: &str| -> Vec<String> {
+            let arg = score.get_arguments().find(|arg| arg.get_id() == id).unwrap();
+            assert!(!arg.is_hide_default_value_set(), "{id}");
+            arg.get_default_values().iter().map(|v| v.to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(shown("keep_fallback"), expected);
+        assert_eq!(shown("outside_indel_t_drop"), [DEFAULT_OUTSIDE_INDEL_T_DROP.to_string()]);
         assert_eq!(OutsideTDrop(None).to_string(), "none");
     }
 
