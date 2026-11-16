@@ -42,6 +42,10 @@ use winnowr::training::{
 use winnowr::vcf::VcfSummary;
 use winnowr::version::{LONG_VERSION, VERSION};
 
+/// The widest the help is wrapped to (narrower terminals wrap it narrower); the user guide's
+/// command reference shows the help at this width.
+pub(crate) const HELP_WIDTH: usize = 100;
+
 /// The default number of threads, when neither `-t` nor `OMP_NUM_THREADS` gives one: enough to
 /// overlap I/O with compute, while staying predictable on shared hosts and under schedulers.
 pub(crate) const DEFAULT_THREADS: NonZeroUsize = NonZeroUsize::new(4).expect("4 is non-zero");
@@ -56,7 +60,7 @@ pub(crate) const THREADS_VARIABLE: &str = "OMP_NUM_THREADS";
     name = "winnowr",
     version = VERSION.as_str(),
     long_version = LONG_VERSION.as_str(),
-    max_term_width = 100
+    max_term_width = HELP_WIDTH
 )]
 pub struct Cli {
     /// The options shared by every subcommand.
@@ -2657,5 +2661,423 @@ mod tests {
         .unwrap();
         let Command::Strlen(args) = cli.command else { panic!("not strlen") };
         assert_eq!(args.regions, ["chr1:1-100", "chr2"]);
+    }
+
+    /// The environment variable that makes [`documented_cli_help_matches_the_binary`] rewrite the
+    /// documented help files instead of comparing them.
+    const UPDATE_DOCS: &str = "WINNOWR_UPDATE_DOCS";
+
+    /// The repository's `docs/` directory, or `None` when it is absent (the published crate leaves
+    /// it out), in which case the documentation tests have nothing to check.
+    fn docs_dir() -> Option<PathBuf> {
+        let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+        docs.is_dir().then_some(docs)
+    }
+
+    /// Text with the trailing white space of each line removed, ending in one newline.
+    fn trim_lines(text: &str) -> String {
+        let lines: Vec<&str> = text.trim_end().lines().map(str::trim_end).collect();
+        format!("{}\n", lines.join("\n"))
+    }
+
+    /// The help that `winnowr --help` and `winnowr <command> --help` print in a terminal
+    /// [`HELP_WIDTH`] columns wide, with the file name each is documented in (`winnowr` for the
+    /// top level), with trailing white space trimmed.
+    ///
+    /// The help holds no version string (only `-V, --version`'s description), so it changes only
+    /// when the options do.
+    fn documented_help() -> Vec<(String, String)> {
+        let command = Cli::command().term_width(HELP_WIDTH);
+        let help = |args: &[&str]| -> String {
+            let argv = std::iter::once("winnowr").chain(args.iter().copied()).chain(["--help"]);
+            let error = command.clone().try_get_matches_from(argv).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp, "{error}");
+            trim_lines(&error.render().to_string())
+        };
+        let mut helps = vec![("winnowr".to_string(), help(&[]))];
+        for subcommand in command.get_subcommands() {
+            let name = subcommand.get_name().to_string();
+            helps.push((name.clone(), help(&[name.as_str()])));
+        }
+        helps
+    }
+
+    /// The tool-reference page that shows a documented help file: `tools/overview.md` for the top
+    /// level, else `tools/<command>.md`.
+    fn tool_page(name: &str) -> String {
+        if name == "winnowr" { "tools/overview.md".to_string() } else { format!("tools/{name}.md") }
+    }
+
+    /// The help in `docs/_generated/cli/` (included verbatim in the user guide's tool reference)
+    /// is the binary's, and each file is included by its tool page, which the book's summary
+    /// links. With `WINNOWR_UPDATE_DOCS=1`, rewrites the help files instead of comparing them.
+    #[test]
+    fn documented_cli_help_matches_the_binary() {
+        let Some(docs) = docs_dir() else { return };
+        let dir = docs.join("_generated/cli");
+        let update = std::env::var_os(UPDATE_DOCS).is_some_and(|value| value == "1");
+        let helps = documented_help();
+        let mut problems = Vec::new();
+        // A file of a command that no longer exists.
+        for entry in std::fs::read_dir(&dir).into_iter().flatten() {
+            let path = entry.unwrap().path();
+            let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let is_help = path.extension().is_some_and(|extension| extension == "txt");
+            if is_help && !helps.iter().any(|(command, _)| *command == name) {
+                if update {
+                    std::fs::remove_file(&path).unwrap();
+                } else {
+                    problems.push(format!("{} has no command", path.display()));
+                }
+            }
+        }
+        let mut stale = Vec::new();
+        for (name, help) in &helps {
+            let path = dir.join(format!("{name}.txt"));
+            if update {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(&path, help).unwrap();
+            } else {
+                let documented = std::fs::read_to_string(&path).map(|text| trim_lines(&text));
+                if documented.ok().as_ref() != Some(help) {
+                    stale.push(path.display().to_string());
+                }
+            }
+        }
+        if !stale.is_empty() {
+            problems.push(format!(
+                "the documented CLI help is out of date: {}. Run `{UPDATE_DOCS}=1 cargo test \
+                 documented_cli_help_matches_the_binary` and commit the changes",
+                stale.join(", ")
+            ));
+        }
+        let summary = std::fs::read_to_string(docs.join("src/SUMMARY.md")).unwrap_or_default();
+        for (name, _) in &helps {
+            let page = tool_page(name);
+            let include = format!("{{{{#include ../../_generated/cli/{name}.txt}}}}");
+            let text = std::fs::read_to_string(docs.join("src").join(&page)).unwrap_or_default();
+            if !text.contains(&include) {
+                problems.push(format!("docs/src/{page} does not contain {include}"));
+            }
+            if !summary.contains(&format!("({page})")) {
+                problems.push(format!("docs/src/SUMMARY.md does not link {page}"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// The Markdown files whose examples are checked: the README and the user guide's pages.
+    fn documented_markdown(docs: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().is_some_and(|extension| extension == "md") {
+                    files.push(path);
+                }
+            }
+        }
+        let mut files = vec![docs.parent().unwrap().join("README.md")];
+        walk(&docs.join("src"), &mut files);
+        files.sort();
+        files
+    }
+
+    /// A command line without its `$ ` prompt and any leading `NAME=value` environment
+    /// assignments or `time`, so `OMP_NUM_THREADS=8 winnowr ...` is checked too.
+    fn strip_command_prefix(line: &str) -> &str {
+        let mut line = line.strip_prefix("$ ").unwrap_or(line);
+        loop {
+            let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+            let assignment = word.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+            if assignment || word == "time" {
+                line = rest.trim_start();
+            } else {
+                return line;
+            }
+        }
+    }
+
+    /// One line of a shell command split into words as a POSIX shell splits them, for the quoting
+    /// the examples use: white space separates words; `'...'` quotes literally; `"..."` quotes
+    /// with `\` escaping only `"`, `\`, `$` and `` ` ``; `\` outside quotes escapes the next
+    /// character; and `#` at the start of a word, outside quotes, starts a comment. Returns the
+    /// words, and whether the line ends in an unquoted `\` (continues on the next line).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the quote if a quote is not closed on the line.
+    fn shell_words(line: &str) -> Result<(Vec<String>, bool), String> {
+        let mut words = Vec::new();
+        let mut word: Option<String> = None;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                c if c.is_whitespace() => words.extend(word.take()),
+                '#' if word.is_none() => break,
+                '\\' => match chars.next() {
+                    Some(next) => word.get_or_insert_default().push(next),
+                    None => {
+                        words.extend(word.take());
+                        return Ok((words, true));
+                    }
+                },
+                '\'' => {
+                    let word = word.get_or_insert_default();
+                    loop {
+                        match chars.next() {
+                            Some('\'') => break,
+                            Some(c) => word.push(c),
+                            None => return Err("unmatched single quote".to_string()),
+                        }
+                    }
+                }
+                '"' => {
+                    let word = word.get_or_insert_default();
+                    loop {
+                        match chars.next() {
+                            Some('"') => break,
+                            Some('\\') => match chars.peek() {
+                                Some(&next @ ('"' | '\\' | '$' | '`')) => {
+                                    word.push(next);
+                                    chars.next();
+                                }
+                                _ => word.push('\\'),
+                            },
+                            Some(c) => word.push(c),
+                            None => return Err("unmatched double quote".to_string()),
+                        }
+                    }
+                }
+                c => word.get_or_insert_default().push(c),
+            }
+        }
+        words.extend(word);
+        Ok((words, false))
+    }
+
+    /// The `winnowr <command> ...` command lines in a Markdown text's fenced code blocks (``` or
+    /// ~~~), with their line numbers, each split into words by [`shell_words`]: `\` continuations
+    /// are joined, and `$ ` prompts, leading environment assignments or `time`, and `#` comments
+    /// (whole lines, or after a command) are dropped. Lines that do not start with `winnowr `
+    /// (e.g. another tool's command) are skipped. A command whose quoting is broken is an `Err`
+    /// saying why.
+    ///
+    /// # Panics
+    ///
+    /// If a `\` continuation is still open when its code block ends.
+    fn example_commands(text: &str) -> Vec<(usize, Result<Vec<String>, String>)> {
+        let mut commands = Vec::new();
+        let mut in_block = false;
+        let mut pending: Option<(usize, String)> = None;
+        for (index, line) in text.lines().enumerate() {
+            let fence = line.trim_start();
+            if fence.starts_with("```") || fence.starts_with("~~~") {
+                if let Some((number, _)) = pending {
+                    panic!("the command at line {number} continues past the end of its code block");
+                }
+                in_block = !in_block;
+                continue;
+            }
+            if !in_block {
+                continue;
+            }
+            // Only a command's first line has a prompt or prefix to strip: a continuation line
+            // is all arguments, which may look like assignments (e.g. `--regions a=a.bed`). The
+            // physical lines are joined as a shell joins them, before splitting into words: a
+            // `\` at the end of a line is removed with the newline, and the next line follows
+            // as written, so its indentation still separates words and a continuation inside a
+            // word joins it.
+            let (number, joined) = match pending.take() {
+                Some((number, joined)) => (number, joined + line.trim_end()),
+                None => {
+                    let line = strip_command_prefix(line.trim());
+                    if !line.starts_with("winnowr ") {
+                        continue;
+                    }
+                    (index + 1, line.to_string())
+                }
+            };
+            match shell_words(&joined) {
+                Err(error) => commands.push((number, Err(error))),
+                Ok((_, true)) => {
+                    let without = joined.strip_suffix('\\').unwrap_or(&joined).to_string();
+                    pending = Some((number, without));
+                }
+                Ok((words, false)) => commands.push((number, Ok(words))),
+            }
+        }
+        commands
+    }
+
+    #[rstest]
+    #[case::plain("a b  c", &["a", "b", "c"], false)]
+    #[case::single_quotes("a 'b c' d", &["a", "b c", "d"], false)]
+    #[case::double_quotes(r#"a "b \"c\" $x \n" d"#, &["a", r#"b "c" $x \n"#, "d"], false)]
+    #[case::escapes(r"a b\ c it\'s", &["a", "b c", "it's"], false)]
+    #[case::joined(r#"--x="a b"c'd'"#, &["--x=a bcd"], false)]
+    #[case::empty_word(r#"a "" b"#, &["a", "", "b"], false)]
+    #[case::comment("a b # c 'd", &["a", "b"], false)]
+    #[case::hash_in_a_word("a b#c", &["a", "b#c"], false)]
+    #[case::hash_in_quotes(r##"a "#1" '#2'"##, &["a", "#1", "#2"], false)]
+    #[case::continued(r"a b \", &["a", "b"], true)]
+    fn shell_words_split_as_a_shell_does(
+        #[case] line: &str,
+        #[case] expected: &[&str],
+        #[case] continues: bool,
+    ) {
+        let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        assert_eq!(shell_words(line).unwrap(), (expected, continues));
+    }
+
+    #[rstest]
+    #[case::single("a 'b c", "unmatched single quote")]
+    #[case::double(r#"a "b c"#, "unmatched double quote")]
+    #[case::escaped_close(r#"a "b\""#, "unmatched double quote")]
+    fn shell_words_reject_an_unmatched_quote(#[case] line: &str, #[case] expected: &str) {
+        assert_eq!(shell_words(line).unwrap_err(), expected);
+    }
+
+    #[test]
+    fn example_commands_are_parsed_from_fenced_blocks() {
+        let text = "winnowr score --vcf outside.vcf\n\
+                    ```console\n\
+                    # A comment\n\
+                    $ winnowr strlen --vcf a.vcf \\\n  --reference r.fa  # measure\n\
+                    samtools index a.bam\n\
+                    winnowr --version\n\
+                    ```\n\
+                    ~~~\n\
+                    OMP_NUM_THREADS=8 time winnowr train --help\n\
+                    winnowr extract --vcf v.vcf --regions \\\n  a=a.bed\n\
+                    ~~~\n";
+        let commands: Vec<(usize, String)> = example_commands(text)
+            .into_iter()
+            .map(|(line, words)| (line, words.unwrap().join(" ")))
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                (4, "winnowr strlen --vcf a.vcf --reference r.fa".to_string()),
+                (7, "winnowr --version".to_string()),
+                (10, "winnowr train --help".to_string()),
+                (11, "winnowr extract --vcf v.vcf --regions a=a.bed".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the command at line 2 continues past the end of its code block")]
+    fn example_commands_reject_a_continuation_left_open() {
+        example_commands("```\nwinnowr strlen \\\n```\n");
+    }
+
+    /// Every `winnowr` command line in the README's and the user guide's code blocks parses, so
+    /// a renamed or removed option cannot leave an example behind. The files they name need not
+    /// exist: only the command line is parsed.
+    #[test]
+    fn documented_example_commands_parse() {
+        let Some(docs) = docs_dir() else { return };
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for path in documented_markdown(&docs) {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let (n, file_failures) = example_failures(&path.display().to_string(), &text);
+            checked += n;
+            failures.extend(file_failures);
+        }
+        assert!(checked > 0, "no example commands found under {}", docs.display());
+        assert!(failures.is_empty(), "examples that do not parse:\n{}", failures.join("\n"));
+    }
+
+    /// The number of `winnowr` example commands in a Markdown text, and a message (naming `file`
+    /// and the line) for each that does not parse.
+    fn example_failures(file: &str, text: &str) -> (usize, Vec<String>) {
+        let mut failures = Vec::new();
+        let commands = example_commands(text);
+        for (line, command) in &commands {
+            let words = match command {
+                Ok(words) => words,
+                Err(error) => {
+                    failures.push(format!("{file}:{line}: {error}"));
+                    continue;
+                }
+            };
+            let command = words.join(" ");
+            // A command named alone lists it (e.g. the README's command list): it must exist.
+            if let [_, name] = words.as_slice()
+                && !name.starts_with('-')
+            {
+                if Cli::command().find_subcommand(name).is_none() {
+                    failures.push(format!("{file}:{line}: no command {name}"));
+                }
+                continue;
+            }
+            if let Err(error) = Cli::command().try_get_matches_from(words) {
+                // Help and version requests are valid command lines.
+                if !matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                    let message = error.render().to_string();
+                    let first = message.lines().next().unwrap_or_default();
+                    failures.push(format!("{file}:{line}: {command}\n  {first}"));
+                }
+            }
+        }
+        (commands.len(), failures)
+    }
+
+    /// The failures of the example commands in one fenced block.
+    fn block_failures(commands: &str) -> Vec<String> {
+        example_failures("doc.md", &format!("```console\n{commands}\n```\n")).1
+    }
+
+    #[test]
+    fn a_quoted_example_argument_is_one_word() {
+        let failures = block_failures(r#"winnowr extract --vcf v -o t --sample "sample one""#);
+        assert!(failures.is_empty(), "{failures:?}");
+        let failures = block_failures(
+            "winnowr extract --vcf v -o t --reference 'my ref.fa' \\\n  --sample=it\\'s",
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn a_hash_inside_quotes_does_not_start_a_comment() {
+        let failures =
+            block_failures(r#"winnowr extract --vcf v -o t --sample "sample #1" --removed-option"#);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("--removed-option"), "{failures:?}");
+    }
+
+    #[test]
+    fn an_unmatched_quote_in_an_example_is_reported() {
+        let failures =
+            block_failures("# setup\nwinnowr extract --vcf v -o t --sample \"sample one");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].starts_with("doc.md:3:"), "{failures:?}");
+        assert!(failures[0].contains("unmatched"), "{failures:?}");
+    }
+
+    #[test]
+    fn a_continued_example_with_assignments_parses() {
+        let failures = block_failures(
+            "winnowr extract --vcf v.vcf -o t --regions \\\n  a=a.bed b=b.bed  # two sets",
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn a_continuation_inside_a_word_joins_without_a_space() {
+        // As a shell reads it: `winnowr extract--vcf v -o t`, which is no command.
+        let failures = block_failures("winnowr extract\\\n--vcf v -o t");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("extract--vcf"), "{failures:?}");
+        // The same split after a space, or with the next line indented, is two words.
+        for text in ["winnowr extract \\\n--vcf v -o t", "winnowr extract\\\n  --vcf v -o t"] {
+            let failures = block_failures(text);
+            assert!(failures.is_empty(), "{text:?}: {failures:?}");
+        }
     }
 }
