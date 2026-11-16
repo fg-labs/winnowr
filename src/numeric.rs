@@ -1,19 +1,21 @@
-//! Floating-point sums and number formatting, in the orders and forms winnowr's results were first
-//! defined with (those of the Python version, NumPy's pairwise `ndarray.sum()` and Python's
-//! compensated built-in `sum()` and `str()`).
+//! Floating-point sums and number formatting with fixed semantics: pairwise summation in NumPy's
+//! `ndarray.sum()` order, Neumaier's compensated summation (as CPython's built-in `sum()` uses),
+//! and the shortest round-trip float formatting of Python's `str()`.
 //!
-//! Matching the Python version is no longer a goal, but these stay. The sums feed features
-//! (repeat-length and stutter features) and threshold searches: summing in another order changes
-//! features by a few ULPs, which can move a call across a tree split of an existing model, and
-//! changes exact ties between thresholds or genotypes. Features also stay consistent with those in
-//! feature tables the Python version wrote, which training can still read. The formatting is the
-//! text of the `evaluate` and `stratify` metrics files, which downstream parsers and comparisons
-//! read.
+//! The sums feed features (repeat-length and stutter features) and threshold searches: summing in
+//! another order changes features by a few ULPs, which can move a call across a tree split of an
+//! existing model, and changes exact ties between thresholds or genotypes. A fixed order also keeps
+//! features consistent with those in existing feature tables, which training reads. The formatting
+//! is the text of the `evaluate` and `stratify` metrics files, which downstream parsers and
+//! comparisons read.
 
-/// Sums values in NumPy's order (pairwise, in blocks of eight), so that features are the same bit
-/// for bit for existing models (see the module docs).
+/// Sums values in NumPy's pairwise order, so that features are the same bit for bit for existing
+/// models (see the module docs). Fewer than eight values are summed in sequence. Up to 128 values
+/// (one block) are summed in eight interleaved partial sums, combined pairwise, plus the remainder
+/// past the last multiple of eight in sequence. Longer slices are split in two at the largest
+/// multiple of eight not past the middle, and the halves summed recursively.
 #[must_use]
-pub fn numpy_sum(values: &[f64]) -> f64 {
+pub fn pairwise_sum(values: &[f64]) -> f64 {
     const BLOCK: usize = 128;
     let n = values.len();
     if n < 8 {
@@ -37,13 +39,13 @@ pub fn numpy_sum(values: &[f64]) -> f64 {
     }
     let mut half = n / 2;
     half -= half % 8;
-    numpy_sum(&values[..half]) + numpy_sum(&values[half..])
+    pairwise_sum(&values[..half]) + pairwise_sum(&values[half..])
 }
 
-/// Sums values as Python 3.12+'s built-in `sum()` does for floats: Neumaier's improved
-/// Kahan–Babuška compensated summation, starting from 0.
+/// Sums values with Neumaier's improved Kahan–Babuška compensated summation, starting from 0 (as
+/// CPython 3.12+'s built-in `sum()` does for floats).
 #[must_use]
-pub fn python_sum<I: IntoIterator<Item = f64>>(values: I) -> f64 {
+pub fn compensated_sum<I: IntoIterator<Item = f64>>(values: I) -> f64 {
     let (mut sum, mut compensation) = (0.0f64, 0.0f64);
     for value in values {
         let total = sum + value;
@@ -61,10 +63,10 @@ pub fn python_sum<I: IntoIterator<Item = f64>>(values: I) -> f64 {
     sum
 }
 
-/// Formats a float as Python's `str()` does: the shortest representation that round-trips, in
+/// Formats a float as its shortest representation that round-trips (as Python's `str()` does), in
 /// scientific notation (with a signed, at least two-digit exponent) below 1e-4 or from 1e16.
 #[must_use]
-pub fn python_float(value: f64) -> String {
+pub fn shortest_float(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_string();
     }
@@ -96,13 +98,13 @@ pub fn python_float(value: f64) -> String {
     }
 }
 
-/// Formats a metric value as metrics files write it: Python's `str(round(value, 5))`, as the Python
-/// version's did (see the module docs). Both round the double's exact value to five decimals, ties
-/// to even.
+/// Formats a metric value as metrics files write it: rounded to five decimals, then formatted by
+/// [`shortest_float`], as Python's `str(round(value, 5))` (see the module docs). Both round the
+/// double's exact value to five decimals, ties to even.
 #[must_use]
 pub fn metric_float(value: f64) -> String {
     let rounded: f64 = format!("{value:.5}").parse().unwrap_or(value);
-    python_float(rounded)
+    shortest_float(rounded)
 }
 
 #[cfg(test)]
@@ -112,9 +114,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn numpy_sum_matches_sequential_sums_for_short_arrays() {
-        assert_eq!(numpy_sum(&[]), 0.0);
-        assert_eq!(numpy_sum(&[0.1, 0.2, 0.3]), 0.1 + 0.2 + 0.3);
+    fn pairwise_sum_matches_sequential_sums_for_short_arrays() {
+        assert_eq!(pairwise_sum(&[]), 0.0);
+        assert_eq!(pairwise_sum(&[0.1, 0.2, 0.3]), 0.1 + 0.2 + 0.3);
         // Eight or more values are summed in eight interleaved partial sums.
         let values: Vec<f64> = (1..=10).map(|i| f64::from(i) * 0.1).collect();
         let r: Vec<f64> = (0..8).map(|j| values[j]).collect();
@@ -122,19 +124,19 @@ mod tests {
             + ((r[4] + r[5]) + (r[6] + r[7]))
             + values[8]
             + values[9];
-        assert_eq!(numpy_sum(&values), expected);
+        assert_eq!(pairwise_sum(&values), expected);
         let long: Vec<f64> = (0..300).map(|i| f64::from(i).sqrt()).collect();
-        assert!((numpy_sum(&long) - long.iter().sum::<f64>()).abs() < 1e-9);
+        assert!((pairwise_sum(&long) - long.iter().sum::<f64>()).abs() < 1e-9);
     }
 
     #[test]
-    fn python_sum_compensates_rounding() {
-        assert_eq!(python_sum([]), 0.0);
-        assert_eq!(python_sum([0.1; 10]), 1.0);
+    fn compensated_sum_compensates_rounding() {
+        assert_eq!(compensated_sum([]), 0.0);
+        assert_eq!(compensated_sum([0.1; 10]), 1.0);
         assert_ne!([0.1; 10].iter().sum::<f64>(), 1.0);
-        assert_eq!(python_sum([1e100, 1.0, -1e100]), 1.0);
-        assert_eq!(python_sum([f64::INFINITY, 1.0]), f64::INFINITY);
-        // The two orders of these terms sum to the same value, as in Python.
+        assert_eq!(compensated_sum([1e100, 1.0, -1e100]), 1.0);
+        assert_eq!(compensated_sum([f64::INFINITY, 1.0]), f64::INFINITY);
+        // The two orders of these terms sum to the same value.
         let terms = [
             -6.397755605663211,
             -6.057451687708123,
@@ -143,8 +145,8 @@ mod tests {
             -6.057451687708123,
         ];
         let swapped = [terms[0], terms[1], terms[3], terms[2], terms[4]];
-        assert_eq!(python_sum(terms), -32.35802864668634);
-        assert_eq!(python_sum(swapped), -32.35802864668634);
+        assert_eq!(compensated_sum(terms), -32.35802864668634);
+        assert_eq!(compensated_sum(swapped), -32.35802864668634);
     }
 
     #[rstest]
@@ -164,8 +166,8 @@ mod tests {
     #[case(1.5e300, "1.5e+300")]
     #[case(f64::NAN, "nan")]
     #[case(f64::INFINITY, "inf")]
-    fn formats_floats_as_python(#[case] value: f64, #[case] expected: &str) {
-        assert_eq!(python_float(value), expected);
+    fn formats_floats_as_shortest_round_trip(#[case] value: f64, #[case] expected: &str) {
+        assert_eq!(shortest_float(value), expected);
     }
 
     // Expected values from Python's `str(round(value, 5))`.
@@ -180,7 +182,7 @@ mod tests {
     #[case(-0.00026699862934476126, "-0.00027")]
     #[case(0.000001, "0.0")]
     #[case(f64::NAN, "nan")]
-    fn formats_metrics_as_python(#[case] value: f64, #[case] expected: &str) {
+    fn formats_metrics_rounded_to_five_decimals(#[case] value: f64, #[case] expected: &str) {
         assert_eq!(metric_float(value), expected);
     }
 }

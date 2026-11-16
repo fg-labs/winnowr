@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::labels::TRUTH_DELTA_COLUMNS;
-use crate::numeric::{numpy_sum, python_sum};
+use crate::numeric::{compensated_sum, pairwise_sum};
 use crate::repeat_features::{called_deltas_of, ranked_lengths};
 use crate::strlen::{Histogram, parse_histogram};
 use crate::table::{FeatureTable, FeatureTableInfo};
@@ -81,7 +81,7 @@ pub fn error_bucket(error: i64, period: u64) -> usize {
         return N_ERRORS - 1;
     }
     let period = period as i64;
-    // Python's floor division and modulo, which the Python version used.
+    // Euclidean division and remainder (the period is positive here).
     let (units, remainder) = (error.div_euclid(period), error.rem_euclid(period));
     if remainder == 0 && units.abs() <= MAX_UNITS {
         (units + MAX_UNITS) as usize
@@ -212,8 +212,8 @@ pub struct StutterSite {
 /// given [`StutterFit`] settings.
 ///
 /// Each stratum's counts get [`STRATUM_PSEUDOCOUNT`] pseudo-reads distributed as its period class
-/// (all length bins pooled, plus one pseudo-read per bucket). Sums are taken in NumPy's order, so
-/// the model is the Python version's bit for bit.
+/// (all length bins pooled, plus one pseudo-read per bucket). Sums are taken in a fixed pairwise
+/// order (see [`pairwise_sum`]).
 #[must_use]
 pub fn fit_stutter_model_with(sites: &[StutterSite], fit: StutterFit) -> StutterModel {
     let mut counts = vec![vec![[0.0f64; N_ERRORS]; LENGTH_BINS.len()]; N_PERIOD_CLASSES];
@@ -237,7 +237,7 @@ pub fn fit_stutter_model_with(sites: &[StutterSite], fit: StutterFit) -> Stutter
         }
     }
     let normalized = |values: [f64; N_ERRORS]| -> [f64; N_ERRORS] {
-        let total = numpy_sum(&values);
+        let total = pairwise_sum(&values);
         values.map(|value| value / total)
     };
     let mut probabilities = Vec::with_capacity(N_PERIOD_CLASSES);
@@ -259,7 +259,7 @@ pub fn fit_stutter_model_with(sites: &[StutterSite], fit: StutterFit) -> Stutter
                 })
                 .collect(),
         );
-        n_reads.push(class_counts.iter().map(|stratum| numpy_sum(stratum) as u64).collect());
+        n_reads.push(class_counts.iter().map(|stratum| pairwise_sum(stratum) as u64).collect());
     }
     StutterModel { probabilities, n_reads, direction: fit.direction }
 }
@@ -471,8 +471,9 @@ pub fn call_length_genotype(
                 .values()
                 .enumerate()
                 .map(|(k, &n)| n as f64 * (0.5 * p_first[k] + 0.5 * p_second[k]).ln());
-            // Summed as the Python version did, so exact ties between genotypes stay exact.
-            let log_likelihood = python_sum(terms);
+            // A fixed summation method and order make the result reproducible, and compensation
+            // keeps its rounding error small.
+            let log_likelihood = compensated_sum(terms);
             log_likelihoods.insert((first, second), log_likelihood);
         }
     }

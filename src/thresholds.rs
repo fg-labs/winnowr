@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::NEVER;
 use crate::labels::{Label, PromoteLabel};
-use crate::numeric::python_sum;
+use crate::numeric::compensated_sum;
 use crate::rescore::{
     Actions, CallFlags, CallLimits, Counts, DecisionThresholds, Mode, Probabilities, Rule, decide,
     decide_promote, decide_with_rule, rescore, rescore_promote,
@@ -235,8 +235,9 @@ fn shared_baseline(baselines: impl IntoIterator<Item = Counts>) -> Result<Counts
 /// Grid-searches the thresholds that maximise the summed F1 gain over folds.
 ///
 /// [`NEVER`] is always a candidate, and ties go to the higher `t_drop`, then the higher `t_flip`,
-/// then the higher `t_regenotype` (see the module docs). Fold gains are summed as Python's `sum()`
-/// does, so ties resolve as in the Python version.
+/// then the higher `t_regenotype` (see the module docs). Fold gains are summed with
+/// [`compensated_sum`] in fold order: a fixed method and order make the result reproducible, and
+/// compensation keeps its rounding error small.
 ///
 /// # Arguments
 ///
@@ -264,7 +265,7 @@ pub fn search_thresholds(
     let (best, gain) = grid_argmax(
         |t: &[f64]| {
             let thresholds = DecisionThresholds { t_drop: t[0], t_flip: t[1], t_regenotype: t[2] };
-            python_sum(folds.iter().map(|fold| fold.f1_gain(thresholds, mode)))
+            compensated_sum(folds.iter().map(|fold| fold.f1_gain(thresholds, mode)))
         },
         &[grid, flip_grid, regenotype_grid],
     );
@@ -334,7 +335,7 @@ pub fn search_promote_thresholds(
         bail!("threshold search needs at least one fold");
     }
     let (best, gain) = grid_argmax(
-        |t: &[f64]| python_sum(folds.iter().map(|fold| fold.f1_gain(t[0], t[1]))),
+        |t: &[f64]| compensated_sum(folds.iter().map(|fold| fold.f1_gain(t[0], t[1]))),
         &[promote_grid, flip_grid],
     );
     Ok(PromoteThresholds { t_promote: best[0], t_flip: best[1], gain })
