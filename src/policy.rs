@@ -10,6 +10,7 @@ use rayon::prelude::*;
 
 use crate::common::{PASS, PhaseTimer, Task, VariantType};
 use crate::model::WinnowrModel;
+use crate::promote_labels::promote_eligible;
 use crate::regenotype::{
     RegenotypeTarget, regenotype_targets, with_regenotype_columns, without_regenotype,
 };
@@ -157,25 +158,21 @@ pub struct Decision {
 }
 
 /// The calls a model scores: PASS calls of its variant type (genotype models), or non-PASS calls
-/// of its variant type that do not overlap a PASS call (promote models).
+/// of its variant type that do not overlap a PASS call (promote models, see
+/// [`promote_eligible`]).
 ///
 /// # Errors
 ///
-/// Returns an error if the table lacks `variant_type`, `filter` or `overlaps_pass`.
+/// Returns an error if the table lacks `variant_type`, `filter` or (promote models)
+/// `overlaps_pass`.
 pub fn scored_mask(table: &FeatureTable, model: &WinnowrModel) -> Result<Vec<bool>> {
     let types = table.str_column("variant_type")?;
-    let filters = table.str_column("filter")?;
-    let overlaps_pass = table.bool_column("overlaps_pass")?;
     let variant_type = model.info.variant_type.as_str();
-    Ok((0..table.num_rows())
-        .map(|i| {
-            types[i] == variant_type
-                && match model.info.task {
-                    Task::Genotype => filters[i] == PASS,
-                    Task::Promote => filters[i] != PASS && !overlaps_pass[i],
-                }
-        })
-        .collect())
+    let eligible = match model.info.task {
+        Task::Genotype => table.str_column("filter")?.iter().map(|f| *f == PASS).collect(),
+        Task::Promote => promote_eligible(table)?,
+    };
+    Ok(types.iter().zip(eligible).map(|(vt, eligible)| *vt == variant_type && eligible).collect())
 }
 
 /// Scores each model's calls and decides drops, promotions, flips and re-genotypes.

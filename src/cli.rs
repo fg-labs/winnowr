@@ -353,12 +353,14 @@ pub(crate) struct TrainArgs {
     #[arg(long, default_value_t = TrainingParams::default().learning_rate)]
     pub(crate) learning_rate: f64,
 
-    /// The maximum leaves per tree.
-    #[arg(long, default_value_t = TrainingParams::default().max_leaves)]
+    /// The maximum leaves per tree (0 = unlimited, bounded by --max-depth).
+    #[arg(long, default_value_t = TrainingParams::default().max_leaves,
+          value_parser = clap::value_parser!(u32).range(..=i64::from(i32::MAX)))]
     pub(crate) max_leaves: u32,
 
     /// The maximum tree depth (0 = unlimited, bounded by --max-leaves).
-    #[arg(long, default_value_t = TrainingParams::default().max_depth)]
+    #[arg(long, default_value_t = TrainingParams::default().max_depth,
+          value_parser = clap::value_parser!(u32).range(..=i64::from(i32::MAX)))]
     pub(crate) max_depth: u32,
 
     /// The minimum hessian sum per leaf.
@@ -503,7 +505,8 @@ pub(crate) struct PolicyArgs {
     /// P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
     /// model's veto threshold is compared with), in place of the model's threshold, even when that
     /// is higher (none: the model's threshold). The keep fallback (--keep-fallback) still drops
-    /// them when P(keep) is below 0.5.
+    /// them when P(keep) is below 0.5. With --expected-f1 it applies too, before a flip or
+    /// re-genotype.
     #[arg(long, default_value_t = OutsideTDrop(Some(DEFAULT_OUTSIDE_INDEL_T_DROP)),
           value_name = "P|none")]
     pub(crate) outside_indel_t_drop: OutsideTDrop,
@@ -514,7 +517,8 @@ impl PolicyArgs {
     ///
     /// The confident regions are the `regions` named [`CONFIDENT_REGIONS`]. Without them, the
     /// outside indel drop threshold is not applied (with a warning when `indel_genotype`, i.e. an
-    /// indel genotype model will score).
+    /// indel genotype model will score). They are read only if an action is withheld outside them
+    /// or an indel genotype model will drop calls outside them.
     ///
     /// # Errors
     ///
@@ -541,8 +545,11 @@ impl PolicyArgs {
         let (flip, regenotype, promote) = (has("flip"), has("regenotype"), has("promote"));
         let indel_t_drop = self.outside_indel_t_drop.0;
         let path = regions.iter().find(|r| r.name == CONFIDENT_REGIONS).map(|r| r.path.as_path());
+        // Read the confident regions only when something uses them, so an unused BED (e.g. in a
+        // run without an indel genotype model) cannot fail the run.
+        let outside_t_drop = indel_t_drop.filter(|_| indel_genotype);
         match path {
-            Some(path) if flip || regenotype || promote || indel_t_drop.is_some() => {
+            Some(path) if flip || regenotype || promote || outside_t_drop.is_some() => {
                 let regions = RegionSet::from_bed(CONFIDENT_REGIONS, path)?;
                 regions.check_contigs(contigs)?;
                 info!("Confident regions (acting fully inside): {}", path.display());
@@ -555,7 +562,7 @@ impl PolicyArgs {
                  {CONFIDENT_REGIONS}=PATH"
             ),
             None => {
-                if let (Some(t_drop), true) = (indel_t_drop, indel_genotype) {
+                if let Some(t_drop) = outside_t_drop {
                     log::warn!(
                         "no confident regions given, so indel calls are dropped at the model's \
                          threshold everywhere; pass --regions {CONFIDENT_REGIONS}=PATH (GIAB's \
@@ -1048,8 +1055,9 @@ fn shared_reference_contigs(
 ///
 /// # Errors
 ///
-/// Returns an error if --unfixable-flips is given for a promote model, or --validation-fraction is
-/// not in `[0, 1)`.
+/// Returns an error if --unfixable-flips is given for a promote model, --validation-fraction is
+/// not in `[0, 1)`, --learning-rate is not positive and finite, --min-child-weight or
+/// --reg-lambda is negative or not finite.
 fn training_params(args: &TrainArgs, threads: NonZeroUsize) -> Result<TrainingParams> {
     let params = TrainingParams {
         learning_rate: args.learning_rate,
@@ -1083,6 +1091,18 @@ fn training_params(args: &TrainArgs, threads: NonZeroUsize) -> Result<TrainingPa
             "--validation-fraction must be at least 0 and below 1, got {}",
             params.validation_fraction
         );
+    }
+    // XGBoost accepts NaN for these (its range checks are comparisons), which trains a model of
+    // NaN probabilities whose parameters cannot be read back.
+    if !(params.learning_rate.is_finite() && params.learning_rate > 0.0) {
+        bail!("--learning-rate must be positive and finite, got {}", params.learning_rate);
+    }
+    for (option, value) in
+        [("--min-child-weight", params.min_child_weight), ("--reg-lambda", params.reg_lambda)]
+    {
+        if !(value.is_finite() && value >= 0.0) {
+            bail!("{option} must be at least 0 and finite, got {value}");
+        }
     }
     Ok(params)
 }
@@ -2352,6 +2372,50 @@ mod tests {
     }
 
     #[test]
+    fn withheld_actions_read_the_confident_regions_without_an_indel_genotype_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = parse(&[
+            "score",
+            "--vcf",
+            "v",
+            "--models",
+            "m",
+            "-o",
+            "o",
+            "--abstain-actions",
+            "flip",
+        ])
+        .unwrap();
+        let Command::Score(args) = cli.command else { panic!("not score") };
+        let regions = confident_regions(&dir);
+        let policy = args.policy.policy(Mode::Genotyper, &["chr1"], &regions, false).unwrap();
+        let abstain = policy.abstain.unwrap();
+        assert!(abstain.flip && !abstain.regenotype && !abstain.promote);
+        assert_eq!(abstain.indel_t_drop, args.policy.outside_indel_t_drop.0);
+        // A missing BED is still an error.
+        let missing = vec![NamedBed {
+            name: CONFIDENT_REGIONS.to_string(),
+            path: dir.path().join("missing.bed"),
+        }];
+        let error = args.policy.policy(Mode::Genotyper, &["chr1"], &missing, false).unwrap_err();
+        assert!(format!("{error:#}").contains("missing.bed"), "{error:#}");
+    }
+
+    #[test]
+    fn the_confident_regions_are_not_read_without_an_indel_genotype_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("missing.bed");
+        let regions = vec![NamedBed { name: CONFIDENT_REGIONS.to_string(), path }];
+        let cli = parse(&["score", "--vcf", "v", "--models", "m", "-o", "o"]).unwrap();
+        let Command::Score(args) = cli.command else { panic!("not score") };
+        let policy = args.policy.policy(Mode::Genotyper, &["chr1"], &regions, false).unwrap();
+        assert!(policy.abstain.is_none());
+        // With an indel genotype model they are read.
+        let error = args.policy.policy(Mode::Genotyper, &["chr1"], &regions, true).unwrap_err();
+        assert!(format!("{error:#}").contains("missing.bed"), "{error:#}");
+    }
+
+    #[test]
     fn the_default_policy_can_be_turned_off() {
         let dir = tempfile::TempDir::new().unwrap();
         let regions = confident_regions(&dir);
@@ -2572,6 +2636,36 @@ mod tests {
             error(&["--task", "promote", "--unfixable-flips", "exclude"]),
             "--unfixable-flips applies to genotype models, not --task promote"
         );
+    }
+
+    #[rstest]
+    #[case::nan_learning_rate(&["--learning-rate", "nan"], "--learning-rate must be positive and finite, got NaN")]
+    #[case::infinite_learning_rate(&["--learning-rate", "inf"], "--learning-rate must be positive and finite, got inf")]
+    #[case::zero_learning_rate(&["--learning-rate", "0"], "--learning-rate must be positive and finite, got 0")]
+    #[case::infinite_min_child_weight(&["--min-child-weight", "inf"], "--min-child-weight must be at least 0 and finite, got inf")]
+    #[case::negative_reg_lambda(&["--reg-lambda=-5"], "--reg-lambda must be at least 0 and finite, got -5")]
+    #[case::nan_reg_lambda(&["--reg-lambda", "NaN"], "--reg-lambda must be at least 0 and finite, got NaN")]
+    fn invalid_xgboost_options_are_rejected(#[case] extra: &[&str], #[case] expected: &str) {
+        assert_eq!(train_params(extra).unwrap_err().to_string(), expected);
+    }
+
+    #[test]
+    fn boundary_xgboost_options_are_accepted() {
+        let params = train_params(&["--min-child-weight", "0", "--reg-lambda", "0"]).unwrap();
+        assert_eq!((params.min_child_weight, params.reg_lambda), (0.0, 0.0));
+        // XGBoost's CPU trainer takes 0 for no limit on leaves and depth, or both.
+        for (leaves, depth) in [("0", "30"), ("0", "31"), ("7", "0"), ("0", "0")] {
+            let params = train_params(&["--max-leaves", leaves, "--max-depth", depth]).unwrap();
+            assert_eq!(params.max_leaves.to_string(), leaves);
+            assert_eq!(params.max_depth.to_string(), depth);
+        }
+        // Beyond XGBoost's 32-bit parameters, the command line fails.
+        let base = ["train", "--tables", "a", "b", "--variant-type", "snp", "-o", "m"];
+        for option in ["--max-leaves", "--max-depth"] {
+            let error = parse(&[&base[..], &[option, "2147483648"]].concat()).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{option}");
+            assert!(parse(&[&base[..], &[option, "2147483647"]].concat()).is_ok(), "{option}");
+        }
     }
 
     #[rstest]

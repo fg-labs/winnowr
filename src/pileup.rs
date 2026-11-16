@@ -136,9 +136,7 @@ impl std::str::FromStr for PileupOptions {
         if options.high_mapq < 2 {
             bail!("the high MAPQ bin must start at 2 or more, so that the low bin is not empty");
         }
-        if options.flank == 0 {
-            bail!("the flank must be at least 1");
-        }
+        crate::strlen::check_flank(options.flank)?;
         Ok(options)
     }
 }
@@ -625,6 +623,8 @@ mod tests {
         for bad in ["mapq1", "flank0", "bq", "other", "mapqx"] {
             assert!(bad.parse::<PileupOptions>().is_err(), "{bad}");
         }
+        let error = "flank10001".parse::<PileupOptions>().unwrap_err();
+        assert_eq!(error.to_string(), "the flank must be between 1 and 10000, got 10001");
         assert_eq!(
             (default.bin(0), default.bin(1), default.bin(19), default.bin(20)),
             (0, 1, 1, 2)

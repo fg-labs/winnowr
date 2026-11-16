@@ -3,7 +3,9 @@
 Scoring needs trained models: winnowr distributes none, so [train your own](quick-training.md)
 first. It also needs, for the sample:
 
-- the single-sample VCF from HaplotypeCaller (gVCF mode), indexed,
+- the single-sample VCF from HaplotypeCaller (gVCF mode), indexed, with every FILTER, INFO and
+  FORMAT tag of its records declared in its header (`extract` and `score` stop with an error naming
+  the record otherwise),
 - the gVCF it was genotyped from, indexed, when the VCF lacks the raw annotations (RAW_MQandDP,
   QUALapprox, VarDP, AS_RAW_MQ),
 - the region BEDs the models were trained with, under the same names, plus GIAB's GRCh38
@@ -42,7 +44,8 @@ winnowr score --vcf sample.vcf.gz --gvcf sample.g.vcf.gz --models snp.winnowr.js
 ```
 
 `strlen` and `pileup` measure the autosomes `chr1` to `chr22` by default; `--regions` takes other
-contigs or ranges (e.g. `chr22:20000000-30000000`).
+contigs or ranges (e.g. `chr22:20000000-30000000`). A range that starts past its contig's end is an
+error.
 
 `sample.winnowr.vcf.gz` holds every record of `sample.vcf.gz`: dropped calls get FILTER
 `WinnowrDrop`, and scored calls get the models' probabilities in INFO.

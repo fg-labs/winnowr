@@ -157,6 +157,17 @@ fn fit<S: CvSample>(
     num_class: usize,
     threads: NonZeroUsize,
 ) -> Result<Booster> {
+    fit_holding_out(samples, features, params, num_class, threads).map(|(booster, _)| booster)
+}
+
+/// Fits a booster as [`fit`] does, and returns the number of calls held out for early stopping.
+fn fit_holding_out<S: CvSample>(
+    samples: &[(&S, Option<&[bool]>)],
+    features: &[String],
+    params: &TrainingParams,
+    num_class: usize,
+    threads: NonZeroUsize,
+) -> Result<(Booster, usize)> {
     let mut values = Vec::new();
     let mut classes = Vec::new();
     let mut is_validation = Vec::new();
@@ -185,7 +196,16 @@ fn fit<S: CvSample>(
             }
         }
     }
-    fit_booster(&values, &classes, &is_validation, features, params, num_class, threads)
+    let held_out = is_validation.iter().filter(|&&v| v).count();
+    let booster =
+        fit_booster(&values, &classes, &is_validation, features, params, num_class, threads)?;
+    Ok((booster, held_out))
+}
+
+/// Whether the final model is refit (see [`fit_final`]): only when asked and early stopping held
+/// calls out, as otherwise the refit would repeat the fit on the same calls.
+fn refits(params: &TrainingParams, held_out: usize) -> bool {
+    params.refit_final && params.validation_fraction > 0.0 && held_out > 0
 }
 
 /// Fits the final model on every call of the samples: early-stopping as [`fit`] does, then, with
@@ -203,8 +223,8 @@ fn fit_final<S: CvSample>(
     threads: NonZeroUsize,
 ) -> Result<Booster> {
     let all: Vec<(&S, Option<&[bool]>)> = samples.iter().map(|s| (s, None)).collect();
-    let booster = fit(&all, features, params, num_class, threads)?;
-    if !params.refit_final || params.validation_fraction <= 0.0 {
+    let (booster, held_out) = fit_holding_out(&all, features, params, num_class, threads)?;
+    if !refits(params, held_out) {
         return Ok(booster);
     }
     let rounds = booster.boosted_rounds()?;
@@ -1238,6 +1258,17 @@ mod tests {
         let expected = fit(&all, &features, &every_call, 3, threads(1)).unwrap();
         assert_eq!(refitted.to_json().unwrap(), expected.to_json().unwrap());
         assert_ne!(refitted.to_json().unwrap(), stopped.to_json().unwrap());
+    }
+
+    #[test]
+    fn the_final_model_is_refit_only_when_calls_were_held_out() {
+        let params = TrainingParams { refit_final: true, ..TrainingParams::default() };
+        assert!(params.validation_fraction > 0.0);
+        assert!(refits(&params, 1));
+        // A validation fraction that held no block out stopped nothing early.
+        assert!(!refits(&params, 0));
+        assert!(!refits(&TrainingParams { validation_fraction: 0.0, ..params }, 1));
+        assert!(!refits(&TrainingParams { refit_final: false, ..params }, 1));
     }
 
     #[test]

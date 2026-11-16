@@ -194,6 +194,10 @@ pub const FLANK: u64 = 5;
 /// The MAPQ a read needs to be measured (by default).
 pub const MIN_MAPQ: u8 = 20;
 
+/// The largest flank (bp) of the strlen and pileup settings: far beyond any read's useful
+/// anchor, and small enough that tract windows cannot overflow.
+pub const MAX_FLANK: u64 = 10_000;
+
 /// Which reads measure a tract, and how far outside it they must align.
 ///
 /// Written as comma-separated settings (see [`fmt::Display`] and [`std::str::FromStr`]), e.g.
@@ -275,9 +279,7 @@ impl std::str::FromStr for StrlenOptions {
                 );
             }
         }
-        if options.flank == 0 {
-            bail!("the flank must be at least 1");
-        }
+        check_flank(options.flank)?;
         Ok(options)
     }
 }
@@ -421,8 +423,11 @@ pub fn tract_of_record<S: AsRef<[u8]>>(
         if alt == b"*" || alt == b"." || alt.first() == Some(&b'<') {
             continue;
         }
+        // VCF bases may be in either case; match them against the upper-case context.
         let (offset, deleted, inserted) = crate::alleles::trim_alleles(reference, alt);
-        if let Some(tract) = find_tract(&context, (p0 - lo) as usize + offset, deleted, inserted) {
+        let (deleted, inserted) = (deleted.to_ascii_uppercase(), inserted.to_ascii_uppercase());
+        if let Some(tract) = find_tract(&context, (p0 - lo) as usize + offset, &deleted, &inserted)
+        {
             return Some(RepeatTract { start: lo + tract.start, end: lo + tract.end, ..tract });
         }
     }
@@ -445,6 +450,18 @@ pub struct TractEvidence {
     pub frac_mapq_lt20: Option<f64>,
     /// The mean base quality of the tract bases in the measured reads.
     pub mean_tract_bq: Option<f64>,
+}
+
+/// Checks a flank of the strlen or pileup settings is between 1 and [`MAX_FLANK`].
+///
+/// # Errors
+///
+/// Returns an error if it is not.
+pub(crate) fn check_flank(flank: u64) -> Result<()> {
+    if !(1..=MAX_FLANK).contains(&flank) {
+        bail!("the flank must be between 1 and {MAX_FLANK}, got {flank}");
+    }
+    Ok(())
 }
 
 /// The 0-based, half-open span a read must overlap to count for a tract: the tract with `flank`
@@ -1102,6 +1119,12 @@ mod tests {
         // Lowercase (soft-masked) reference bases are matched as uppercase.
         let lower = reference.to_ascii_lowercase();
         assert_eq!(tract_of_record(lower.as_bytes(), pos, b"CA", &["C"]), Some(a_tract(start)));
+        // So are lowercase allele bases, inserted or deleted.
+        let upper = tract_of_record(reference.as_bytes(), pos, b"C", &["CAA"]);
+        assert_eq!(upper, Some(a_tract(start)));
+        assert_eq!(tract_of_record(reference.as_bytes(), pos, b"c", &["caa"]), upper);
+        assert_eq!(tract_of_record(reference.as_bytes(), pos, b"C", &["CaA"]), upper);
+        assert_eq!(tract_of_record(reference.as_bytes(), pos, b"ca", &["c"]), Some(a_tract(start)));
     }
 
     #[test]
@@ -1266,6 +1289,12 @@ mod tests {
         assert_eq!(options.flank_of(&a_tract(80)), 5);
         assert!("mapq".parse::<StrlenOptions>().is_err());
         assert!("flank0".parse::<StrlenOptions>().is_err());
+        assert_eq!("flank10000".parse::<StrlenOptions>().unwrap().flank, MAX_FLANK);
+        let error = "flank18446744073709551615".parse::<StrlenOptions>().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the flank must be between 1 and 10000, got 18446744073709551615"
+        );
         assert!("other".parse::<StrlenOptions>().is_err());
     }
 

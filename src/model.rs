@@ -746,6 +746,16 @@ pub fn fit_booster<S: AsRef<str>>(
         labels.len(),
         100.0 * held_out as f64 / labels.len() as f64
     );
+    if held_out == 0 && params.validation_fraction > 0.0 {
+        log::warn!(
+            "no {} bp block of the {} calls was held out for early stopping (too few blocks for \
+             a validation fraction of {}), so all {} rounds are kept",
+            params.validation_block_size,
+            labels.len(),
+            params.validation_fraction,
+            params.max_rounds
+        );
+    }
     let subset = |validation: bool| -> Result<DMatrix> {
         let rows: Vec<usize> =
             (0..labels.len()).filter(|&i| is_validation[i] == validation).collect();

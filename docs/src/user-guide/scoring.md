@@ -26,12 +26,12 @@ repeat-length or pileup features need `--strlen` or `--pileup` tables, or `--ali
 - `genotyper` (the default): drop calls with P(drop) at or above `t_drop`, flip the remaining calls
   with P(flip) at or above `t_flip`, and, for re-genotype models, re-genotype the calls still
   remaining that the repeat-length caller disagrees with when P(re-genotype) is at or above
-  `t_regenotype`. Only a `0/1` or `1/1` call can be flipped, and only a call whose length-caller
-  genotype differs from its own, and can be written, can be re-genotyped. A call that cannot take an
-  action goes on to the next: e.g. a `1/2` call with P(flip) at or above `t_flip` is not flipped,
-  but may be re-genotyped, else is left alone or, for an indel, dropped by the keep fallback when
-  P(keep) is below 0.5. That order is the threshold rule; the experimental `--expected-f1` (below)
-  acts on probabilities above 0.5 instead.
+  `t_regenotype`. Only a `0/1` or `1/1` call can be flipped, and only a call with a diploid genotype
+  (not `./.` or haploid) whose length-caller genotype differs from its own, and can be written, can
+  be re-genotyped. A call that cannot take an action goes on to the next: e.g. a `1/2` call with
+  P(flip) at or above `t_flip` is not flipped, but may be re-genotyped, else is left alone or, for
+  an indel, dropped by the keep fallback when P(keep) is below 0.5. That order is the threshold
+  rule; the experimental `--expected-f1` (below) acts on probabilities above 0.5 instead.
 - `veto`: drop calls whose P(drop) + P(flip) (+ P(re-genotype)) is at or above `t_drop`: the call
   as made is wrong. Never flip or re-genotype.
 
@@ -63,9 +63,11 @@ Two more options are experimental:
 
 - `--expected-f1 <snp|indel>`: the genotype models of these variant types take the action of
   greatest expected F1 gain in place of the keep fallback. In genotyper mode this replaces their
-  thresholds: flip when P(flip) is above 0.5, else re-genotype when P(re-genotype) is above 0.5,
-  else drop when P(keep) is below 0.5. In veto mode `t_drop` still applies: a call is dropped when
-  P(drop) + P(flip) (+ P(re-genotype)) reaches `t_drop`, or when P(keep) is below 0.5.
+  thresholds: drop an indel call outside the confident regions when P(drop) reaches
+  `--outside-indel-t-drop`, else flip when P(flip) is above 0.5, else re-genotype when
+  P(re-genotype) is above 0.5, else drop when P(keep) is below 0.5. In veto mode `t_drop` still
+  applies: a call is dropped when P(drop) + P(flip) (+ P(re-genotype)) reaches `t_drop`, or when
+  P(keep) is below 0.5.
 - `--abstain-actions <flip|regenotype|promote>`: withhold these actions from calls outside the
   confident regions.
 
@@ -76,9 +78,10 @@ table), and warn that other names are ignored.
 
 ## The output VCF
 
-`score` writes every record of the input VCF. The output format follows the `-o`
-suffix, in any case: `.vcf.gz` (or `.vcf.bgz`) is bgzipped and tabix-indexed, `.bcf` is CSI-indexed
-BCF, and anything else is plain-text VCF.
+`score` writes every record of the input VCF, including any at POS 0, which are not read or scored
+(`extract` and `score` warn about them). The output format follows the `-o` suffix, in any case:
+`.vcf.gz` (or `.vcf.bgz`) is bgzipped and tabix-indexed, `.bcf` is CSI-indexed BCF, and anything
+else is plain-text VCF.
 
 Genotype models score PASS calls of their variant type; promote models score the non-PASS calls of
 their variant type that do not overlap a PASS call. Other records are written unchanged. A scored

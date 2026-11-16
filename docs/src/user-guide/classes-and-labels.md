@@ -28,8 +28,20 @@ Training labels come from the hap.py output VCF given to `extract --happy`, from
 Calls that hap.py does not label TP or FP (e.g. outside the truth set's confident regions) are left
 out of training and evaluation. The truth FNs are counted too, since F1 needs them.
 
-hap.py splits a multi-allelic call into one record per ALT allele. `extract` labels such a call
-from all of its records: it is *keep* only when every record of it is a TP.
+hap.py splits a multi-allelic call into one record per ALT allele. `extract` labels such a call from
+all of its records: it is *keep* only when every record of it is a TP. hap.py also trims a padded
+call, where `extract` looks for its label: a padded SNP (e.g. `TTAGA>TTCGA`) to its differing base,
+and a padded indel (e.g. `ACGT>ACT`) to the base before its trimmed alleles (`CG>C`, one base on).
+
+A record split from a PASS call, or trimmed from a PASS padded call, labels that call even when a
+non-PASS call is at the record's position, since hap.py run with `--pass-only` labels only PASS
+calls. If the hap.py VCF also labels non-PASS calls (hap.py ran without `--pass-only`), a label at a
+non-PASS call's position stays that call's, as does a record split from a non-PASS call.
+
+The hap.py VCF does not record whether hap.py ran with `--pass-only`, so `extract` infers it: it
+takes hap.py to have run without `--pass-only` only if some label at a non-PASS call's position
+cannot be a PASS call's. Otherwise it joins the labels as if hap.py ran with `--pass-only`, and a
+non-PASS call's label may go to a PASS call. Run hap.py with `--pass-only` for reliable labels.
 
 ## Flips that a flip cannot fix
 

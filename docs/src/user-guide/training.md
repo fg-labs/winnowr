@@ -56,13 +56,16 @@ when the validation log-loss has not improved for `--early-stopping-rounds` (20)
 neighbouring calls, do not leak into training. `--validation-fraction 0` turns early stopping
 off.
 
-The final model, fitted on every training sample, is then refitted on all of its calls, the
-held-out blocks included, for the number of rounds its early stopping chose. `--refit-final false`
-keeps the early-stopped fit. The refit has no effect without early stopping.
+The final model, fitted on every training sample, is then refitted on all of its calls, the held-out
+blocks included, for the number of rounds its early stopping chose. `--refit-final false` keeps the
+early-stopped fit. The refit has no effect without early stopping, and is skipped, with a warning,
+when the validation fraction holds out no block.
 
 The other XGBoost parameters (`--learning-rate`, `--max-leaves`, `--max-depth`,
 `--min-child-weight`, `--reg-lambda`, `--seed`) have regularized defaults; see
-[train](../tools/train.md).
+[train](../tools/train.md). `train` checks them before reading the tables: `--learning-rate` must be
+positive, `--min-child-weight` and `--reg-lambda` at least 0, all finite, and `--max-leaves` and
+`--max-depth` at most 2147483647, with 0 for no limit.
 
 ## Features
 

@@ -32,7 +32,8 @@ Options:
           P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
           model's veto threshold is compared with), in place of the model's threshold, even when
           that is higher (none: the model's threshold). The keep fallback (--keep-fallback) still
-          drops them when P(keep) is below 0.5 [default: 0.6]
+          drops them when P(keep) is below 0.5. With --expected-f1 it applies too, before a flip or
+          re-genotype [default: 0.6]
       --regions <NAME=PATH>...
           The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
           with these. Only the confident regions (notinalldifficultregions) are read; the models'
