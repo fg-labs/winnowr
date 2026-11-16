@@ -299,6 +299,25 @@ gh release upload v<version> winnowr-<version>-src.tar.gz --repo fg-labs/winnowr
 gh release upload v<version> winnowr-<version>-src.tar.gz.sha256 --repo fg-labs/winnowr
 ```
 
+### Release notes preamble
+
+Once the `release` workflow has created the GitHub release, put a short, hand-written preamble above its generated notes, ending with a `---` line. The preamble should have:
+
+* A heading, `## X.Y.Z: <the release's main changes in a few words>`.
+* A paragraph on what the release is for and whether outputs and models change. Say how this was checked, e.g. by running the same `strlen`, `extract` and `score` commands on a small input with the previous release's binary (from its GitHub release) and this one, and comparing the outputs' checksums.
+* Sections on what matters to users, starting with anything that can stop a pipeline (new errors, removed or renamed options).
+* A "Should I upgrade?" section saying who should upgrade and what to check first.
+
+To add it, save the preamble as `preamble.md`, then run:
+
+```console
+tmp=$(mktemp -d)
+gh release view v<version> --repo fg-labs/winnowr --json body --jq .body > "$tmp/notes.md" \
+  && test -s "$tmp/notes.md" \
+  && cat preamble.md "$tmp/notes.md" > "$tmp/body.md" \
+  && gh release edit v<version> --repo fg-labs/winnowr --notes-file "$tmp/body.md"
+```
+
 ### Release credentials
 
 The `publish` workflow needs:
