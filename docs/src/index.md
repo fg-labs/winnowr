@@ -1,27 +1,35 @@
 # winnowr
 
-winnowr is machine-learned genotyping and filtering of germline small-variant calls. It
-post-processes single-sample GATK HaplotypeCaller calls (made in gVCF mode, e.g. with
-`--dragen-mode`) and writes the same VCF with some calls filtered, some promoted to PASS and some
-re-genotyped.
+<!-- The opening below is repeated in README.md: change both together. -->
 
-For each PASS call, an XGBoost model for its variant type (SNP or indel) predicts one of three
-classes: *drop* (the site is really `0/0`), *keep* (the call is right) or *flip* (the alleles are
-right but the zygosity is wrong). An optional *promote* model per variant type scores the non-PASS
-calls. Indel models can also use the lengths of repeat tracts measured in the reads, and re-genotype
-a call to the genotype those lengths support. Models of either variant type can also use counts of
-each allele's reads by mapping quality (MAPQ). See [Classes and
-labels](user-guide/classes-and-labels.md).
+**winnowr post-processes single-sample GATK HaplotypeCaller VCFs with models you train on
+truth-labelled samples.**
 
-Each model's thresholds are chosen by cross-validation on the training samples, to raise F1, and
-are stored in the model file with it. By default `score` also drops indel calls whose P(keep) is
-below 0.5, and uses a drop threshold of 0.6 for indel calls outside GIAB's confident regions. See
-[Training](user-guide/training.md) and [Scoring](user-guide/scoring.md).
+**What sets winnowr apart**
 
-No trained models are distributed. You train your own from samples with a truth set, such as the
-[GIAB](https://www.nist.gov/programs-projects/genome-bottle) benchmarks, labelled by
+- **Works on a single sample:** no cohort or joint calling.
+- **Fixes calls, not just filters them:** it can drop false calls, flip wrong zygosity,
+  re-genotype indels in repeats, and rescue true calls that were filtered.
+- **Uses evidence the VCF lacks:** repeat-tract lengths and reads below HaplotypeCaller's MAPQ
+  cut-off.
+- **Tuned for F1:** cross-validation against your truth data picks each model's thresholds.
+- **Drops in after HaplotypeCaller:** no re-calling.
+
+No trained models are distributed: you train them on samples with a truth set, such as
+[GIAB](https://www.nist.gov/programs-projects/genome-bottle), labelled by
 [hap.py](https://github.com/Illumina/hap.py). The
-[training quick start](getting-started/quick-training.md) lists the steps.
+[training quick start](getting-started/quick-training.md) lists the steps, and
+[Classes and labels](user-guide/classes-and-labels.md) explains what each action means.
+
+The VCF must be genotyped from a HaplotypeCaller gVCF (e.g. one made with `--dragen-mode`). `score`
+and `extract` also take that gVCF (`--gvcf`), and read it only when the VCF lacks the raw
+annotations.
+
+By default `score` also applies two indel rules that are fixed, not chosen by cross-validation. An
+indel call that the thresholds leave alone is dropped when its P(keep) is below 0.5. Given GIAB's
+confident regions (`--regions notinalldifficultregions=...`), an indel call outside them is dropped
+at a threshold of 0.6, in place of the model's drop threshold. See
+[Scoring](user-guide/scoring.md).
 
 > **Demonstration code only.** winnowr is a research prototype, shared to illustrate an approach
 > to machine-learned filtering and genotyping of germline variant calls. It is not supported, has

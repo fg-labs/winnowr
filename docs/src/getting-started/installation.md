@@ -19,11 +19,13 @@ cargo install --locked --path .
 `--recursive` fetches the vendored XGBoost sources (a git submodule). In a clone made without it,
 run `git submodule update --init --recursive`.
 
-XGBoost, htslib and the OpenMP runtime are built from source and linked statically, so the binary
-needs nothing installed alongside it. A source build on a Linux distribution whose `libgomp.a` is
-not position-independent (e.g. RHEL, Amazon Linux) links the shared libgomp instead, with a
-warning, unless built with `RUSTFLAGS='-C relocation-model=static'` and an explicit `--target`
-(see `xgboost/build.rs`).
+XGBoost and htslib are built from source and linked statically, with the OpenMP runtime's static
+library (`libomp.a` from Homebrew on macOS, GCC's `libgomp.a` on Linux), so none of them needs
+installing alongside the binary; it still uses the system's C and C++ runtime libraries (e.g.
+`libstdc++` on Linux). A source build on a Linux distribution whose `libgomp.a` is not
+position-independent (e.g. RHEL, Amazon Linux) links the shared libgomp instead, with a warning,
+unless built with `RUSTFLAGS='-C relocation-model=static'` and an explicit `--target`; so does any
+build whose static-link test fails (see `xgboost/build.rs`).
 
 [DEVELOPING.md](https://github.com/fg-labs/winnowr/blob/main/docs/DEVELOPING.md) covers the build
 in more detail, including `WINNOWR_LIBOMP_PREFIX` for a libomp installed elsewhere
