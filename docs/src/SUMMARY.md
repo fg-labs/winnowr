@@ -1,0 +1,31 @@
+# Summary
+
+<!-- The `- [Title]()` entries are mdBook draft chapters: section headers without a page. -->
+
+[Home](index.md)
+
+- [Getting started]()
+  - [Installation](getting-started/installation.md)
+  - [Quick start: scoring](getting-started/quick-scoring.md)
+  - [Quick start: training](getting-started/quick-training.md)
+  - [Coming from the Python version](getting-started/python-version.md)
+- [User guide]()
+  - [Classes and labels](user-guide/classes-and-labels.md)
+  - [Training](user-guide/training.md)
+  - [Scoring](user-guide/scoring.md)
+  - [Repeat-length features](user-guide/repeat-length.md)
+  - [Pileup features](user-guide/pileup.md)
+  - [Evaluating and stratifying](user-guide/evaluating.md)
+  - [Model files](user-guide/model-files.md)
+  - [Performance tuning](user-guide/performance.md)
+- [Tool reference]()
+  - [Overview](tools/overview.md)
+  - [strlen](tools/strlen.md)
+  - [pileup](tools/pileup.md)
+  - [extract](tools/extract.md)
+  - [subset](tools/subset.md)
+  - [train](tools/train.md)
+  - [evaluate](tools/evaluate.md)
+  - [stratify](tools/stratify.md)
+  - [score](tools/score.md)
+- [Developer docs](developers.md)

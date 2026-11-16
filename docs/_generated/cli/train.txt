@@ -1,0 +1,143 @@
+Train a genotype or promote model from labelled feature tables.
+
+The model depends on the number of threads (-t, else OMP_NUM_THREADS), as XGBoost's histogram sums
+do: training again with the same tables, options and threads gives the same model.
+
+Usage: winnowr train [OPTIONS] --tables <TABLES>... --variant-type <VARIANT_TYPE> --output <OUTPUT>
+
+Options:
+  -t, --threads <THREADS>
+          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+
+      --tables <TABLES>...
+          Labelled feature tables (from `extract --happy`), one per training sample: at least two,
+          of distinct samples
+
+      --variant-type <VARIANT_TYPE>
+          The variant type to train for (snp or indel)
+
+  -o, --output <OUTPUT>
+          The model file to write (`.winnowr.json` is appended if missing)
+
+      --task <TASK>
+          genotype trains on PASS calls (drop/keep/flip; needs hap.py labels); promote trains on
+          non-PASS calls (stay/promote/promote+flip; needs tables extracted with --truth-vcf)
+
+          [default: genotype]
+
+      --no-neighbourhood
+          Leave out the multi-site neighbourhood features
+
+      --repeat-length
+          Use the repeat-length features (indel genotype models; tables extracted with `extract
+          --strlen`): fits a stutter model on the training samples' truth-homozygous calls, saved
+          with the model, and adds read-length histogram and length-caller features. Each
+          cross-validation fold refits the stutter model on its training samples only
+
+      --regenotype
+          Add the re-genotype class (implies --repeat-length): calls whose genotype a het <-> hom
+          flip does not fix but the length caller's genotype does; its threshold is chosen by
+          cross-validation with the genotyper's
+
+      --pileup-features
+          Use the pileup features (tables extracted with `extract --pileup`): the reads of each
+          call's reference and alternate alleles at MAPQ 0, at low MAPQ and at high MAPQ, counted at
+          any MAPQ, and fractions of them. The pileup settings are recorded in the model, which then
+          needs pileup evidence measured the same way to score
+
+      --unfixable-flips <UNFIXABLE_FLIPS>
+          What genotype training does with flip labels that a het <-> hom flip cannot fix (an
+          allele-match FP that is not `0/1` or `1/1`, or whose flip is not the truth genotype, e.g.
+          a call missing the second allele of a het-alt truth): flip trains them as flips, as hap.py
+          labels them; drop trains them as drops; exclude leaves them out of the fits. They are
+          scored as FPs in cross-validation either way. Recorded in the model
+
+          [default: flip]
+
+      --sample-groups <SAMPLE_GROUPS>...
+          Samples to hold out together in cross-validation, one comma-separated group per value
+          (e.g. a trio: HG005,HG006,HG007). Samples not in a group are held out alone. Unused with
+          --cv-folds chromosomes
+
+      --cv-folds <CV_FOLDS>
+          How the cross-validation that chooses the thresholds holds out calls: samples holds out
+          each sample group (--sample-groups) in turn; chromosomes holds out groups of whole
+          chromosomes (--chromosome-folds groups of about equal calls) from every sample at once, so
+          every fold fits every sample, and related samples' calls at the same site are held out
+          together. Recorded in the model
+
+          [default: samples]
+          [possible values: samples, chromosomes]
+
+      --chromosome-folds <CHROMOSOME_FOLDS>
+          The number of chromosome groups (folds) with --cv-folds chromosomes
+
+          [default: 5]
+
+      --refit-final [<REFIT_FINAL>]
+          Refit the final model on all its training calls, those held out for early stopping
+          included, for the rounds its early stopping chose. Has no effect without early stopping (a
+          zero --validation-fraction). Recorded in the model
+
+          [default: true]
+          [possible values: true, false]
+
+      --grid <GRID>...
+          Candidate thresholds: t_drop and t_flip for genotype models, t_promote and t_flip for
+          promote models, each a probability in [0, 1]. "Never act" is always added [default:
+          built-in grids from 0.2 up]
+
+      --learning-rate <LEARNING_RATE>
+          The XGBoost learning rate (eta)
+
+          [default: 0.05]
+
+      --max-leaves <MAX_LEAVES>
+          The maximum leaves per tree
+
+          [default: 31]
+
+      --max-depth <MAX_DEPTH>
+          The maximum tree depth (0 = unlimited, bounded by --max-leaves)
+
+          [default: 0]
+
+      --min-child-weight <MIN_CHILD_WEIGHT>
+          The minimum hessian sum per leaf
+
+          [default: 10]
+
+      --reg-lambda <REG_LAMBDA>
+          L2 regularization of leaf weights
+
+          [default: 1]
+
+      --max-rounds <MAX_ROUNDS>
+          The maximum boosting rounds
+
+          [default: 3000]
+
+      --early-stopping-rounds <EARLY_STOPPING_ROUNDS>
+          Early-stopping patience (rounds) on the validation split
+
+          [default: 20]
+
+      --validation-fraction <VALIDATION_FRACTION>
+          About the fraction of training calls held out for early stopping (0 disables it). Whole
+          genomic blocks (--validation-block-size) are held out, from every sample, so that calls at
+          the same site in other samples, and neighbouring calls, do not leak into training
+
+          [default: 0.1]
+
+      --validation-block-size <VALIDATION_BLOCK_SIZE>
+          The size (bp) of the genomic blocks held out together for early stopping
+
+          [default: 10000]
+
+      --seed <SEED>
+          The random seed (validation split and XGBoost; at most 2^63 - 1, as XGBoost takes it)
+
+          [default: 1]
+
+  -h, --help
+          Print help (see a summary with '-h')

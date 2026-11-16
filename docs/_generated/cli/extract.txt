@@ -1,0 +1,35 @@
+Extract a feature table for a sample's calls, optionally labelled with truth
+
+Usage: winnowr extract [OPTIONS] --vcf <VCF> --output <OUTPUT>
+
+Options:
+  -t, --threads <THREADS>       The number of worker threads to use [default: OMP_NUM_THREADS when
+                                set, else 4]
+      --vcf <VCF>               The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g.
+                                --dragen-mode)
+  -o, --output <OUTPUT>         The feature table to write (Parquet)
+      --gvcf <GVCF>             The indexed gVCF the VCF was genotyped from. It supplies the raw
+                                annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) when the VCF
+                                lacks them, and is not read otherwise
+      --regions <NAME=PATH>...  Region BEDs to flag calls in, as NAME=PATH (e.g.
+                                segdups=segdups.bed.gz). The names must match those a model was
+                                trained with
+      --contigs <CONTIGS>...    The contigs to extract [default: chr1 chr2 chr3 chr4 chr5 chr6 chr7
+                                chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18
+                                chr19 chr20 chr21 chr22]
+      --sample <SAMPLE>         The sample name to record [default: the VCF's sample]
+      --strlen <STRLEN>...      Repeat-tract read-length tables from `winnowr strlen` (e.g. one per
+                                shard), joined as repeat-length features of indel calls; needed to
+                                train or apply models that use them
+      --pileup <PILEUP>...      Allele read count tables from `winnowr pileup` (e.g. one per shard),
+                                joined as pileup features of SNP and indel calls; needed to train or
+                                apply models that use them
+      --happy <HAPPY>           The hap.py output VCF for this sample (run with --engine vcfeval
+                                --pass-only), which labels PASS calls; needed for training and
+                                evaluation tables
+      --truth-vcf <TRUTH_VCF>   The indexed truth VCF (e.g. a GIAB benchmark); with --truth-bed and
+                                --happy, labels non-PASS calls for training promote models
+      --truth-bed <TRUTH_BED>   The truth confident-regions BED
+      --reference <REFERENCE>   The indexed reference FASTA used to left-align indels when matching
+                                non-PASS calls to the truth; without it, alleles are only trimmed
+  -h, --help                    Print help

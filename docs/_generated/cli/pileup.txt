@@ -1,0 +1,25 @@
+Count the reads of each call's alleles by MAPQ, at any MAPQ (pileup evidence)
+
+Usage: winnowr pileup [OPTIONS] --vcf <VCF> --alignments <ALIGNMENTS> --reference <REFERENCE> --output <OUTPUT>
+
+Options:
+  -t, --threads <THREADS>        The number of worker threads to use [default: OMP_NUM_THREADS when
+                                 set, else 4]
+      --vcf <VCF>                The indexed VCF of the calls (the VCF given to `extract` or
+                                 `score`)
+      --alignments <ALIGNMENTS>  The indexed BAM or CRAM of the sample's reads
+      --reference <REFERENCE>    The indexed, uncompressed reference FASTA (also used to decode
+                                 CRAM)
+  -o, --output <OUTPUT>          The table to write (`.gz` or `.bgz`, in any case, is
+                                 BGZF-compressed)
+      --regions <REGIONS>...     The regions to measure, as chrom or chrom:start-end (1-based,
+                                 inclusive) [default: chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9
+                                 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20
+                                 chr21 chr22]
+      --settings <SETTINGS>      How reads are counted, as comma-separated settings over the
+                                 defaults: mapqN (the lowest MAPQ of the high bin), bqN (the minimum
+                                 base quality of a SNP base) and flankN (the aligned flank bases an
+                                 indel read needs on each side of the repeat tract). The settings
+                                 are recorded in the table; a model scores only tables measured as
+                                 its training tables were [default: mapq20,bq10,flank5]
+  -h, --help                     Print help

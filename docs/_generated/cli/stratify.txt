@@ -1,0 +1,102 @@
+Report models' decisions, outcomes, F1 and P(keep) calibration by benchmark stratum.
+
+Each call is in one stratum by whether its REF span is inside each of two truth sets' confident
+regions: both, <second>-only, <first>-only or neither. Calls are scored as `score` does. Writes
+<output>.strata.tsv (actions, outcomes and F1 of the labelled calls per truth set and stratum; the
+`all` rows match `evaluate`), <output>.rates.tsv (action rates of every scored call per stratum,
+variant type and chromosome, with no truth needed) and <output>.calibration.tsv (binned P(keep)
+against the observed keep rate).
+
+With --stratification or --report-region (e.g. GIAB stratification BEDs), also writes the same
+metrics within each named region, as hap.py's --stratification does: a call or truth FN is in a
+region if its REF span overlaps it, and regions may overlap. Each truth set is scored within its own
+confident regions. Writes <output>.regions.strata.tsv, <output>.regions.calibration.tsv and
+<output>.regions.rates.tsv (action rates per region and benchmark stratum, including the parts
+outside the truth sets).
+
+Usage: winnowr stratify [OPTIONS] --models <MODELS>... --truth-names <FIRST> <SECOND> --tables <FIRST> <SECOND> --truth-beds <FIRST> <SECOND> --happy <FIRST> <SECOND> --output <OUTPUT>
+
+Options:
+      --models <MODELS>...
+          The model files: at most one genotype and one promote model per variant type
+
+  -t, --threads <THREADS>
+          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+
+      --truth-names <FIRST> <SECOND>
+          The names of the two truth sets (e.g. v421 v5q), in the order of the options below
+
+      --tables <FIRST> <SECOND>
+          The sample's labelled feature tables (from `extract --happy`, plus --truth-vcf for promote
+          models), one per truth set, extracted from the same VCF
+
+      --truth-beds <FIRST> <SECOND>
+          The truth sets' confident-regions BEDs
+
+      --happy <FIRST> <SECOND>
+          The hap.py output VCFs the tables were labelled from (for the truth FNs per stratum)
+
+      --mode <MODE>
+          How genotype models act: genotyper (drop, flip and re-genotype) or veto (drop only)
+
+          [default: genotyper]
+
+      --keep-fallback <KEEP_FALLBACK>...
+          Variant types whose genotype model also drops the calls its thresholds leave alone when
+          P(keep) is below 0.5 (none, alone: no variant type)
+
+          [default: indel]
+          [possible values: snp, indel, none]
+
+      --expected-f1 <EXPECTED_F1>...
+          Experimental: variant types whose genotype model takes the action of greatest expected F1
+          gain instead of using its thresholds (and in place of --keep-fallback): flip or
+          re-genotype when its probability is above 0.5, else drop when P(keep) is below 0.5
+
+      --abstain-actions <ABSTAIN_ACTIONS>...
+          Experimental: actions withheld from calls outside the confident regions (--regions
+          notinalldifficultregions=PATH; calls whose REF span is not inside it are "outside"); none,
+          alone: no action
+
+          [default: none]
+          [possible values: flip, regenotype, promote, none]
+
+      --outside-indel-t-drop <P|none>
+          The drop threshold of indel calls outside the confident regions: they are dropped when
+          P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
+          model's veto threshold is compared with), in place of the model's threshold, even when
+          that is higher (none: the model's threshold). The keep fallback (--keep-fallback) still
+          drops them when P(keep) is below 0.5
+
+          [default: 0.6]
+
+      --regions <NAME=PATH>...
+          The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
+          with these. Only the confident regions (notinalldifficultregions) are read; the models'
+          region features come from the table. Not reported within: see --report-region
+
+  -o, --output <OUTPUT>
+          The prefix of the reports to write (<output>.strata.tsv, <output>.rates.tsv and
+          <output>.calibration.tsv)
+
+      --calls <CALLS>
+          Also write each scored call's stratum, labels, probabilities and action (gzipped TSV)
+
+      --labelled-calls <DIR>
+          Also write the labelled PASS calls as the genotype models see them (features, length-call
+          features, re-genotype columns and labels) to <dir>/<sample>.<truth>.<vt>.parquet
+
+      --stratification <STRATIFICATION>
+          A hap.py stratification manifest of regions to also report within: NAME<TAB>PATH lines,
+          with paths relative to the manifest's directory
+
+      --report-region <NAME=PATH>...
+          Regions to also report within, as NAME=PATH (BED, optionally gzipped), after those of
+          --stratification
+
+      --contigs <CONTIGS>...
+          Report only the calls and truth FNs on these contigs (e.g. the chromosomes held out from a
+          model's training) [default: all the table's contigs]
+
+  -h, --help
+          Print help (see a summary with '-h')

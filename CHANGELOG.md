@@ -5,7 +5,9 @@ All notable changes to this project are documented in this file.
 ## [0.1.0] - 2026-11-15
 
 The first release of the Rust rewrite of winnowr. Its outputs and models differ from the Python
-version's by design; see the README for the changes in the defaults.
+version's by design; see
+[Coming from the Python version](https://winnowr.readthedocs.io/en/latest/getting-started/python-version.html)
+for the changes in the defaults.
 
 ### Features
 

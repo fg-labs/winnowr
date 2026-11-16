@@ -74,7 +74,7 @@ winnowr-xgboost = { version = "0.1.0", path = "xgboost" }
 # On Linux, mimalloc also replaces malloc for the C and C++ code (XGBoost, htslib, the OpenMP
 # runtime), so their allocations come from mimalloc's arenas, which it marks for transparent huge
 # pages (madvise). Training is bound by memory latency, and XGBoost's large buffers otherwise sit
-# on 4 KiB pages unless THP is turned on system-wide (see the README's "Performance tuning").
+# on 4 KiB pages unless THP is turned on system-wide (see docs/src/user-guide/performance.md).
 [target.'cfg(target_os = "linux")'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false, features = ["override"] }
 
