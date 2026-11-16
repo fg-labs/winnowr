@@ -97,9 +97,16 @@ cd winnowr
 cargo install --locked --path .
 ```
 
-`--recursive` fetches the vendored XGBoost sources (a git submodule). Releases will also be
-published to [crates.io](https://crates.io), [bioconda](https://bioconda.github.io) and as
-prebuilt binaries on the [releases page](https://github.com/fg-labs/winnowr/releases).
+`--recursive` fetches the vendored XGBoost sources (a git submodule). From version 0.1.1, winnowr
+can also be installed from [crates.io](https://crates.io/crates/winnowr), with the same build
+requirements; the `winnowr-xgboost` crate bundles the XGBoost sources, so no submodule is needed:
+
+```console
+cargo install --locked winnowr
+```
+
+Prebuilt binaries are on the [releases page](https://github.com/fg-labs/winnowr/releases), and
+releases will also be published to [bioconda](https://bioconda.github.io).
 
 ## Commands
 

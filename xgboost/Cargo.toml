@@ -47,6 +47,11 @@ cmake = "0.1.58"
 [dev-dependencies]
 rstest = "0.28.0"
 
+# docs.rs documents Linux only, since the crate supports only macOS and Linux; build.rs skips the
+# XGBoost build there.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
 [package.metadata.dist]
 # A library: dist builds and ships only the winnowr binary.
 dist = false

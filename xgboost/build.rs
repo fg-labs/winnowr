@@ -17,6 +17,8 @@
 //! The C++ compiler is the one the `cc` crate selects (honouring `CXX`, `CXX_<target>`,
 //! `TARGET_CXX` and compiler wrappers), which is also the one the `cmake` crate builds with. The
 //! C++ standard library stays dynamic: it is part of every supported platform.
+//!
+//! On docs.rs (`DOCS_RS` set) XGBoost is not built: documenting the crate links nothing.
 
 #[path = "build/patch.rs"]
 mod patch;
@@ -35,6 +37,19 @@ fn main() {
     );
     declare_rerun_triggers(&manifest_dir, &source);
     println!("cargo:rustc-env=WINNOWR_XGBOOST_VENDORED_VERSION={}", vendored_version(&source));
+    // The crate reaches libgomp's internal wait settings only when it links libgomp statically.
+    println!("cargo::rustc-check-cfg=cfg(winnowr_static_libgomp)");
+
+    // Documenting the crate links nothing, so on docs.rs, which limits build time, skip building
+    // XGBoost.
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    if env::var_os("DOCS_RS").is_some() {
+        println!(
+            "cargo:warning=DOCS_RS is set, so XGBoost was not built; calls to it will not link"
+        );
+        return;
+    }
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let source = patched_source(&source, &manifest_dir.join("patches"), &out_dir);
 
@@ -70,8 +85,6 @@ fn main() {
     println!("cargo:rustc-link-lib=static=xgboost");
     println!("cargo:rustc-link-lib=static=dmlc");
 
-    // The crate reaches libgomp's internal wait settings only when it links libgomp statically.
-    println!("cargo::rustc-check-cfg=cfg(winnowr_static_libgomp)");
     match openmp.static_link(&compiler, &out_dir) {
         StaticLink::Links => {
             link_static_copy(&openmp.archive, &out_dir, openmp.name);

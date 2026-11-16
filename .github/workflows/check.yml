@@ -181,9 +181,16 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Rustdoc check
         run: cargo ci-doc
+      # docs.rs sets DOCS_RS, so winnowr-xgboost's build script skips XGBoost: check that the
+      # crates still document that way. Only winnowr-xgboost and winnowr rebuild.
+      - name: Rustdoc check as on docs.rs
+        run: cargo ci-doc
+        env:
+          DOCS_RS: "1"
 
-  # The published winnowr-xgboost crate ships a subset of the vendored sources (its `include`
-  # list); check that the packaged crate still builds on its own.
+  # Both published crates ship only their `include` lists (winnowr-xgboost a subset of the
+  # vendored sources); check that the packaged crates still build on their own. Cargo verifies
+  # winnowr against the packaged winnowr-xgboost.
   package:
     runs-on: ubuntu-22.04
     env:
@@ -195,9 +202,11 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+      - name: Install libclang (bindgen, for htslib)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libclang-dev
       - name: Install Rust toolchain
         run: rustup toolchain install
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-      - name: Package and build winnowr-xgboost
-        run: cargo package --locked -p winnowr-xgboost
+      - name: Package and build both crates
+        run: cargo package --workspace --locked
