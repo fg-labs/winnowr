@@ -152,10 +152,11 @@ pub(crate) enum Command {
     /// Each model acts at its cross-validated thresholds. Indel genotype models also drop the
     /// calls their thresholds leave alone when P(keep) is below 0.5 (--keep-fallback). Given the
     /// confident regions (--regions notinalldifficultregions=PATH, GIAB's GRCh38 genome
-    /// stratification), indel calls outside them are dropped at P(drop) >= 0.6
-    /// (--outside-indel-t-drop) in place of the model's drop threshold, whether that is lower or
-    /// higher, and the keep fallback still drops them when P(keep) is below 0.5. Without the
-    /// regions, `score` warns and uses the model's threshold everywhere.
+    /// stratification), indel calls outside them are dropped at P(drop) >= 0.6 (in veto mode,
+    /// P(drop) + P(flip) (+ P(re-genotype)) >= 0.6; --outside-indel-t-drop) in place of the
+    /// model's drop threshold, whether that is lower or higher, and the keep fallback still drops
+    /// them when P(keep) is below 0.5. Without the regions, `score` warns and uses the model's
+    /// threshold everywhere.
     Score(ScoreArgs),
     /// Measure read lengths across repeat tracts at indel calls (repeat-length evidence).
     Strlen(StrlenArgs),
@@ -494,9 +495,10 @@ pub(crate) struct PolicyArgs {
     pub(crate) abstain_actions: Vec<String>,
 
     /// The drop threshold of indel calls outside the confident regions: they are dropped when
-    /// P(drop) is at least this, in place of the model's threshold, even when that is higher
-    /// (none: the model's threshold). The keep fallback (--keep-fallback) still drops them when
-    /// P(keep) is below 0.5.
+    /// P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
+    /// model's veto threshold is compared with), in place of the model's threshold, even when that
+    /// is higher (none: the model's threshold). The keep fallback (--keep-fallback) still drops
+    /// them when P(keep) is below 0.5.
     #[arg(long, default_value_t = OutsideTDrop(Some(DEFAULT_OUTSIDE_INDEL_T_DROP)),
           value_name = "P|none")]
     pub(crate) outside_indel_t_drop: OutsideTDrop,
@@ -744,9 +746,11 @@ pub(crate) struct ScoreArgs {
 ///
 /// For every indel record (any FILTER) whose POS is in the regions, finds the repeat tract of its
 /// first pure insertion or deletion allele in the reference, and histograms the observed minus
-/// reference tract length over the primary, non-duplicate reads that span the tract with aligned
-/// flank bases on each side (by default reads with MAPQ at least 20 and five flank bases: see
-/// --reads). Writes the read settings and then one row per record; give the output(s) to
+/// reference tract length over the reads that span the tract with aligned flank bases on each
+/// side (by default reads with MAPQ at least 20 and five flank bases: see --reads), up to 600
+/// reads per site. Unmapped, secondary, supplementary, duplicate and QC-failed reads are not
+/// used. Writes the read settings and then one row per indel record with a pure insertion or
+/// deletion allele (other records are skipped, and counted in the log); give the output(s) to
 /// `extract --strlen` or `score --strlen` (or let `score --alignments` measure them itself).
 #[derive(Debug, Args)]
 pub(crate) struct StrlenArgs {
