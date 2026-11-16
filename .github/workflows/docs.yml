@@ -1,0 +1,35 @@
+name: Docs
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".readthedocs.yaml"
+      - ".github/workflows/docs.yml"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes its running build.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Builds the user guide with the script Read the Docs runs (the same pinned, checksummed mdbook
+  # and mdbook-linkcheck2), failing on links to pages that do not exist. The CLI help and the
+  # example commands it shows are checked against the binary by the test job in check.yml.
+  book:
+    name: build the user guide
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the book
+        run: docs/build.sh

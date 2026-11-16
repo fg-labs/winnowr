@@ -14,7 +14,7 @@ no-section-label = true
 
 # Fails the build on links to pages that do not exist (mdBook alone only warns); links to missing
 # anchors are not checked. The checker is the mdbook-linkcheck2 fork, which reads mdBook 0.5's
-# output. Web links are not followed, so the build needs no network. With a second output
-# configured, mdBook writes the HTML to book/html/.
+# output; its version is pinned in docs/build.sh. Web links are not followed, so the build needs no
+# network. With a second output configured, mdBook writes the HTML to book/html/.
 [output.linkcheck2]
 follow-web-links = false
