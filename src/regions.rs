@@ -245,7 +245,7 @@ fn parse_bed_line(line: &str) -> Result<Option<(&str, u64, u64)>> {
 /// its REF: at least one base, so that an empty REF still has a position. A `pos` below 1 (a
 /// telomere record) starts at 0.
 #[must_use]
-pub(crate) fn ref_span(pos: i64, ref_len: usize) -> (u64, u64) {
+pub fn ref_span(pos: i64, ref_len: usize) -> (u64, u64) {
     let start = u64::try_from(pos).unwrap_or(0).saturating_sub(1);
     (start, start + ref_len.max(1) as u64)
 }

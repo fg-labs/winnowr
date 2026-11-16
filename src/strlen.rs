@@ -1,15 +1,16 @@
 //! Per-read repeat-tract lengths at indel calls ("strlen" evidence): the repeat tract, the length
 //! histogram, and the strlen tables `winnowr strlen` writes.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::BuildHasher;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
 use crate::evidence::{Evidence, EvidenceTables, write_table};
 use crate::read_pass::{
-    ReadInputs, Shard, SweepSites, anchored_length, run_shards, sweep_clusters,
+    MAX_READS, ReadInputs, Shard, SweepSites, anchored_length, run_shards, sweep_clusters,
 };
 
 /// Reads per length difference (bp, observed minus reference tract length), in increasing order
@@ -153,10 +154,8 @@ fn parse_row(line: &str) -> Result<StrlenRow> {
         })
     };
     let float = |index: usize| -> Result<f64> {
+        // `nan` (a missing value) parses as NaN.
         let value = fields[index];
-        if value == "nan" {
-            return Ok(f64::NAN);
-        }
         value
             .parse()
             .with_context(|| format!("{} is not a number: {value:?}", STRLEN_COLUMNS[index]))
@@ -320,9 +319,6 @@ impl<'de> serde::Deserialize<'de> for StrlenOptions {
 /// Reference bases fetched on each side of a record to find its tract.
 pub const CONTEXT: u64 = 600;
 
-/// Stop reading a site after this many overlapping reads.
-pub const MAX_READS: u64 = 600;
-
 /// The smallest `k` such that `seq` is periodic with period `k` (`seq.len()` if aperiodic).
 #[must_use]
 pub fn min_period(seq: &[u8]) -> usize {
@@ -457,7 +453,7 @@ pub struct TractEvidence {
 /// # Errors
 ///
 /// Returns an error if it is not.
-pub(crate) fn check_flank(flank: u64) -> Result<()> {
+pub fn check_flank(flank: u64) -> Result<()> {
     if !(1..=MAX_FLANK).contains(&flank) {
         bail!("the flank must be between 1 and {MAX_FLANK}, got {flank}");
     }
@@ -467,11 +463,15 @@ pub(crate) fn check_flank(flank: u64) -> Result<()> {
 /// The 0-based, half-open span a read must overlap to count for a tract: the tract with `flank`
 /// bases on each side. Returns `(first, last)` (the anchors, inclusive; `first` may be negative)
 /// and the fetch span `(beg, end)`.
-pub(crate) fn tract_window(tract: &RepeatTract, flank: u64) -> ((i64, i64), (i64, i64)) {
+pub fn tract_window(tract: &RepeatTract, flank: u64) -> ((i64, i64), (i64, i64)) {
     let first = tract.start as i64 - flank as i64;
     let last = (tract.end + flank - 1) as i64;
     ((first, last), (first.max(0), last + 1))
 }
+
+/// Read names found by hash, stored with their hashes: a name is hashed once (the stored hashes
+/// grow the table) and copied only when new.
+type ReadNames = (std::hash::RandomState, hashbrown::HashTable<(u64, Vec<u8>)>);
 
 /// The read evidence for one tract, accumulated over the reads overlapping it, in order.
 struct TractAccumulator {
@@ -481,7 +481,7 @@ struct TractAccumulator {
     length: i64,
     min_mapq: u8,
     /// The names of the measured reads, when mates are collapsed.
-    measured: Option<HashSet<Vec<u8>>>,
+    measured: Option<ReadNames>,
     n_overlap: u64,
     n_spanning: u64,
     histogram: Histogram,
@@ -502,7 +502,7 @@ impl TractAccumulator {
             flank,
             length: tract.length() as i64,
             min_mapq: options.min_mapq,
-            measured: options.collapse_mates.then(HashSet::new),
+            measured: options.collapse_mates.then(Default::default),
             n_overlap: 0,
             n_spanning: 0,
             histogram: Histogram::new(),
@@ -514,14 +514,15 @@ impl TractAccumulator {
         }
     }
 
-    /// True once [`MAX_READS`] reads have been counted: later reads are not read.
+    /// True once more than [`MAX_READS`] reads have been counted (the last is not measured):
+    /// later reads are not read.
     fn is_full(&self) -> bool {
         self.n_overlap > MAX_READS
     }
 
     /// Counts the next overlapping read (not one with [`crate::read_pass::SKIP_FLAGS`]),
     /// measuring it if it spans the tract. `cigar` caches the read's decoded CIGAR across the
-    /// tracts and options it is added to: it is decoded here the first time it is needed.
+    /// tracts it is added to: it is decoded here the first time it is needed.
     fn add(
         &mut self,
         record: &rust_htslib::bam::Record,
@@ -552,10 +553,16 @@ impl TractAccumulator {
         if record.mapq() < self.min_mapq {
             return;
         }
-        if let Some(measured) = &mut self.measured
-            && !measured.insert(record.qname().to_vec())
-        {
-            return;
+        if let Some((hasher, measured)) = &mut self.measured {
+            let name = record.qname();
+            let hash = hasher.hash_one(name);
+            let same = |(h, seen): &(u64, Vec<u8>)| *h == hash && seen == name;
+            match measured.entry(hash, same, |&(h, _)| h) {
+                hashbrown::hash_table::Entry::Occupied(_) => return,
+                hashbrown::hash_table::Entry::Vacant(entry) => {
+                    entry.insert((hash, name.to_vec()));
+                }
+            }
         }
         *self.histogram.entry(observed - self.length).or_insert(0) += 1;
         self.n_spanning += 1;
@@ -584,62 +591,10 @@ impl TractAccumulator {
     }
 }
 
-/// Measures a tract's length in each read spanning it, with the default [`StrlenOptions`]: a
-/// primary, non-duplicate, QC-passing, mapped read aligned (M/=/X) at both anchors, [`FLANK`]
-/// bases outside each end of the tract; reads with MAPQ below [`MIN_MAPQ`] are counted in the
-/// MAPQ summaries but not measured. Its observed tract length is the number of query bases
-/// between the anchors.
-///
-/// The reads are those a fetch of the tract and its flanks returns, in order, up to
-/// [`MAX_READS`]. [`measure_tracts`] measures many tracts with the same result, faster.
-///
-/// # Errors
-///
-/// Returns an error if the reads cannot be fetched or read.
-#[cfg(test)]
-pub fn measure_tract(
-    reads: &mut rust_htslib::bam::IndexedReader,
-    tid: u32,
-    tract: &RepeatTract,
-) -> Result<TractEvidence> {
-    measure_tract_with(reads, tid, tract, &StrlenOptions::default())
-}
-
-/// Measures a tract as [`measure_tract`] does, with other [`StrlenOptions`].
-///
-/// # Errors
-///
-/// Returns an error if the reads cannot be fetched or read.
-#[cfg(test)]
-pub fn measure_tract_with(
-    reads: &mut rust_htslib::bam::IndexedReader,
-    tid: u32,
-    tract: &RepeatTract,
-    options: &StrlenOptions,
-) -> Result<TractEvidence> {
-    use rust_htslib::bam::Read as _;
-    let (_, (beg, end)) = tract_window(tract, options.flank_of(tract));
-    reads.fetch((tid, beg, end)).context("failed to fetch reads")?;
-    let mut accumulator = TractAccumulator::new(tract, options);
-    let mut record = rust_htslib::bam::Record::new();
-    while let Some(read) = reads.read(&mut record) {
-        read.context("failed to read a read")?;
-        if record.flags() & crate::read_pass::SKIP_FLAGS != 0 {
-            continue;
-        }
-        accumulator.add(&record, &mut None);
-        if accumulator.is_full() {
-            break;
-        }
-    }
-    Ok(accumulator.finish())
-}
-
-/// Measures tracts on one contig as `measure_tract_with` does for each of `options`, with the
-/// same results, but reads each read once per cluster of nearby tracts rather than once per tract
-/// and option (see [`sweep_clusters`]): each read is counted for every tract (and option) whose
-/// fetch would have returned it (it overlaps the tract's fetch span), in the same order. Returns
-/// the evidence per option, then per tract.
+/// Measures tracts on one contig with `options`, returning the evidence per tract. A tract gets
+/// the reads a fetch of its own span (the tract and its flanks) would return, in the same order,
+/// up to [`MAX_READS`] measured, but each read is read once per cluster of nearby tracts rather
+/// than once per tract (see [`sweep_clusters`]).
 ///
 /// # Errors
 ///
@@ -648,62 +603,34 @@ pub fn measure_tracts(
     reads: &mut rust_htslib::bam::IndexedReader,
     tid: u32,
     tracts: &[RepeatTract],
-    options: &[StrlenOptions],
-) -> Result<Vec<Vec<TractEvidence>>> {
-    // Per option, then tract: the fetch spans and accumulators.
-    let spans: Vec<Vec<(i64, i64)>> = options
-        .iter()
-        .map(|o| tracts.iter().map(|tract| tract_window(tract, o.flank_of(tract)).1).collect())
-        .collect();
-    let accumulators: Vec<Vec<TractAccumulator>> = options
-        .iter()
-        .map(|o| tracts.iter().map(|tract| TractAccumulator::new(tract, o)).collect())
-        .collect();
-    // The union of each tract's spans over the options.
-    let union: Vec<(i64, i64)> = (0..tracts.len())
-        .map(|i| {
-            let beg = spans.iter().map(|s| s[i].0).min().unwrap_or(0);
-            let end = spans.iter().map(|s| s[i].1).max().unwrap_or(0);
-            (beg, end)
-        })
-        .collect();
-    let mut measuring = Measuring { spans: &spans, accumulators };
-    sweep_clusters(reads, tid, &union, &mut measuring)?;
-    Ok(measuring
-        .accumulators
-        .into_iter()
-        .map(|per_tract| per_tract.into_iter().map(TractAccumulator::finish).collect())
-        .collect())
+    options: &StrlenOptions,
+) -> Result<Vec<TractEvidence>> {
+    let spans: Vec<(i64, i64)> =
+        tracts.iter().map(|tract| tract_window(tract, options.flank_of(tract)).1).collect();
+    let accumulators = tracts.iter().map(|tract| TractAccumulator::new(tract, options)).collect();
+    let mut measuring = Measuring { accumulators };
+    sweep_clusters(reads, tid, &spans, &mut measuring)?;
+    Ok(measuring.accumulators.into_iter().map(TractAccumulator::finish).collect())
 }
 
-/// The tracts [`measure_tracts`] measures: per option, then tract, the fetch spans and the
-/// evidence so far.
-struct Measuring<'a> {
-    spans: &'a [Vec<(i64, i64)>],
-    accumulators: Vec<Vec<TractAccumulator>>,
+/// The tracts [`measure_tracts`] measures: per tract, the evidence so far.
+struct Measuring {
+    accumulators: Vec<TractAccumulator>,
 }
 
-impl SweepSites for Measuring<'_> {
-    /// A tract is full once it is full for every option.
+impl SweepSites for Measuring {
     fn is_full(&self, i: usize) -> bool {
-        self.accumulators.iter().all(|per_tract| per_tract[i].is_full())
+        self.accumulators[i].is_full()
     }
 
-    /// Adds the read for each option whose fetch span of the tract it overlaps.
+    /// Adds the read, which overlaps the tract's fetch span.
     fn add(
         &mut self,
         i: usize,
         record: &rust_htslib::bam::Record,
-        start: i64,
-        end: i64,
         cigar: &mut Option<rust_htslib::bam::record::CigarStringView>,
     ) {
-        for (option_spans, per_tract) in self.spans.iter().zip(self.accumulators.iter_mut()) {
-            let (beg, fetch_end) = option_spans[i];
-            if start < fetch_end && end > beg && !per_tract[i].is_full() {
-                per_tract[i].add(record, cigar);
-            }
-        }
+        self.accumulators[i].add(record, cigar);
     }
 }
 
@@ -763,8 +690,8 @@ impl StrlenSite {
 }
 
 /// Measures the repeat tract of every indel record (any FILTER) whose POS lies in each region,
-/// in region order, then VCF order, with the default [`StrlenOptions`]. Records without a pure insertion or deletion allele are
-/// skipped.
+/// in region order, then VCF order, with `options`. Records without a pure insertion or deletion
+/// allele are skipped.
 ///
 /// Regions are split into shards measured in parallel on the rayon pool, each with its own
 /// readers.
@@ -774,28 +701,13 @@ impl StrlenSite {
 /// Returns an error if a region is malformed or its contig is not in the VCF header or the
 /// reference, an indel record extends past the end of its contig in the reference, or a file
 /// cannot be read.
-#[cfg(test)]
 pub fn measure_regions<S: AsRef<str>>(
     inputs: &ReadInputs<'_>,
     regions: &[S],
+    options: &StrlenOptions,
 ) -> Result<Vec<StrlenSite>> {
-    let mut per_option = measure_regions_with(inputs, regions, &[StrlenOptions::default()])?;
-    Ok(per_option.pop().unwrap_or_default())
-}
-
-/// Measures the records of regions as `measure_regions` does, once for each of `options`, in
-/// one pass over the reads. Returns the sites per option.
-///
-/// # Errors
-///
-/// As `measure_regions`.
-pub fn measure_regions_with<S: AsRef<str>>(
-    inputs: &ReadInputs<'_>,
-    regions: &[S],
-    options: &[StrlenOptions],
-) -> Result<Vec<Vec<StrlenSite>>> {
     // Ignored for BAM; for CRAM, skips decoding the fields the tract pass does not read.
-    let names = if options.iter().any(|o| o.collapse_mates) { CRAM_READ_NAME } else { 0 };
+    let names = if options.collapse_mates { CRAM_READ_NAME } else { 0 };
     let per_shard = run_shards(inputs, regions, CRAM_REQUIRED_FIELDS | names, |shard| {
         measure_shard(shard, inputs, options)
     })?;
@@ -803,13 +715,7 @@ pub fn measure_regions_with<S: AsRef<str>>(
     if skipped > 0 {
         log::info!("Skipped {skipped} indel records without a pure insertion or deletion allele");
     }
-    let mut per_option: Vec<Vec<StrlenSite>> = vec![Vec::new(); options.len()];
-    for (sites, _) in per_shard {
-        for (all, shard) in per_option.iter_mut().zip(sites) {
-            all.extend(shard);
-        }
-    }
-    Ok(per_option)
+    Ok(per_shard.into_iter().flat_map(|(sites, _)| sites).collect())
 }
 
 /// The htslib CRAM fields the tract pass reads (FLAG, RNAME, POS, MAPQ, CIGAR and QUAL), so CRAM
@@ -824,14 +730,14 @@ const CRAM_READ_NAME: u32 = 0x1;
 fn measure_shard(
     shard: &mut Shard<'_>,
     inputs: &ReadInputs<'_>,
-    options: &[StrlenOptions],
-) -> Result<(Vec<Vec<StrlenSite>>, usize)> {
+    options: &StrlenOptions,
+) -> Result<(Vec<StrlenSite>, usize)> {
     use rust_htslib::bcf::Read as _;
     let (chrom, start, end) = (shard.chrom, shard.start, shard.end);
     // Indel records and their tracts, measured together once all are read; a region without
     // indels needs no reads on its contig.
     let mut pending: Vec<(u64, String, String, RepeatTract)> = Vec::new();
-    let mut sites: Vec<Vec<StrlenSite>> = vec![Vec::new(); options.len()];
+    let mut sites: Vec<StrlenSite> = Vec::new();
     let mut skipped = 0;
     if !shard.fetch_records(inputs.vcf)? {
         return Ok((sites, skipped));
@@ -866,17 +772,8 @@ fn measure_shard(
     let tracts: Vec<RepeatTract> = pending.iter().map(|(.., tract)| tract.clone()).collect();
     let evidence = measure_tracts(shard.reads, tid, &tracts, options)
         .with_context(|| format!("failed to measure {chrom}:{start}-{end}"))?;
-    for (option_sites, option_evidence) in sites.iter_mut().zip(evidence) {
-        for ((pos, reference, alt, tract), evidence) in pending.iter().zip(option_evidence) {
-            option_sites.push(StrlenSite {
-                chrom: chrom.to_string(),
-                pos: *pos,
-                reference: reference.clone(),
-                alt: alt.clone(),
-                tract: tract.clone(),
-                evidence,
-            });
-        }
+    for ((pos, reference, alt, tract), evidence) in pending.into_iter().zip(evidence) {
+        sites.push(StrlenSite { chrom: chrom.to_string(), pos, reference, alt, tract, evidence });
     }
     Ok((sites, skipped))
 }
@@ -931,7 +828,57 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::evidence::{check_options, read_tables};
+    use crate::evidence::read_tables;
+    use crate::model_evidence::check_options;
+
+    /// Measures a tract as [`measure_tract`] does, with other [`StrlenOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reads cannot be fetched or read.
+    fn measure_tract_with(
+        reads: &mut rust_htslib::bam::IndexedReader,
+        tid: u32,
+        tract: &RepeatTract,
+        options: &StrlenOptions,
+    ) -> Result<TractEvidence> {
+        use rust_htslib::bam::Read as _;
+        let (_, (beg, end)) = tract_window(tract, options.flank_of(tract));
+        reads.fetch((tid, beg, end)).context("failed to fetch reads")?;
+        let mut accumulator = TractAccumulator::new(tract, options);
+        let mut record = rust_htslib::bam::Record::new();
+        while let Some(read) = reads.read(&mut record) {
+            read.context("failed to read a read")?;
+            if record.flags() & crate::read_pass::SKIP_FLAGS != 0 {
+                continue;
+            }
+            accumulator.add(&record, &mut None);
+            if accumulator.is_full() {
+                break;
+            }
+        }
+        Ok(accumulator.finish())
+    }
+
+    /// Measures a tract's length in each read spanning it, with the default [`StrlenOptions`]: a
+    /// primary, non-duplicate, QC-passing, mapped read aligned (M/=/X) at both anchors, [`FLANK`]
+    /// bases outside each end of the tract; reads with MAPQ below [`MIN_MAPQ`] are counted in the
+    /// MAPQ summaries but not measured. Its observed tract length is the number of query bases
+    /// between the anchors.
+    ///
+    /// The reads are those a fetch of the tract and its flanks returns, in order, of which at
+    /// most [`MAX_READS`] are measured. [`measure_tracts`] measures many tracts with the same result, faster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reads cannot be fetched or read.
+    fn measure_tract(
+        reads: &mut rust_htslib::bam::IndexedReader,
+        tid: u32,
+        tract: &RepeatTract,
+    ) -> Result<TractEvidence> {
+        measure_tract_with(reads, tid, tract, &StrlenOptions::default())
+    }
 
     #[rstest]
     #[case::empty(".", &[])]
@@ -1248,10 +1195,7 @@ mod tests {
         tracts.push(RepeatTract { end: 5_200, ..a_tract(5_000) }); // longer than the reads
         tracts.push(a_tract(5_040)); // a repeat of a tract
         let mut reader = rust_htslib::bam::IndexedReader::from_path(&bam).unwrap();
-        let together = measure_tracts(&mut reader, 0, &tracts, &[StrlenOptions::default()])
-            .unwrap()
-            .pop()
-            .unwrap();
+        let together = measure_tracts(&mut reader, 0, &tracts, &StrlenOptions::default()).unwrap();
         let each: Vec<TractEvidence> =
             tracts.iter().map(|tract| measure_tract(&mut reader, 0, tract).unwrap()).collect();
         assert_eq!(together, each);
@@ -1327,17 +1271,13 @@ mod tests {
         // The default: MAPQ 20 and 5 flank bases.
         let default = measure(&mut reader, "default");
         assert_eq!((default.n_spanning, default.frac_mapq_lt20), (3, Some(0.25)));
-        // Measured together in one pass, each setting gives what it gives alone.
-        let options: Vec<StrlenOptions> =
-            ["legacy", "legacy,mapq20", "mates", "default", "legacy,mapq20,mates"]
-                .iter()
-                .map(|s| s.parse().unwrap())
-                .collect();
-        let together =
-            measure_tracts(&mut reader, 0, std::slice::from_ref(&tract), &options).unwrap();
-        for (option, evidence) in options.iter().zip(together) {
-            let alone = measure_tract_with(&mut reader, 0, &tract, option).unwrap();
-            assert_eq!(evidence, vec![alone], "{option:?}");
+        // Measured in a sweep, each setting gives what the tract's own fetch gives.
+        for settings in ["legacy", "legacy,mapq20", "mates", "default", "legacy,mapq20,mates"] {
+            let option: StrlenOptions = settings.parse().unwrap();
+            let swept =
+                measure_tracts(&mut reader, 0, std::slice::from_ref(&tract), &option).unwrap();
+            let alone = measure_tract_with(&mut reader, 0, &tract, &option).unwrap();
+            assert_eq!(swept, vec![alone], "{settings}");
         }
     }
 
@@ -1391,15 +1331,19 @@ mod tests {
             &[read("ref", 50, "70M")],
         );
         let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
-        let sites = measure_regions(&inputs, &["chr1", "chr2"]).unwrap();
+        let sites = measure_regions(&inputs, &["chr1", "chr2"], &StrlenOptions::default()).unwrap();
         // The SNP is not measured; the insertion has an empty tract (no T next to it).
         assert_eq!(
             sites.iter().map(|s| s.pos).collect::<Vec<_>>(),
             [start as u64, start as u64 + 20]
         );
         assert_eq!(sites[0].evidence.histogram.get(&0), Some(&1));
-        let only_snp =
-            measure_regions(&inputs, &[format!("chr1:{}-{}", start + 1, start + 15)]).unwrap();
+        let only_snp = measure_regions(
+            &inputs,
+            &[format!("chr1:{}-{}", start + 1, start + 15)],
+            &StrlenOptions::default(),
+        )
+        .unwrap();
         assert!(only_snp.is_empty());
 
         let table = dir.path().join("strlen.tsv.gz");
@@ -1408,9 +1352,14 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].length_histogram, "0:1");
         // A region past the contig end is capped to it.
-        let capped = measure_regions(&inputs, &["chr1:1-18446744073709551000"]).unwrap();
+        let capped =
+            measure_regions(&inputs, &["chr1:1-18446744073709551000"], &StrlenOptions::default())
+                .unwrap();
         assert_eq!(capped.len(), 2);
-        let message = format!("{:#}", measure_regions(&inputs, &["chrX"]).unwrap_err());
+        let message = format!(
+            "{:#}",
+            measure_regions(&inputs, &["chrX"], &StrlenOptions::default()).unwrap_err()
+        );
         assert!(
             message.contains("contig chrX of region chrX is not in the VCF header"),
             "{message}"
@@ -1421,7 +1370,7 @@ mod tests {
             (["chr1:10-20", "chr1:20-30"], "regions chr1:10-20 and chr1:20-30 overlap"),
             (["chr2", "chr1:100-200"], ""),
         ] {
-            let measured = measure_regions(&inputs, &regions);
+            let measured = measure_regions(&inputs, &regions, &StrlenOptions::default());
             if expected.is_empty() {
                 assert!(measured.is_ok());
             } else {
@@ -1448,7 +1397,10 @@ mod tests {
         let vcf = crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[record]);
         let bam = crate::testing::write_bam(dir.path(), "reads.bam", reference.len() as u64, &[]);
         let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
-        let message = format!("{:#}", measure_regions(&inputs, &["chr2"]).unwrap_err());
+        let message = format!(
+            "{:#}",
+            measure_regions(&inputs, &["chr2"], &StrlenOptions::default()).unwrap_err()
+        );
         assert!(message.contains("extends past the end of chr2 (4 bp)"), "{message}");
     }
 }

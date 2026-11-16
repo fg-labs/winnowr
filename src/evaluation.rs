@@ -1,16 +1,16 @@
 //! F1 reports for a model's decisions on a labelled sample.
 
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::common::NEVER;
+use crate::io::write_tsv;
 use crate::labels::Label;
+use crate::numeric::metric_float;
 use crate::policy::withhold_promotions;
 use crate::rescore::{
-    CallLimits, Counts, DecisionThresholds, Mode, Probabilities, Rule, decide_promote,
-    rescore_promote,
+    CallLimits, Counts, DecisionThresholds, Mode, Outcome, Probabilities, Rule, decide_promote,
 };
 use crate::samples::{PromoteSampleCalls, SampleCalls};
 use crate::thresholds::{
@@ -83,9 +83,39 @@ pub struct PolicyMetric {
     pub regenotypes_broke_tp: i64,
 }
 
-/// The number of true values.
-fn count(mask: impl Iterator<Item = bool>) -> i64 {
-    mask.filter(|&v| v).count() as i64
+impl PolicyMetric {
+    /// The metric's values as written, in [`POLICY_METRIC_COLUMNS`] order.
+    #[must_use]
+    pub fn formatted_values(&self) -> Vec<String> {
+        let f = metric_float;
+        vec![
+            self.sample.clone(),
+            self.variant_type.clone(),
+            self.policy.clone(),
+            self.mode.to_string(),
+            f(self.t_drop),
+            f(self.t_flip),
+            self.dropped.to_string(),
+            self.dropped_tp.to_string(),
+            self.flipped.to_string(),
+            self.flips_fixed.to_string(),
+            self.flips_broke_tp.to_string(),
+            self.counts.tp.to_string(),
+            self.counts.fp.to_string(),
+            self.counts.fn_.to_string(),
+            f(self.counts.f1()),
+            f(self.f1_gain),
+            f(self.t_promote),
+            f(self.t_promote_flip),
+            self.promoted.to_string(),
+            self.promoted_correct.to_string(),
+            self.promoted_flipped.to_string(),
+            f(self.t_regenotype),
+            self.regenotyped.to_string(),
+            self.regenotypes_fixed.to_string(),
+            self.regenotypes_broke_tp.to_string(),
+        ]
+    }
 }
 
 /// Applies one policy to a sample's labelled calls and rescores.
@@ -104,12 +134,8 @@ pub fn evaluate_policy(
 ) -> Result<PolicyMetric> {
     let fold = calls.to_fold(probabilities.clone())?;
     let actions = fold.decide_with_rule(thresholds, mode, acting.rule, acting.limits);
-    let counts = fold.rescore(&actions);
-    let is_tp: Vec<bool> = fold.labels.iter().map(|&label| label == Label::Keep).collect();
-    let both = |a: &[bool], b: &[bool]| count(a.iter().zip(b).map(|(x, y)| *x && *y));
-    let not_tp: Vec<bool> = is_tp.iter().map(|tp| !tp).collect();
-    let regenotype_fixed: Vec<bool> =
-        not_tp.iter().zip(&fold.regenotype_ok).map(|(a, b)| *a && *b).collect();
+    let outcome = Outcome::of_calls(&fold.labels, &fold.flip_ok, &fold.regenotype_ok, &actions);
+    let counts = fold.baseline.plus(outcome.delta);
     Ok(PolicyMetric {
         sample: calls.sample.clone(),
         variant_type: variant_type.to_string(),
@@ -117,11 +143,11 @@ pub fn evaluate_policy(
         mode,
         t_drop: thresholds.t_drop,
         t_flip: thresholds.t_flip,
-        dropped: count(actions.drop.iter().copied()),
-        dropped_tp: both(&actions.drop, &is_tp),
-        flipped: count(actions.flip.iter().copied()),
-        flips_fixed: both(&actions.flip, &fold.flip_ok),
-        flips_broke_tp: both(&actions.flip, &is_tp),
+        dropped: outcome.dropped,
+        dropped_tp: outcome.dropped_tp,
+        flipped: outcome.flipped,
+        flips_fixed: outcome.flips_fixed,
+        flips_broke_tp: outcome.flips_broke_tp,
         counts,
         f1_gain: counts.f1() - fold.baseline.f1(),
         t_promote: NEVER,
@@ -130,9 +156,9 @@ pub fn evaluate_policy(
         promoted_correct: 0,
         promoted_flipped: 0,
         t_regenotype: thresholds.t_regenotype,
-        regenotyped: count(actions.regenotype.iter().copied()),
-        regenotypes_fixed: both(&actions.regenotype, &regenotype_fixed),
-        regenotypes_broke_tp: both(&actions.regenotype, &is_tp),
+        regenotyped: outcome.regenotyped,
+        regenotypes_fixed: outcome.regenotypes_fixed,
+        regenotypes_broke_tp: outcome.regenotypes_broke_tp,
     })
 }
 
@@ -245,15 +271,15 @@ pub fn evaluate_promote_policy(
     if let Some(withheld) = withheld {
         withhold_promotions(&mut promotions, withheld);
     }
-    let start = pass_metric.counts;
-    let counts = rescore_promote(&fold.labels, &promotions, start);
+    let outcome = Outcome::of_candidates(&fold.labels, &promotions);
+    let counts = pass_metric.counts.plus(outcome.delta);
     Ok(PolicyMetric {
         policy: policy.to_string(),
         t_promote,
         t_promote_flip: t_flip,
-        promoted: count(promotions.promote.iter().copied()),
-        promoted_correct: counts.tp - start.tp,
-        promoted_flipped: count(promotions.flip.iter().copied()),
+        promoted: outcome.promoted,
+        promoted_correct: outcome.promoted_correct,
+        promoted_flipped: outcome.promoted_flipped,
         counts,
         f1_gain: counts.f1() - candidates.baseline.f1(),
         ..pass_metric.clone()
@@ -309,49 +335,6 @@ pub fn evaluate_promote_model(
     Ok(metrics)
 }
 
-/// Formats a float as Python's `str()` does: the shortest representation that round-trips, in
-/// scientific notation (with a signed, at least two-digit exponent) below 1e-4 or from 1e16.
-#[must_use]
-pub fn python_float(value: f64) -> String {
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value > 0.0 { "inf" } else { "-inf" }.to_string();
-    }
-    if value == 0.0 {
-        return if value.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
-    }
-    // Rust's `{:e}` is the shortest round-tripping representation, e.g. `-1.25e-5`.
-    let scientific = format!("{value:e}");
-    let (mantissa, exponent) = scientific.split_once('e').expect("`{:e}` has an exponent");
-    let exponent: i32 = exponent.parse().expect("`{:e}` has an integer exponent");
-    let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    if (-4..16).contains(&exponent) {
-        let point = exponent + 1;
-        let text = if point <= 0 {
-            format!("0.{}{digits}", "0".repeat(point.unsigned_abs() as usize))
-        } else if point as usize >= digits.len() {
-            format!("{digits}{}.0", "0".repeat(point as usize - digits.len()))
-        } else {
-            format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
-        };
-        format!("{sign}{text}")
-    } else {
-        let exponent_sign = if exponent < 0 { '-' } else { '+' };
-        format!("{sign}{mantissa}e{exponent_sign}{:02}", exponent.unsigned_abs())
-    }
-}
-
-/// Formats a metric value as the Python version's metrics files do: Python's `str(round(value,
-/// 5))`. Both round the double's exact value to five decimals, ties to even.
-#[must_use]
-pub fn metric_float(value: f64) -> String {
-    let rounded: f64 = format!("{value:.5}").parse().unwrap_or(value);
-    python_float(rounded)
-}
-
 /// The columns of a metrics file, in order.
 pub const POLICY_METRIC_COLUMNS: [&str; 25] = [
     "sample",
@@ -381,61 +364,17 @@ pub const POLICY_METRIC_COLUMNS: [&str; 25] = [
     "regenotypes_broke_tp",
 ];
 
-impl PolicyMetric {
-    /// The metric's values as written, in [`POLICY_METRIC_COLUMNS`] order.
-    #[must_use]
-    pub fn formatted_values(&self) -> Vec<String> {
-        let f = metric_float;
-        vec![
-            self.sample.clone(),
-            self.variant_type.clone(),
-            self.policy.clone(),
-            self.mode.to_string(),
-            f(self.t_drop),
-            f(self.t_flip),
-            self.dropped.to_string(),
-            self.dropped_tp.to_string(),
-            self.flipped.to_string(),
-            self.flips_fixed.to_string(),
-            self.flips_broke_tp.to_string(),
-            self.counts.tp.to_string(),
-            self.counts.fp.to_string(),
-            self.counts.fn_.to_string(),
-            f(self.counts.f1()),
-            f(self.f1_gain),
-            f(self.t_promote),
-            f(self.t_promote_flip),
-            self.promoted.to_string(),
-            self.promoted_correct.to_string(),
-            self.promoted_flipped.to_string(),
-            f(self.t_regenotype),
-            self.regenotyped.to_string(),
-            self.regenotypes_fixed.to_string(),
-            self.regenotypes_broke_tp.to_string(),
-        ]
-    }
-}
-
 /// Writes metrics as a tab-separated file with a header line.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be written.
 pub fn write_policy_metrics(path: &Path, metrics: &[PolicyMetric]) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut out = std::io::BufWriter::new(file);
-    writeln!(out, "{}", POLICY_METRIC_COLUMNS.join("\t"))?;
-    for metric in metrics {
-        writeln!(out, "{}", metric.formatted_values().join("\t"))?;
-    }
-    out.flush().with_context(|| format!("failed to write {}", path.display()))
+    write_tsv(path, &POLICY_METRIC_COLUMNS, metrics.iter().map(PolicyMetric::formatted_values))
 }
 
 #[cfg(test)]
 mod tests {
-    use rstest::rstest;
-
     use super::*;
 
     mod policies {
@@ -700,42 +639,5 @@ mod tests {
                  1.01\t1.01\t0\t0\t0\t1.01\t0\t0\t0"
             );
         }
-    }
-
-    #[rstest]
-    #[case(0.0, "0.0")]
-    #[case(-0.0, "-0.0")]
-    #[case(1.0, "1.0")]
-    #[case(1.01, "1.01")]
-    #[case(0.5, "0.5")]
-    #[case(1e-4, "0.0001")]
-    #[case(1.0 - 1e-10, "0.9999999999")]
-    #[case(1e-5, "1e-05")]
-    #[case(-2.5e-7, "-2.5e-07")]
-    #[case(0.00867123, "0.00867123")]
-    #[case(123456.0, "123456.0")]
-    #[case(1e15, "1000000000000000.0")]
-    #[case(1e16, "1e+16")]
-    #[case(1.5e300, "1.5e+300")]
-    #[case(f64::NAN, "nan")]
-    #[case(f64::INFINITY, "inf")]
-    fn formats_floats_as_python(#[case] value: f64, #[case] expected: &str) {
-        assert_eq!(python_float(value), expected);
-    }
-
-    // Expected values from Python's `str(round(value, 5))`.
-    #[rstest]
-    #[case(0.9941015342732787, "0.9941")]
-    #[case(0.00198187845033726, "0.00198")]
-    #[case(1.0 - 1e-10, "1.0")]
-    #[case(1.01, "1.01")]
-    #[case(0.0, "0.0")]
-    #[case(0.015625, "0.01562")]
-    #[case(0.046875, "0.04688")]
-    #[case(-0.00026699862934476126, "-0.00027")]
-    #[case(0.000001, "0.0")]
-    #[case(f64::NAN, "nan")]
-    fn formats_metrics_as_python(#[case] value: f64, #[case] expected: &str) {
-        assert_eq!(metric_float(value), expected);
     }
 }

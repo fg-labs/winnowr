@@ -54,6 +54,8 @@ Options:
           gain instead of using its thresholds (and in place of --keep-fallback): flip or
           re-genotype when its probability is above 0.5, else drop when P(keep) is below 0.5
 
+          [possible values: snp, indel]
+
       --abstain-actions <ABSTAIN_ACTIONS>...
           Experimental: actions withheld from calls outside the confident regions (--regions
           notinalldifficultregions=PATH; calls whose REF span is not inside it are "outside"); none,

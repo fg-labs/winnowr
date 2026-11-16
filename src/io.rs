@@ -1,13 +1,13 @@
-//! Reading text files that may be gzip- or BGZF-compressed.
+//! Reading text files that may be gzip- or BGZF-compressed, and writing tab-separated files.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 /// The empty block that ends a complete BGZF file (SAM/BAM specification, section 4.1.2).
-pub(crate) const BGZF_EOF: [u8; 28] = [
+pub const BGZF_EOF: [u8; 28] = [
     0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
     0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
@@ -20,7 +20,7 @@ pub(crate) const BGZF_EOF: [u8; 28] = [
 ///
 /// Returns an error if the file cannot be read, lacks the end-of-file block, or does not start
 /// with `expected_prefix`.
-pub(crate) fn append_bgzf_blocks<W: std::io::Write>(
+pub fn append_bgzf_blocks<W: std::io::Write>(
     out: &mut W,
     path: &Path,
     expected_prefix: &[u8],
@@ -60,7 +60,7 @@ pub(crate) fn append_bgzf_blocks<W: std::io::Write>(
 /// # Errors
 ///
 /// Returns an error if the file cannot be opened.
-pub(crate) fn open_text<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
+pub fn open_text<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
     let path = path.as_ref();
     let reader = rust_htslib::bgzf::Reader::from_path(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
@@ -74,7 +74,7 @@ pub(crate) fn open_text<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
 ///
 /// Returns an error if the file cannot be opened, or is BGZF-compressed without the end-of-file
 /// block.
-pub(crate) fn open_table<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
+pub fn open_table<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
     let path = path.as_ref();
     // Only a regular file can be checked: reading the start of a pipe (e.g. process substitution)
     // would consume it.
@@ -94,7 +94,7 @@ pub(crate) fn open_table<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
 
 /// True if a regular file does not end with the BGZF end-of-file block. Files that cannot be
 /// checked (e.g. pipes) are assumed complete.
-pub(crate) fn lacks_bgzf_eof(path: &Path) -> bool {
+pub fn lacks_bgzf_eof(path: &Path) -> bool {
     let check = || -> std::io::Result<bool> {
         let mut file = File::open(path)?;
         let metadata = file.metadata()?;
@@ -110,6 +110,23 @@ pub(crate) fn lacks_bgzf_eof(path: &Path) -> bool {
         Ok(tail != BGZF_EOF)
     };
     check().unwrap_or(false)
+}
+
+/// Writes a tab-separated file with a header line.
+pub fn write_tsv<I: Iterator<Item = Vec<String>>>(
+    path: &Path,
+    header: &[&str],
+    rows: I,
+) -> Result<()> {
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut out = std::io::BufWriter::new(file);
+    writeln!(out, "{}", header.join("\t"))?;
+    for row in rows {
+        debug_assert_eq!(row.len(), header.len());
+        writeln!(out, "{}", row.join("\t"))?;
+    }
+    out.flush().with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[cfg(test)]

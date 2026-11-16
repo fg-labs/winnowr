@@ -1830,6 +1830,7 @@ dependencies = [
  "clap",
  "env_logger",
  "flate2",
+ "hashbrown",
  "indexmap",
  "log",
  "lzma-sys",
@@ -1840,6 +1841,7 @@ dependencies = [
  "rust-htslib",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "winnowr-xgboost",
 ]

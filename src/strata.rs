@@ -24,15 +24,16 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::common::{PhaseTimer, Task, VariantType};
-use crate::evaluation::metric_float;
+use crate::io::write_tsv;
 use crate::labels::{
     HappyFn, Label, PromoteLabel, TRUTH_DELTA_COLUMNS, labelled_mask, read_happy_fns,
 };
 use crate::model::WinnowrModel;
+use crate::numeric::metric_float;
 use crate::policy::{ModelRowDecisions, Policy, check_model_kinds, decide_model_rows};
 use crate::promote_labels::promote_mask;
 use crate::regions::{RegionSet, ref_span};
-use crate::rescore::{Counts, Mode};
+use crate::rescore::{CallAction, Mode, Outcome};
 use crate::samples::SampleCalls;
 use crate::table::FeatureTable;
 
@@ -125,26 +126,6 @@ pub type StratumFnCounts = BTreeMap<(VariantType, Stratum), i64>;
 
 /// Truth FN counts by variant type and region (an index into a list of region sets).
 pub type RegionFnCounts = BTreeMap<(VariantType, usize), i64>;
-
-/// The truth FN records of a hap.py output VCF on `contigs`, counted by variant type and stratum.
-///
-/// An FN's stratum is decided by its REF span as a call's is (see [`table_strata`]): it is inside
-/// a truth set's regions only if its whole span is. hap.py reports the FNs of its own truth set
-/// that overlap that truth set's regions, so an FN whose span crosses their edge falls in a
-/// stratum without that truth set, as a labelled call with the same span does; it still counts in
-/// the truth set's `all` row.
-///
-/// # Errors
-///
-/// Returns an error if the VCF cannot be read or is not hap.py output.
-#[cfg(test)]
-pub fn fn_strata<S: AsRef<str>>(
-    happy: &Path,
-    contigs: &[S],
-    beds: [&RegionSet; 2],
-) -> Result<StratumFnCounts> {
-    Ok(fn_counts(happy, contigs, beds, &[])?.0)
-}
 
 /// The truth FN records of a hap.py output VCF on `contigs`, counted by variant type and stratum
 /// (as `fn_strata`) and by variant type and each region of `regions` that the FN's REF span
@@ -267,181 +248,6 @@ pub fn with_truth_labels(table: &FeatureTable, labels: &FeatureTable) -> Result<
     info.fn_counts.clone_from(&labels.info().fn_counts);
     info.promote_labelled = labels.info().promote_labelled;
     Ok(out)
-}
-
-/// A genotype model's action on a PASS call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallAction {
-    /// No action.
-    Keep,
-    /// Dropped (including re-genotyped to `0/0`).
-    Drop,
-    /// Flipped het <-> hom.
-    Flip,
-    /// Re-genotyped to the length caller's genotype.
-    Regenotype,
-}
-
-impl CallAction {
-    /// The action given drop, flip and re-genotype flags (the first set wins).
-    #[must_use]
-    pub const fn of(drop: bool, flip: bool, regenotype: bool) -> CallAction {
-        if drop {
-            CallAction::Drop
-        } else if flip {
-            CallAction::Flip
-        } else if regenotype {
-            CallAction::Regenotype
-        } else {
-            CallAction::Keep
-        }
-    }
-}
-
-/// The actions on one stratum's labelled calls and their outcomes against one truth set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Outcome {
-    /// Labelled PASS calls.
-    pub labelled: i64,
-    /// PASS calls dropped.
-    pub dropped: i64,
-    /// True-positive PASS calls dropped.
-    pub dropped_tp: i64,
-    /// PASS calls flipped.
-    pub flipped: i64,
-    /// Flips that produced the truth genotype.
-    pub flips_fixed: i64,
-    /// Flips of true-positive calls.
-    pub flips_broke_tp: i64,
-    /// PASS calls re-genotyped.
-    pub regenotyped: i64,
-    /// Re-genotypes that produced the truth genotype.
-    pub regenotypes_fixed: i64,
-    /// Re-genotypes of true-positive calls.
-    pub regenotypes_broke_tp: i64,
-    /// Labelled promotion candidates (non-PASS calls).
-    pub candidates: i64,
-    /// Candidates promoted.
-    pub promoted: i64,
-    /// Promotions that turned a truth FN into a TP.
-    pub promoted_correct: i64,
-    /// Promotions whose genotype was flipped.
-    pub promoted_flipped: i64,
-    /// The counts before any action (FNs from the truth FNs in the stratum).
-    pub before: Counts,
-    /// The change in counts from the actions.
-    pub delta: Counts,
-}
-
-impl Outcome {
-    /// Adds a labelled PASS call and the action taken on it.
-    pub fn add_call(
-        &mut self,
-        label: Label,
-        flip_ok: bool,
-        regenotype_ok: bool,
-        action: CallAction,
-    ) {
-        let is_tp = label == Label::Keep;
-        self.labelled += 1;
-        if is_tp {
-            self.before.tp += 1;
-        } else {
-            self.before.fp += 1;
-        }
-        let d = &mut self.delta;
-        match action {
-            CallAction::Keep => {}
-            CallAction::Drop => {
-                self.dropped += 1;
-                if is_tp {
-                    self.dropped_tp += 1;
-                    d.tp -= 1;
-                    d.fn_ += 1;
-                } else {
-                    d.fp -= 1;
-                }
-            }
-            CallAction::Flip | CallAction::Regenotype => {
-                let ok = if action == CallAction::Flip {
-                    self.flipped += 1;
-                    flip_ok
-                } else {
-                    self.regenotyped += 1;
-                    regenotype_ok
-                };
-                let (fixed, broke) = if action == CallAction::Flip {
-                    (&mut self.flips_fixed, &mut self.flips_broke_tp)
-                } else {
-                    (&mut self.regenotypes_fixed, &mut self.regenotypes_broke_tp)
-                };
-                if is_tp {
-                    *broke += 1;
-                    d.tp -= 1;
-                    d.fp += 1;
-                    d.fn_ += 1;
-                } else if ok {
-                    *fixed += 1;
-                    d.tp += 1;
-                    d.fp -= 1;
-                    d.fn_ -= 1;
-                }
-            }
-        }
-    }
-
-    /// Adds a labelled promotion candidate and whether it was promoted (and flipped).
-    pub fn add_candidate(&mut self, label: PromoteLabel, promote: bool, flip: bool) {
-        self.candidates += 1;
-        if !promote {
-            return;
-        }
-        self.promoted += 1;
-        if flip {
-            self.promoted_flipped += 1;
-        }
-        let right = (label == PromoteLabel::Promote && !flip)
-            || (label == PromoteLabel::PromoteFlip && flip);
-        if right {
-            self.promoted_correct += 1;
-            self.delta.tp += 1;
-            self.delta.fn_ -= 1;
-        } else {
-            self.delta.fp += 1;
-        }
-    }
-
-    /// The counts after the actions.
-    #[must_use]
-    pub fn after(&self) -> Counts {
-        Counts {
-            tp: self.before.tp + self.delta.tp,
-            fp: self.before.fp + self.delta.fp,
-            fn_: self.before.fn_ + self.delta.fn_,
-        }
-    }
-
-    /// Adds another outcome's counts.
-    pub fn add(&mut self, other: &Outcome) {
-        self.labelled += other.labelled;
-        self.dropped += other.dropped;
-        self.dropped_tp += other.dropped_tp;
-        self.flipped += other.flipped;
-        self.flips_fixed += other.flips_fixed;
-        self.flips_broke_tp += other.flips_broke_tp;
-        self.regenotyped += other.regenotyped;
-        self.regenotypes_fixed += other.regenotypes_fixed;
-        self.regenotypes_broke_tp += other.regenotypes_broke_tp;
-        self.candidates += other.candidates;
-        self.promoted += other.promoted;
-        self.promoted_correct += other.promoted_correct;
-        self.promoted_flipped += other.promoted_flipped;
-        for (sum, part) in [(&mut self.before, other.before), (&mut self.delta, other.delta)] {
-            sum.tp += part.tp;
-            sum.fp += part.fp;
-            sum.fn_ += part.fn_;
-        }
-    }
 }
 
 /// Predicted P(keep) against the observed fraction of `Keep` labels, in equal-width bins.
@@ -758,30 +564,7 @@ impl StratifiedReport {
         self.outcome_rows()
             .into_iter()
             .map(|(truth, vt, stratum, o)| {
-                let (before, after) = (o.before, o.after());
-                format!(
-                    "{} {:5} {:12} {:5} labelled={} drop={} (TP {}) flip={} (fixed {}, broke {}) \
-                     regenotype={} (fixed {}, broke {}) promote={} (correct {}) F1 {:.5} -> {:.5} \
-                     ({:+.5})",
-                    self.sample,
-                    self.names[truth],
-                    stratum,
-                    vt,
-                    o.labelled,
-                    o.dropped,
-                    o.dropped_tp,
-                    o.flipped,
-                    o.flips_fixed,
-                    o.flips_broke_tp,
-                    o.regenotyped,
-                    o.regenotypes_fixed,
-                    o.regenotypes_broke_tp,
-                    o.promoted,
-                    o.promoted_correct,
-                    before.f1(),
-                    after.f1(),
-                    after.f1() - before.f1()
-                )
+                summary_line(&self.sample, &self.names[truth], &stratum, 12, vt, &o, false)
             })
             .collect()
     }
@@ -955,34 +738,45 @@ impl RegionReport {
         self.outcome_rows()
             .into_iter()
             .map(|(truth, vt, region, o)| {
-                let (before, after) = (o.before, o.after());
-                format!(
-                    "{} {:5} {:38} {:5} labelled={} drop={} (TP {}) flip={} (fixed {}, broke {}) \
-                     regenotype={} (fixed {}, broke {}) promote={} (correct {}) FN={} F1 {:.5} -> \
-                     {:.5} ({:+.5})",
-                    self.sample,
-                    self.names[truth],
-                    region,
-                    vt,
-                    o.labelled,
-                    o.dropped,
-                    o.dropped_tp,
-                    o.flipped,
-                    o.flips_fixed,
-                    o.flips_broke_tp,
-                    o.regenotyped,
-                    o.regenotypes_fixed,
-                    o.regenotypes_broke_tp,
-                    o.promoted,
-                    o.promoted_correct,
-                    before.fn_,
-                    before.f1(),
-                    after.f1(),
-                    after.f1() - before.f1()
-                )
+                summary_line(&self.sample, &self.names[truth], &region, 38, vt, &o, true)
             })
             .collect()
     }
+}
+
+/// A log line of an outcome row: the sample, truth set, group (stratum or region, padded to
+/// `width`) and variant type, then the actions, their outcomes and the F1 change, with the truth
+/// FNs when `with_fn`.
+fn summary_line(
+    sample: &str,
+    truth: &str,
+    group: &dyn std::fmt::Display,
+    width: usize,
+    vt: VariantType,
+    o: &Outcome,
+    with_fn: bool,
+) -> String {
+    let (before, after) = (o.before, o.after());
+    let fns = if with_fn { format!("FN={} ", before.fn_) } else { String::new() };
+    format!(
+        "{sample} {truth:5} {group:width$} {vt} labelled={} drop={} (TP {}) flip={} (fixed {}, \
+         broke {}) regenotype={} (fixed {}, broke {}) promote={} (correct {}) {fns}F1 {:.5} -> \
+         {:.5} ({:+.5})",
+        o.labelled,
+        o.dropped,
+        o.dropped_tp,
+        o.flipped,
+        o.flips_fixed,
+        o.flips_broke_tp,
+        o.regenotyped,
+        o.regenotypes_fixed,
+        o.regenotypes_broke_tp,
+        o.promoted,
+        o.promoted_correct,
+        before.f1(),
+        after.f1(),
+        after.f1() - before.f1()
+    )
 }
 
 /// An outcome row: the sample, truth set, group (stratum or region), variant type and mode, then
@@ -1518,19 +1312,6 @@ pub const REGION_RATE_COLUMNS: [&str; 17] = [
     "promoted_per_pass",
 ];
 
-/// Writes a tab-separated file with a header line.
-fn write_tsv<I: Iterator<Item = Vec<String>>>(path: &Path, header: &[&str], rows: I) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut out = std::io::BufWriter::new(file);
-    writeln!(out, "{}", header.join("\t"))?;
-    for row in rows {
-        debug_assert_eq!(row.len(), header.len());
-        writeln!(out, "{}", row.join("\t"))?;
-    }
-    out.flush().with_context(|| format!("failed to write {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1539,7 +1320,27 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::rescore::Counts;
     use crate::testing::{call_table, vcf_header, write_indexed_vcf};
+
+    /// The truth FN records of a hap.py output VCF on `contigs`, counted by variant type and stratum.
+    ///
+    /// An FN's stratum is decided by its REF span as a call's is (see [`table_strata`]): it is inside
+    /// a truth set's regions only if its whole span is. hap.py reports the FNs of its own truth set
+    /// that overlap that truth set's regions, so an FN whose span crosses their edge falls in a
+    /// stratum without that truth set, as a labelled call with the same span does; it still counts in
+    /// the truth set's `all` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VCF cannot be read or is not hap.py output.
+    fn fn_strata<S: AsRef<str>>(
+        happy: &Path,
+        contigs: &[S],
+        beds: [&RegionSet; 2],
+    ) -> Result<StratumFnCounts> {
+        Ok(fn_counts(happy, contigs, beds, &[])?.0)
+    }
 
     fn names() -> [String; 2] {
         ["v421".to_string(), "v5q".to_string()]
@@ -1564,6 +1365,26 @@ mod tests {
     }
 
     #[test]
+    fn summary_lines_pad_the_group_and_add_the_fns_on_request() {
+        let outcome = Outcome {
+            labelled: 4,
+            dropped: 1,
+            before: Counts { tp: 3, fp: 1, fn_: 2 },
+            delta: Counts { tp: 0, fp: -1, fn_: 0 },
+            ..Outcome::default()
+        };
+        assert_eq!(
+            summary_line("S", "v5", &"both", 6, VariantType::Snp, &outcome, false),
+            "S v5    both   snp labelled=4 drop=1 (TP 0) flip=0 (fixed 0, broke 0) regenotype=0 \
+             (fixed 0, broke 0) promote=0 (correct 0) F1 0.66667 -> 0.75000 (+0.08333)"
+        );
+        assert_eq!(
+            summary_line("S", "v5", &"MHC", 5, VariantType::Indel, &outcome, true),
+            "S v5    MHC   indel labelled=4 drop=1 (TP 0) flip=0 (fixed 0, broke 0) regenotype=0 \
+             (fixed 0, broke 0) promote=0 (correct 0) FN=2 F1 0.66667 -> 0.75000 (+0.08333)"
+        );
+    }
+    #[test]
     fn table_strata_use_the_ref_span() {
         // v421 covers chr1 [0, 100); v5q covers chr1 [50, 200).
         let first = RegionSet::from_spans("v421", [("chr1", 0, 100)]);
@@ -1580,52 +1401,6 @@ mod tests {
         let got = table_strata(&table, [&first, &second]).unwrap();
         use Stratum::*;
         assert_eq!(got, [FirstOnly, Both, Both, SecondOnly, SecondOnly, Neither, Neither]);
-    }
-
-    /// Every label, flip_ok, regenotype_ok and action: the outcomes summed over calls are what
-    /// `evaluate`'s rescoring gives the same calls and actions.
-    #[test]
-    fn outcomes_sum_to_rescore() {
-        use crate::rescore::{Actions, Promotions, baseline_counts, rescore, rescore_promote};
-        let labels = [Label::Drop, Label::Keep, Label::Flip, Label::Regenotype];
-        let actions =
-            [CallAction::Keep, CallAction::Drop, CallAction::Flip, CallAction::Regenotype];
-        let mut outcome = Outcome::default();
-        let (mut all_labels, mut flip_oks, mut regenotype_oks) = (vec![], vec![], vec![]);
-        let mut masks = Actions { drop: vec![], flip: vec![], regenotype: vec![] };
-        for label in labels {
-            for flip_ok in [false, true] {
-                for regenotype_ok in [false, true] {
-                    for action in actions {
-                        outcome.add_call(label, flip_ok, regenotype_ok, action);
-                        all_labels.push(label);
-                        flip_oks.push(flip_ok);
-                        regenotype_oks.push(regenotype_ok);
-                        masks.drop.push(action == CallAction::Drop);
-                        masks.flip.push(action == CallAction::Flip);
-                        masks.regenotype.push(action == CallAction::Regenotype);
-                    }
-                }
-            }
-        }
-        outcome.before.fn_ = 100;
-        let baseline = baseline_counts(&all_labels, 100);
-        assert_eq!(outcome.before, baseline);
-        let rescored = rescore(&all_labels, &flip_oks, &masks, baseline, &regenotype_oks);
-        assert_eq!(outcome.after(), rescored);
-        // Promotions on top.
-        let promote_labels = [PromoteLabel::Stay, PromoteLabel::Promote, PromoteLabel::PromoteFlip];
-        let mut candidates = Vec::new();
-        let mut promotions = Promotions { promote: vec![], flip: vec![] };
-        for label in promote_labels {
-            for (promote, flip) in [(false, false), (true, false), (true, true)] {
-                outcome.add_candidate(label, promote, flip);
-                candidates.push(label);
-                promotions.promote.push(promote);
-                promotions.flip.push(flip);
-            }
-        }
-        assert_eq!(outcome.after(), rescore_promote(&candidates, &promotions, rescored));
     }
 
     mod end_to_end {

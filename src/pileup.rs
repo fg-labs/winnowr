@@ -25,12 +25,14 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use smallvec::SmallVec;
 
 use crate::alleles::{length_change, variant_type_of};
 use crate::common::VariantType;
 use crate::evidence::{Evidence, EvidenceTables, write_table};
 use crate::read_pass::{
-    ReadInputs, SweepSites, anchored_length, query_position_at, run_shards, sweep_clusters,
+    MAX_READS, ReadInputs, SweepSites, anchored_length, query_position_at, run_shards,
+    sweep_clusters,
 };
 use crate::strlen::{tract_of_record, tract_window};
 
@@ -55,11 +57,6 @@ pub const PILEUP_COLUMNS: [&str; 14] = [
 /// The prefix of the pileup table line that records its read settings, before the column header
 /// (e.g. `##pileup_settings=mapq20,bq10,flank5`).
 pub const SETTINGS_PREFIX: &str = "##pileup_settings=";
-
-/// Stop counting a site's reads after this many overlapping reads (as `winnowr strlen` stops
-/// measuring a tract after as many). Pileup tables do not record it, so changing it changes the
-/// counts that models were trained on without changing their settings.
-pub const MAX_READS: u64 = 600;
 
 /// The MAPQ from which a read is in the high-MAPQ bin (by default).
 pub const HIGH_MAPQ: u8 = 20;
@@ -178,11 +175,11 @@ impl<'de> serde::Deserialize<'de> for PileupOptions {
 pub type AlleleCounts = [[u64; 3]; 3];
 
 /// The allele of a read: the index into [`AlleleCounts`].
-pub(crate) const REF: usize = 0;
+pub const REF: usize = 0;
 /// See [`REF`].
-pub(crate) const ALT: usize = 1;
+pub const ALT: usize = 1;
 /// See [`REF`].
-pub(crate) const OTHER: usize = 2;
+pub const OTHER: usize = 2;
 
 /// One record of a pileup table: a SNP or indel record's allele read counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,7 +310,9 @@ impl Substitutions {
     ) -> Option<usize> {
         let start = u64::try_from(record.pos()).ok()?;
         let (qualities, sequence) = (record.qual(), record.seq());
-        let mut bases = Vec::with_capacity(self.positions.len());
+        // The read's bases, on the stack for the usual few positions: this runs for every read at
+        // every site.
+        let mut bases: SmallVec<[u8; 8]> = SmallVec::with_capacity(self.positions.len());
         for &at in &self.positions {
             let query = query_position_at(cigar, start, u64::try_from(at).ok()?)? as usize;
             let quality = *qualities.get(query)?;
@@ -323,9 +322,10 @@ impl Substitutions {
             }
             bases.push(sequence[query].to_ascii_uppercase());
         }
-        Some(if bases == self.reference {
+        let bases = bases.as_slice();
+        Some(if bases == self.reference.as_slice() {
             REF
-        } else if self.alts.contains(&bases) {
+        } else if self.alts.iter().any(|alt| alt.as_slice() == bases) {
             ALT
         } else {
             OTHER
@@ -443,7 +443,8 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    /// True once [`MAX_READS`] reads have been counted: later reads are not read.
+    /// True once more than [`MAX_READS`] reads have been counted (the last is not counted at
+    /// its alleles): later reads are not read.
     fn is_full(&self) -> bool {
         self.n_reads > MAX_READS
     }
@@ -475,8 +476,8 @@ fn allele_of(
 }
 
 /// Counts reads at sites on one contig: each read (see [`sweep_clusters`]) is counted at every
-/// site whose span it overlaps, up to [`MAX_READS`] reads per site. Overlapping mates are both
-/// counted.
+/// site whose span it overlaps, until the site is full: at most [`MAX_READS`] reads are counted
+/// at a site's alleles. Overlapping mates are both counted.
 fn count_sites(
     reads: &mut rust_htslib::bam::IndexedReader,
     tid: u32,
@@ -506,8 +507,6 @@ impl SweepSites for Counting<'_> {
         &mut self,
         i: usize,
         record: &rust_htslib::bam::Record,
-        _start: i64,
-        _end: i64,
         cigar: &mut Option<rust_htslib::bam::record::CigarStringView>,
     ) {
         let accumulator = &mut self.accumulators[i];
@@ -606,7 +605,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::evidence::{check_options, read_tables};
+    use crate::evidence::read_tables;
+    use crate::model_evidence::check_options;
     use crate::testing::{TestRead, write_bam};
 
     #[test]
@@ -814,6 +814,45 @@ mod tests {
         let counted = count_sites(&mut reader, 0, &[site], &options).unwrap();
         assert_eq!(counted[0].n_reads, 7);
         assert_eq!(counted[0].counts, [[0, 0, 1], [0, 0, 4], [0, 0, 1]]);
+    }
+
+    #[test]
+    fn counts_alleles_substituted_at_more_bases_than_fit_on_the_stack() {
+        let dir = TempDir::new().unwrap();
+        let options = PileupOptions::default();
+        // Ten substituted bases at 0-based [122, 132), more than the 8 a read's bases hold on the
+        // stack: the alternate changes every one.
+        let positions: Vec<usize> = (122..132).collect();
+        let change = |base: u8| match base {
+            b'A' => 'C',
+            b'C' => 'G',
+            b'G' => 'T',
+            _ => 'A',
+        };
+        let alt: Vec<(usize, char)> =
+            positions.iter().map(|&at| (at, change(reference().as_bytes()[at]))).collect();
+        let reads: Vec<(&str, String)> = vec![
+            ("ref", bases_with(90, 160, &[])),
+            ("alt", bases_with(90, 160, &alt)),
+            // The alternate but for its last base.
+            ("other", bases_with(90, 160, &alt[..alt.len() - 1])),
+        ];
+        let reads: Vec<TestRead<'_>> = reads
+            .iter()
+            .map(|(name, bases)| TestRead { bases: Some(bases), ..read(name, 90, "70M", 60) })
+            .collect();
+        let bam = write_bam(dir.path(), "reads.bam", reference().len() as u64, &reads);
+        let substitutions = Substitutions {
+            positions: positions.iter().map(|&at| at as i64).collect(),
+            reference: reference().as_bytes()[122..132].to_vec(),
+            alts: vec![alt.iter().map(|&(_, base)| base as u8).collect()],
+        };
+        let span = substitutions.span();
+        let site = Site { kind: SiteKind::Snp(substitutions), span };
+        let mut reader = rust_htslib::bam::IndexedReader::from_path(&bam).unwrap();
+        let counted = count_sites(&mut reader, 0, &[site], &options).unwrap();
+        assert_eq!(counted[0].n_reads, 3);
+        assert_eq!(counted[0].counts, [[0, 0, 1], [0, 0, 1], [0, 0, 1]]);
     }
 
     #[test]

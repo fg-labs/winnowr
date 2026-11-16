@@ -239,7 +239,7 @@ where
 /// # Errors
 ///
 /// Returns an error naming the repeated contigs.
-pub(crate) fn check_unique_contigs<S: AsRef<str>>(contigs: &[S]) -> Result<()> {
+pub fn check_unique_contigs<S: AsRef<str>>(contigs: &[S]) -> Result<()> {
     let mut seen = HashSet::new();
     let mut repeated: Vec<&str> =
         contigs.iter().map(AsRef::as_ref).filter(|contig| !seen.insert(*contig)).collect();

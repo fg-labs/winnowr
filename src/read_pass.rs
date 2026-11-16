@@ -2,18 +2,20 @@
 //! the calls (`winnowr strlen` and `winnowr pileup`): the regions measured, their shards, the
 //! readers each shard uses, and helpers for reading the reads.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use anyhow::{Context, Result, bail};
 
 use crate::shards::ReaderPool;
 
 /// Unmapped, secondary, QC-fail, duplicate and supplementary reads are skipped.
-pub(crate) const SKIP_FLAGS: u16 = 0x4 | 0x100 | 0x200 | 0x400 | 0x800;
+pub const SKIP_FLAGS: u16 = 0x4 | 0x100 | 0x200 | 0x400 | 0x800;
 
 /// The query position aligned (M/=/X) at a reference position, or `None` (deleted or
 /// unaligned).
-pub(crate) fn query_position_at(
+pub fn query_position_at(
     cigar: &[rust_htslib::bam::record::Cigar],
     reference_start: u64,
     target: u64,
@@ -45,7 +47,7 @@ pub(crate) fn query_position_at(
 
 /// The end of a read's alignment as htslib computes it to decide whether a read overlaps a
 /// fetched region: its start plus the reference length of its CIGAR, and at least one base.
-pub(crate) fn alignment_end(record: &rust_htslib::bam::Record) -> i64 {
+pub fn alignment_end(record: &rust_htslib::bam::Record) -> i64 {
     // CIGAR operations consuming the reference: M, D, N, = and X.
     let reference_length: i64 = record
         .raw_cigar()
@@ -60,7 +62,7 @@ pub(crate) fn alignment_end(record: &rust_htslib::bam::Record) -> i64 {
 /// `first` and `last` (0-based, inclusive: the flank bases outside each end of the tract, with
 /// `flank` bases on each side) and the query bases between the flanks (the observed tract
 /// length), or `None` if the read starts after `first` or is not aligned at both anchors.
-pub(crate) fn anchored_length(
+pub fn anchored_length(
     cigar: &[rust_htslib::bam::record::Cigar],
     start: i64,
     first: i64,
@@ -76,23 +78,28 @@ pub(crate) fn anchored_length(
     Some((first_query, last_query, observed))
 }
 
+/// The most reads measured at a site (a strlen tract or a pileup call): a site is read until
+/// more than this many reads overlap it, so its count of overlapping reads is capped at
+/// `MAX_READS + 1`.
+///
+/// Neither strlen nor pileup tables record it, so changing it changes the evidence that models
+/// were trained on without changing their recorded settings.
+pub const MAX_READS: u64 = 600;
+
 /// Sites whose spans are at most this far apart are read from one fetch.
-pub(crate) const CLUSTER_GAP: i64 = 10_000;
+pub const CLUSTER_GAP: i64 = 10_000;
 
 /// The sites of one contig that [`sweep_clusters`] adds reads to, with the state they accumulate.
-pub(crate) trait SweepSites {
+pub trait SweepSites {
     /// True once site `i` takes no more reads.
     fn is_full(&self, i: usize) -> bool;
 
-    /// Adds a read whose alignment, from 0-based `start` to `end` (see [`alignment_end`]),
-    /// overlaps site `i`'s span. `cigar` caches the read's decoded CIGAR across the sites it is
-    /// added to: it is decoded the first time a site needs it.
+    /// Adds a read that overlaps site `i`'s span. `cigar` caches the read's decoded CIGAR across
+    /// the sites it is added to: it is decoded the first time a site needs it.
     fn add(
         &mut self,
         i: usize,
         record: &rust_htslib::bam::Record,
-        start: i64,
-        end: i64,
         cigar: &mut Option<rust_htslib::bam::record::CigarStringView>,
     );
 }
@@ -105,7 +112,7 @@ pub(crate) trait SweepSites {
 /// # Errors
 ///
 /// Returns an error if the reads cannot be fetched or read.
-pub(crate) fn sweep_clusters<S: SweepSites>(
+pub fn sweep_clusters<S: SweepSites>(
     reads: &mut rust_htslib::bam::IndexedReader,
     tid: u32,
     spans: &[(i64, i64)],
@@ -151,7 +158,7 @@ pub(crate) fn sweep_clusters<S: SweepSites>(
             for &i in &open {
                 let (beg, site_end) = spans[i];
                 if start < site_end && end > beg {
-                    sites.add(i, &record, start, end, &mut cigar);
+                    sites.add(i, &record, &mut cigar);
                 }
             }
         }
@@ -198,6 +205,14 @@ impl Region {
                 Ok(Region { chrom: chrom.to_string(), span: Some((start, end)) })
             }
             _ => bail!("malformed region (expected chrom or chrom:start-end): {region}"),
+        }
+    }
+
+    /// The region as written.
+    fn as_ref_str(&self) -> String {
+        match self.span {
+            Some((start, end)) => format!("{}:{start}-{end}", self.chrom),
+            None => self.chrom.clone(),
         }
     }
 }
@@ -296,7 +311,7 @@ fn plan_shards<S: AsRef<str>>(
 }
 
 /// One shard of a region being measured, with readers open on its contig.
-pub(crate) struct Shard<'r> {
+pub struct Shard<'r> {
     /// The contig.
     pub chrom: &'r str,
     /// The 1-based, inclusive start of the records to measure.
@@ -318,7 +333,7 @@ impl Shard<'_> {
     /// # Errors
     ///
     /// Returns an error if the fetch fails otherwise.
-    pub(crate) fn fetch_records(&mut self, vcf_path: &Path) -> Result<bool> {
+    pub fn fetch_records(&mut self, vcf_path: &Path) -> Result<bool> {
         use rust_htslib::bcf::Read as _;
         let rid = self.vcf.header().name2rid(self.chrom.as_bytes())?;
         match self.vcf.fetch(rid, self.start - 1, Some(self.end - 1)) {
@@ -341,7 +356,7 @@ impl Shard<'_> {
     /// # Errors
     ///
     /// Returns an error, suggesting the VCF was called against another reference, if not.
-    pub(crate) fn check_record_end(&self, pos: u64, reference: &[u8], fasta: &Path) -> Result<()> {
+    pub fn check_record_end(&self, pos: u64, reference: &[u8], fasta: &Path) -> Result<()> {
         if pos - 1 + reference.len() as u64 > self.contig.len() as u64 {
             bail!(
                 "the record at {chrom}:{pos} extends past the end of {chrom} ({} bp) in {}: was \
@@ -359,7 +374,7 @@ impl Shard<'_> {
     /// # Errors
     ///
     /// Returns an error if the contig is not in the reads' header.
-    pub(crate) fn tid(&self, alignments: &Path) -> Result<u32> {
+    pub fn tid(&self, alignments: &Path) -> Result<u32> {
         use rust_htslib::bam::Read as _;
         self.reads.header().tid(self.chrom.as_bytes()).with_context(|| {
             format!("contig {} is not in the header of {}", self.chrom, alignments.display())
@@ -375,7 +390,7 @@ impl Shard<'_> {
 ///
 /// Returns an error if the regions are malformed (see [`plan_shards`]), a file cannot be opened,
 /// or `measure` fails.
-pub(crate) fn run_shards<S, T, F>(
+pub fn run_shards<S, T, F>(
     inputs: &ReadInputs<'_>,
     regions: &[S],
     cram_fields: u32,
@@ -392,28 +407,48 @@ where
     // Reader sets are pooled, so at most one per worker thread is ever opened, and a shard takes
     // a set already holding its contig's sequence when there is one.
     let pool: ReaderPool<ShardReaders> = ReaderPool::new();
+    let contigs = SharedContigs::default();
     shards
         .par_iter()
         .map(|(chrom, start, end)| {
             let mut readers =
                 pool.take_preferring(|readers| readers.holds(chrom)).unwrap_or_default();
-            let measured =
-                readers.open(inputs, chrom, cram_fields).and_then(|(vcf, reads, contig)| {
+            let measured = readers.open(inputs, chrom, cram_fields, &contigs).and_then(
+                |(vcf, reads, contig)| {
                     measure(&mut Shard { chrom, start: *start, end: *end, vcf, reads, contig })
-                });
+                },
+            );
             pool.put(readers);
             measured
         })
         .collect()
 }
 
-impl Region {
-    /// The region as written.
-    fn as_ref_str(&self) -> String {
-        match self.span {
-            Some((start, end)) => format!("{}:{start}-{end}", self.chrom),
-            None => self.chrom.clone(),
+/// Contig sequences shared by the reader sets of a pass: sets on the same contig hold one copy of
+/// its sequence, read once while any set holds it, rather than one copy each (a whole contig,
+/// e.g. ~250 MB for chr1, per worker thread).
+#[derive(Default)]
+struct SharedContigs(Mutex<HashMap<String, Arc<ContigSlot>>>);
+
+/// A contig's sequence while some reader set holds it; locked while it is read.
+type ContigSlot = Mutex<Weak<Vec<u8>>>;
+
+impl SharedContigs {
+    /// `chrom`'s sequence: the copy a reader set holds, else read from `fasta`. A sequence is
+    /// freed when no set holds it.
+    fn get(&self, chrom: &str, fasta: &mut crate::fasta::IndexedFasta) -> Result<Arc<Vec<u8>>> {
+        let slot = {
+            let mut slots = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(slots.entry(chrom.to_string()).or_default())
+        };
+        // Sets that want the contig while it is being read wait for it rather than read it too.
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sequence) = slot.upgrade() {
+            return Ok(sequence);
         }
+        let sequence = Arc::new(fasta.fetch_all(chrom)?);
+        *slot = Arc::downgrade(&sequence);
+        Ok(sequence)
     }
 }
 
@@ -423,7 +458,7 @@ struct ShardReaders {
     vcf: Option<rust_htslib::bcf::IndexedReader>,
     reads: Option<rust_htslib::bam::IndexedReader>,
     fasta: Option<crate::fasta::IndexedFasta>,
-    contig: Option<(String, Vec<u8>)>,
+    contig: Option<(String, Arc<Vec<u8>>)>,
 }
 
 impl ShardReaders {
@@ -433,12 +468,13 @@ impl ShardReaders {
     }
 
     /// Opens the readers not yet open (the reads decoding only the CRAM fields `cram_fields`) and
-    /// loads `chrom`'s sequence if it is not loaded.
+    /// takes `chrom`'s sequence from `contigs` if it is not held.
     fn open(
         &mut self,
         inputs: &ReadInputs<'_>,
         chrom: &str,
         cram_fields: u32,
+        contigs: &SharedContigs,
     ) -> Result<(&mut rust_htslib::bcf::IndexedReader, &mut rust_htslib::bam::IndexedReader, &[u8])>
     {
         use rust_htslib::bam::Read as _;
@@ -461,8 +497,10 @@ impl ShardReaders {
         if self.fasta.is_none() {
             self.fasta = Some(crate::fasta::IndexedFasta::from_path(inputs.reference)?);
         }
-        if self.contig.as_ref().is_none_or(|(name, _)| name != chrom) {
-            let sequence = self.fasta.as_mut().expect("opened above").fetch_all(chrom)?;
+        if !self.holds(chrom) {
+            // The last contig is let go first, so it is freed if no other set holds it.
+            self.contig = None;
+            let sequence = contigs.get(chrom, self.fasta.as_mut().expect("opened above"))?;
             self.contig = Some((chrom.to_string(), sequence));
         }
         let (Some(vcf), Some(reads), Some((_, contig))) =
@@ -470,7 +508,7 @@ impl ShardReaders {
         else {
             unreachable!("the readers were opened above");
         };
-        Ok((vcf, reads, contig))
+        Ok((vcf, reads, contig.as_slice()))
     }
 }
 
@@ -519,6 +557,26 @@ mod tests {
             error.to_string(),
             "region chr1:5000-6000 starts past the end of contig chr1 (1000 bp)"
         );
+    }
+
+    #[test]
+    fn reader_sets_share_a_contig_while_any_holds_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path =
+            crate::testing::write_fasta(dir.path(), &[("chr1", "ACGTACGTAC"), ("chr2", "GG")]);
+        let mut fasta = crate::fasta::IndexedFasta::from_path(&path).unwrap();
+        let contigs = SharedContigs::default();
+        let first = contigs.get("chr1", &mut fasta).unwrap();
+        let second = contigs.get("chr1", &mut fasta).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_slice(), b"ACGTACGTAC");
+        assert_eq!(contigs.get("chr2", &mut fasta).unwrap().as_slice(), b"GG");
+        // Freed when no set holds it, and read again when next wanted.
+        let weak = Arc::downgrade(&first);
+        drop((first, second));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(contigs.get("chr1", &mut fasta).unwrap().as_slice(), b"ACGTACGTAC");
+        assert!(contigs.get("chr3", &mut fasta).is_err());
     }
 
     #[rstest]

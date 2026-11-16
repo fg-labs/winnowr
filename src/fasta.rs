@@ -150,7 +150,7 @@ impl IndexedFasta {
         self.file.seek(SeekFrom::Start(first))?;
         self.file
             .read_exact(&mut raw)
-            .with_context(|| format!("failed to read {} from {}", name, self.path.display()))?;
+            .with_context(|| format!("failed to read {name} from {}", self.path.display()))?;
         raw.retain(|&b| b != b'\n' && b != b'\r');
         if raw.len() as u64 != end - start {
             return Err(self.mismatch(name));

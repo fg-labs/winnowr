@@ -96,7 +96,7 @@ pub fn check_gvcf_header<S: AsRef<str>>(
 /// # Errors
 ///
 /// Returns an error if htslib cannot decode an annotation.
-pub(crate) fn raw_annotation(
+pub fn raw_annotation(
     fields: &mut FieldReader,
     record: &rust_htslib::bcf::Record,
     alleles: &[&[u8]],
@@ -137,19 +137,19 @@ pub fn split_as_raw_mq<S: AsRef<[u8]>>(values: &[f64], alleles: &[S]) -> (f64, f
 
 /// A gVCF variant site with raw annotations.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct GvcfSite {
+pub struct GvcfSite {
     /// The reference allele.
-    pub(crate) reference: Vec<u8>,
+    pub reference: Vec<u8>,
     /// The alternate alleles, excluding `<NON_REF>`.
-    pub(crate) alts: Vec<Vec<u8>>,
+    pub alts: Vec<Vec<u8>>,
     /// The raw annotations.
-    pub(crate) annotation: RawAnnotation,
+    pub annotation: RawAnnotation,
 }
 
 impl GvcfSite {
     /// True if the site has the call's reference allele and every one of its alternate alleles
     /// other than `*` (ignoring case).
-    pub(crate) fn has_alleles<S: AsRef<[u8]>>(&self, reference: &[u8], alts: &[S]) -> bool {
+    pub fn has_alleles<S: AsRef<[u8]>>(&self, reference: &[u8], alts: &[S]) -> bool {
         self.reference.eq_ignore_ascii_case(reference)
             && alts
                 .iter()
@@ -165,7 +165,7 @@ impl GvcfSite {
 /// Matching alleles keeps a call from taking the annotations of a different variant that the
 /// gVCF reports at the same position. The fallback to the first site keeps calls whose alleles
 /// the gVCF represents differently; callers count and report it.
-pub(crate) fn matching_site<'a, S: AsRef<[u8]>>(
+pub fn matching_site<'a, S: AsRef<[u8]>>(
     sites: &'a [GvcfSite],
     reference: &[u8],
     alts: &[S],
@@ -179,7 +179,7 @@ pub(crate) fn matching_site<'a, S: AsRef<[u8]>>(
 /// # Errors
 ///
 /// Returns an error if the gVCF header does not declare the contig, or the gVCF cannot be read.
-pub(crate) fn read_gvcf_sites(
+pub fn read_gvcf_sites(
     gvcf: &mut IndexedReader,
     path: &Path,
     contig: &str,

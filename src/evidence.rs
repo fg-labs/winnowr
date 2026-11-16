@@ -1,9 +1,8 @@
 //! Read-evidence tables: the tab-separated tables `winnowr strlen` and `winnowr pileup` write,
-//! each starting with a line that records the settings its evidence was measured with, and the
-//! check that evidence was measured as a model needs.
+//! each starting with a line that records the settings its evidence was measured with.
 
-use std::collections::HashSet;
 use std::fmt;
+use std::hash::BuildHasher;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -67,7 +66,10 @@ pub fn read_tables<E: Evidence>(paths: &[impl AsRef<Path>]) -> Result<EvidenceTa
         bail!("no {} tables given", E::NAME);
     }
     let mut rows = Vec::new();
-    let mut seen: HashSet<(String, u64, String, String)> = HashSet::new();
+    // The rows kept, by the hash of their key: the hash (so the table grows without hashing keys
+    // again) and the index into `rows`, whose key is compared, so no key is copied.
+    let hasher = std::hash::RandomState::new();
+    let mut seen: hashbrown::HashTable<(u64, usize)> = hashbrown::HashTable::new();
     let mut options: Option<(E, &Path)> = None;
     for path in paths {
         let path = path.as_ref();
@@ -116,8 +118,12 @@ pub fn read_tables<E: Evidence>(paths: &[impl AsRef<Path>]) -> Result<EvidenceTa
             }
             let row =
                 E::parse_row(&line).with_context(|| format!("{}:{line_number}", path.display()))?;
-            let (chrom, pos, reference, alt) = E::row_key(&row);
-            if seen.insert((chrom.to_string(), pos, reference.to_string(), alt.to_string())) {
+            let key = E::row_key(&row);
+            let hash = hasher.hash_one(key);
+            let same = |&(h, i): &(u64, usize)| h == hash && E::row_key(&rows[i]) == key;
+            if let hashbrown::hash_table::Entry::Vacant(entry) = seen.entry(hash, same, |&(h, _)| h)
+            {
+                entry.insert((hash, rows.len()));
                 rows.push(row);
             }
         }
@@ -166,30 +172,4 @@ pub fn write_table<E: Evidence>(
         bail!("failed to finish writing {}", path.display());
     }
     Ok(n)
-}
-
-/// Checks that evidence measured with `measured` (from `source`) can feed a model trained on
-/// evidence measured with `trained`.
-///
-/// # Errors
-///
-/// Returns an error, saying how to measure the evidence again, if the settings differ.
-pub fn check_options<E: Evidence>(
-    measured: E,
-    source: &str,
-    trained: E,
-    model: &Path,
-) -> Result<()> {
-    if measured != trained {
-        bail!(
-            "{source} was measured with {name} {settings} {measured}, but model {} was trained on \
-             evidence measured with {trained}: measure again with `winnowr {name} {option} \
-             {trained}` (or let `score --alignments` measure with the model's settings)",
-            model.display(),
-            name = E::NAME,
-            settings = E::SETTINGS,
-            option = E::OPTION,
-        );
-    }
-    Ok(())
 }

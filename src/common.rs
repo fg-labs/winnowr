@@ -1,4 +1,9 @@
 //! Basic types and constants shared across winnowr modules.
+//!
+//! Enums whose command-line values are exactly their variants ([`Task`], [`VariantType`],
+//! [`crate::labels::UnfixableFlips`]) derive clap's `ValueEnum`, with each variant's help left out
+//! of `--help` (the options describe them); `cli.rs` has its own enums for options whose values
+//! differ (e.g. add `none`).
 
 use std::fmt;
 use std::str::FromStr;
@@ -54,22 +59,38 @@ pub fn repeated<T: Ord>(items: impl IntoIterator<Item = T>) -> Vec<T> {
 }
 
 /// What a model decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Task {
     /// For PASS calls: drop (make `0/0`), keep, or flip het <-> hom.
+    #[value(help = None::<&str>)]
     Genotype,
     /// For non-PASS calls: leave filtered, promote to PASS, or promote and flip.
+    #[value(help = None::<&str>)]
     Promote,
 }
 
 /// The type of variant a model is trained for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum VariantType {
     /// A single-nucleotide polymorphism.
+    #[value(help = None::<&str>)]
     Snp,
     /// An insertion or deletion.
+    #[value(help = None::<&str>)]
     Indel,
 }
 
@@ -175,6 +196,23 @@ mod tests {
     fn unknown_variant_types_are_rejected(#[case] name: &str) {
         let message = name.parse::<VariantType>().unwrap_err().to_string();
         assert!(message.contains("expected one of: snp, indel"), "{message}");
+    }
+
+    /// The command line, model files and messages name the variants the same way: clap's
+    /// [`clap::ValueEnum`] names, serde's and [`Task::as_str`]'s.
+    #[test]
+    fn command_line_names_are_the_model_file_names() {
+        use clap::ValueEnum;
+        assert_eq!(Task::value_variants(), Task::ALL);
+        for task in Task::ALL {
+            assert_eq!(task.to_possible_value().unwrap().get_name(), task.as_str());
+            assert_eq!(serde_json::to_string(task).unwrap(), format!("\"{task}\""));
+        }
+        assert_eq!(VariantType::value_variants(), VariantType::ALL);
+        for variant_type in VariantType::ALL {
+            assert_eq!(variant_type.to_possible_value().unwrap().get_name(), variant_type.as_str());
+            assert_eq!(serde_json::to_string(variant_type).unwrap(), format!("\"{variant_type}\""));
+        }
     }
 
     #[test]

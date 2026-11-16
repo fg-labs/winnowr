@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use log::info;
 
 use crate::common::PhaseTimer;
-use crate::evidence::{Evidence, EvidenceTables, check_options, read_tables};
+use crate::evidence::{Evidence, EvidenceTables, read_tables};
 use crate::model::{ModelInfo, WinnowrModel};
 use crate::pileup::{PileupOptions, PileupTables, measure_pileup};
 use crate::pileup_features::add_pileup_features;
@@ -19,12 +19,38 @@ use crate::policy::{
 };
 use crate::read_pass::ReadInputs;
 use crate::repeat_features::add_strlen_features;
-use crate::strlen::{StrlenOptions, StrlenRow, StrlenTables, measure_regions_with, sites_to_rows};
+use crate::strlen::{StrlenOptions, StrlenRow, StrlenTables, measure_regions, sites_to_rows};
 use crate::table::{FeatureTable, FeatureTableInfo};
+
+/// Checks that evidence measured with `measured` (from `source`) can feed a model trained on
+/// evidence measured with `trained`.
+///
+/// # Errors
+///
+/// Returns an error, saying how to measure the evidence again, if the settings differ.
+pub fn check_options<E: Evidence>(
+    measured: E,
+    source: &str,
+    trained: E,
+    model: &Path,
+) -> Result<()> {
+    if measured != trained {
+        bail!(
+            "{source} was measured with {name} {settings} {measured}, but model {} was trained on \
+             evidence measured with {trained}: measure again with `winnowr {name} {option} \
+             {trained}` (or let `score --alignments` measure with the model's settings)",
+            model.display(),
+            name = E::NAME,
+            settings = E::SETTINGS,
+            option = E::OPTION,
+        );
+    }
+    Ok(())
+}
 
 /// A kind of read evidence as models use it: which models and feature tables have it, and with
 /// what settings.
-pub(crate) trait ModelEvidence: Evidence {
+pub trait ModelEvidence: Evidence {
     /// The features that use the evidence, in messages (e.g. `repeat-length features`).
     const FEATURES: &'static str;
     /// What training with the features needs, in messages (e.g. `repeat-length features need`).
@@ -74,7 +100,7 @@ impl ModelEvidence for PileupOptions {
 /// # Errors
 ///
 /// Returns an error if a table has no evidence, or two were measured differently.
-pub(crate) fn shared_options<E: ModelEvidence>(infos: &[&FeatureTableInfo]) -> Result<E> {
+pub fn shared_options<E: ModelEvidence>(infos: &[&FeatureTableInfo]) -> Result<E> {
     let mut shared: Option<(E, &str)> = None;
     for info in infos {
         let Some(options) = E::of_table(info) else {
@@ -109,7 +135,7 @@ pub(crate) fn shared_options<E: ModelEvidence>(infos: &[&FeatureTableInfo]) -> R
 ///
 /// Returns an error if the settings differ, or the table lacks evidence a model needs and
 /// [`ModelEvidence::TABLE_MUST_HAVE`].
-pub(crate) fn check_table<E: ModelEvidence>(
+pub fn check_table<E: ModelEvidence>(
     table: &Path,
     info: &FeatureTableInfo,
     models: &[WinnowrModel],
@@ -136,10 +162,7 @@ pub(crate) fn check_table<E: ModelEvidence>(
 }
 
 /// The models (by path) that use the evidence.
-pub(crate) fn models_using<E: ModelEvidence>(
-    models: &[WinnowrModel],
-    paths: &[PathBuf],
-) -> Vec<String> {
+pub fn models_using<E: ModelEvidence>(models: &[WinnowrModel], paths: &[PathBuf]) -> Vec<String> {
     paths
         .iter()
         .zip(models)
@@ -154,7 +177,7 @@ pub(crate) fn models_using<E: ModelEvidence>(
 /// # Errors
 ///
 /// Returns an error if models use the evidence and neither tables nor reads are given.
-pub(crate) fn check_supplied<E: ModelEvidence>(
+pub fn check_supplied<E: ModelEvidence>(
     users: &[String],
     tables: &[PathBuf],
     alignments: bool,
@@ -179,7 +202,7 @@ pub(crate) fn check_supplied<E: ModelEvidence>(
 /// # Errors
 ///
 /// Returns an error if two models need it measured differently.
-pub(crate) fn models_options<E: ModelEvidence>(
+pub fn models_options<E: ModelEvidence>(
     models: &[WinnowrModel],
     paths: &[PathBuf],
 ) -> Result<Option<E>> {
@@ -206,7 +229,7 @@ pub(crate) fn models_options<E: ModelEvidence>(
 /// # Errors
 ///
 /// Returns an error if a table cannot be read, or its settings differ from a model's.
-pub(crate) fn read_for_models<E: ModelEvidence>(
+pub fn read_for_models<E: ModelEvidence>(
     tables: &[PathBuf],
     models: &[WinnowrModel],
     paths: &[PathBuf],
@@ -225,7 +248,7 @@ pub(crate) fn read_for_models<E: ModelEvidence>(
 }
 
 /// What `score --alignments` measures: the reads, the settings and the contigs.
-pub(crate) struct Measuring<'a> {
+pub struct Measuring<'a> {
     /// The calls, reads and reference.
     pub inputs: &'a ReadInputs<'a>,
     /// The read settings of the repeat-length evidence the models need, if any.
@@ -255,7 +278,7 @@ impl Measuring<'_> {
 /// # Errors
 ///
 /// Returns an error if the reads cannot be measured or a model cannot score the calls.
-pub(crate) fn measure_and_decide(
+pub fn measure_and_decide(
     table: FeatureTable,
     models: &[WinnowrModel],
     policy: &Policy,
@@ -285,8 +308,8 @@ pub(crate) fn measure_and_decide(
             let inputs = ReadInputs { vcf: &vcf, alignments: &alignments, reference: &reference };
             let strlen_rows = strlen
                 .map(|options| {
-                    let mut sites = measure_regions_with(&inputs, &contigs, &[options])?;
-                    Ok::<_, anyhow::Error>(sites_to_rows(&sites.pop().unwrap_or_default()))
+                    let sites = measure_regions(&inputs, &contigs, &options)?;
+                    Ok::<_, anyhow::Error>(sites_to_rows(&sites))
                 })
                 .transpose()?;
             let pileup = pileup
@@ -393,7 +416,7 @@ mod tests {
     fn model(strlen: Option<StrlenOptions>, pileup: Option<&str>) -> WinnowrModel {
         use crate::common::{Task, VariantType};
         let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Indel);
-        model.info.stutter = strlen.map(|_| crate::stutter::fit_stutter_model(&[]));
+        model.info.stutter = strlen.map(|_| crate::testing::fit_stutter_model(&[]));
         model.info.strlen_settings = strlen;
         model.info.pileup_settings = pileup.map(|s| s.parse().unwrap());
         model

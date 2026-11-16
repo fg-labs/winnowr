@@ -10,7 +10,7 @@ on macOS, GCC's `libgomp.a` on Linux), so binaries that use it need no XGBoost o
 libraries at run time. The one exception: on a Linux distribution whose `libgomp.a` was built
 without `-fPIC` (e.g. RHEL, Amazon Linux), a position-independent binary links the shared libgomp,
 with a build warning, unless built with `RUSTFLAGS='-C relocation-model=static'`. Only the parts of XGBoost's C
-API that winnowr uses are bound: dense matrices with labels, weights and feature names, and
+API that winnowr uses are bound: dense matrices with labels and feature names, and
 boosters that train one round at a time, evaluate, predict, truncate, and save or load JSON.
 Every booster takes an explicit thread count, and prediction checks that a matrix's feature
 names and count match the model's.

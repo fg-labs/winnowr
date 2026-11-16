@@ -37,7 +37,7 @@ const INDEX_MAGIC: [&[u8; 4]; 2] = [b"TBI\x01", b"CSI\x01"];
 ///
 /// Returns an error if the path is remote, the file does not exist, is not a bgzipped VCF or BCF,
 /// or has no readable index.
-pub(crate) fn open_indexed<P: AsRef<Path>>(path: P) -> Result<IndexedReader> {
+pub fn open_indexed<P: AsRef<Path>>(path: P) -> Result<IndexedReader> {
     let path = path.as_ref();
     let text = path.to_string_lossy();
     if text.contains("://") {
@@ -69,7 +69,7 @@ pub(crate) fn open_indexed<P: AsRef<Path>>(path: P) -> Result<IndexedReader> {
 
 /// True if a local, bgzipped VCF or BCF has a tabix or CSI index next to it, so it can be read
 /// by region.
-pub(crate) fn has_index(path: &Path) -> bool {
+pub fn has_index(path: &Path) -> bool {
     rust_htslib::bgzf::is_bgzip(path).unwrap_or(false)
         && index_candidates(path)
             .into_iter()
@@ -98,7 +98,7 @@ fn starts_like_an_index(path: &Path) -> bool {
 
 /// What the tabix index of a bgzipped VCF says about it (see [`tabix_scan`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TabixScan {
+pub struct TabixScan {
     /// The contigs with records in the index, in file order.
     pub contigs: Vec<String>,
     /// The contigs scanned on which the VCF has records at POS 0 (a telomere), or `None` if that
@@ -117,7 +117,7 @@ pub(crate) struct TabixScan {
 ///
 /// rust-htslib panics, rather than failing, on a header or record line that is not UTF-8; such a
 /// panic is caught, without its message, and makes the answer unknown.
-pub(crate) fn tabix_scan<S: AsRef<str>>(vcf: &Path, contigs: Option<&[S]>) -> Option<TabixScan> {
+pub fn tabix_scan<S: AsRef<str>>(vcf: &Path, contigs: Option<&[S]>) -> Option<TabixScan> {
     use rust_htslib::tbx::Read as _;
     let mut magic = [0u8; 3];
     rust_htslib::bgzf::Reader::from_path(vcf).ok()?.read_exact(&mut magic).ok()?;
@@ -171,7 +171,7 @@ fn is_zero(pos: &[u8]) -> bool {
 /// # Errors
 ///
 /// Returns an error if the contig is not in the header, or the fetch fails otherwise.
-pub(crate) fn fetch_span(
+pub fn fetch_span(
     reader: &mut IndexedReader,
     contig: &str,
     start: u64,
@@ -192,10 +192,7 @@ pub(crate) fn fetch_span(
 }
 
 /// The contigs that a header does not declare, in the given order.
-pub(crate) fn missing_contigs<'a, S: AsRef<str>>(
-    header: &HeaderView,
-    contigs: &'a [S],
-) -> Vec<&'a str> {
+pub fn missing_contigs<'a, S: AsRef<str>>(header: &HeaderView, contigs: &'a [S]) -> Vec<&'a str> {
     contigs
         .iter()
         .map(AsRef::as_ref)
@@ -208,11 +205,7 @@ pub(crate) fn missing_contigs<'a, S: AsRef<str>>(
 /// # Errors
 ///
 /// Returns an error naming the undeclared contigs (e.g. from `1` vs `chr1` naming).
-pub(crate) fn check_contigs<S: AsRef<str>>(
-    header: &HeaderView,
-    contigs: &[S],
-    path: &Path,
-) -> Result<()> {
+pub fn check_contigs<S: AsRef<str>>(header: &HeaderView, contigs: &[S], path: &Path) -> Result<()> {
     let missing = missing_contigs(header, contigs);
     if !missing.is_empty() {
         bail!("contig(s) not in the header of {}: {}", path.display(), missing.join(", "));
@@ -221,12 +214,12 @@ pub(crate) fn check_contigs<S: AsRef<str>>(
 }
 
 /// True if the header declares the INFO field `tag`.
-pub(crate) fn has_info(header: &HeaderView, tag: &[u8]) -> bool {
+pub fn has_info(header: &HeaderView, tag: &[u8]) -> bool {
     header.info_type(tag).is_ok()
 }
 
 /// True if the header declares the FORMAT field `tag`.
-pub(crate) fn has_format(header: &HeaderView, tag: &[u8]) -> bool {
+pub fn has_format(header: &HeaderView, tag: &[u8]) -> bool {
     header.format_type(tag).is_ok()
 }
 
@@ -238,7 +231,7 @@ pub(crate) fn has_format(header: &HeaderView, tag: &[u8]) -> bool {
 /// # Errors
 ///
 /// Returns an error, naming `path`, if a header line is not UTF-8.
-pub(crate) fn header_records(
+pub fn header_records(
     header: &HeaderView,
     path: &Path,
 ) -> Result<Vec<rust_htslib::bcf::header::HeaderRecord>> {
@@ -278,7 +271,7 @@ fn quietly<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// The name of each sample in a header.
-pub(crate) fn sample_names(header: &HeaderView) -> Vec<String> {
+pub fn sample_names(header: &HeaderView) -> Vec<String> {
     header.samples().iter().map(|name| String::from_utf8_lossy(name).into_owned()).collect()
 }
 
@@ -342,7 +335,7 @@ impl VcfSummary {
 /// the type last read into it, so reading integers into a buffer last used for (byte) strings
 /// would overflow it.
 #[derive(Debug)]
-pub(crate) struct FieldReader {
+pub struct FieldReader {
     integers: Buffer,
     floats: Buffer,
     strings: Buffer,
@@ -350,7 +343,7 @@ pub(crate) struct FieldReader {
 }
 
 impl FieldReader {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         FieldReader {
             integers: Buffer::new(),
             floats: Buffer::new(),
@@ -360,7 +353,7 @@ impl FieldReader {
     }
 
     /// The first sample's genotype, normalized; missing when the record has no GT.
-    pub(crate) fn genotype(&mut self, record: &Record) -> Genotype {
+    pub fn genotype(&mut self, record: &Record) -> Genotype {
         // GT is decoded as integers, so it shares the integer buffer.
         let n_alleles = record.allele_count() as usize;
         match record.genotypes_shared_buffer(&mut self.integers) {
@@ -390,7 +383,7 @@ impl FieldReader {
     /// # Errors
     ///
     /// Returns an error if htslib cannot decode the value.
-    pub(crate) fn info(&mut self, record: &Record, tag: &[u8]) -> Result<Option<&[f64]>> {
+    pub fn info(&mut self, record: &Record, tag: &[u8]) -> Result<Option<&[f64]>> {
         let Ok((tag_type, _)) = record.header().info_type(tag) else {
             return Ok(None);
         };
@@ -423,7 +416,7 @@ impl FieldReader {
     /// # Errors
     ///
     /// Returns an error if htslib cannot decode the value.
-    pub(crate) fn info_value(&mut self, record: &Record, tag: &[u8], index: usize) -> Result<f64> {
+    pub fn info_value(&mut self, record: &Record, tag: &[u8], index: usize) -> Result<f64> {
         Ok(self
             .info(record, tag)?
             .and_then(|values| values.get(index).copied())
@@ -436,7 +429,7 @@ impl FieldReader {
     /// # Errors
     ///
     /// Returns an error if htslib cannot decode the value.
-    pub(crate) fn format(&mut self, record: &Record, tag: &[u8]) -> Result<Option<&[f64]>> {
+    pub fn format(&mut self, record: &Record, tag: &[u8]) -> Result<Option<&[f64]>> {
         let Ok((tag_type, _)) = record.header().format_type(tag) else {
             return Ok(None);
         };
@@ -486,7 +479,7 @@ impl FieldReader {
 /// declared. A plain reader flags it, but a record read by region is not flagged: such records are
 /// checked with [`DeclaredIds::check_tags`].
 #[derive(Debug, Clone)]
-pub(crate) struct DeclaredIds {
+pub struct DeclaredIds {
     /// The ids of the FILTER, INFO and FORMAT names.
     ids: std::collections::HashSet<u32>,
     /// The names declared, but not as INFO fields.
@@ -501,7 +494,7 @@ impl DeclaredIds {
     /// # Errors
     ///
     /// Returns an error if a header line is not UTF-8.
-    pub(crate) fn new(header: &HeaderView, path: &Path) -> Result<Self> {
+    pub fn new(header: &HeaderView, path: &Path) -> Result<Self> {
         let mut names: IndexMap<String, (bool, bool)> = IndexMap::new();
         for record in header_records(header, path)? {
             let (values, is_info, is_format) = match record {
@@ -533,7 +526,7 @@ impl DeclaredIds {
     /// Header lines that declare each name declared only as other kinds as an INFO and a FORMAT
     /// field, for [`DeclaredIds::check_tags`]. Added to a copy of the header, they keep every
     /// name's id.
-    pub(crate) fn tag_probe_lines(&self) -> Vec<String> {
+    pub fn tag_probe_lines(&self) -> Vec<String> {
         let description = "Declared by winnowr to find tags declared only as other kinds";
         let info = self.not_info.iter().map(|name| {
             let name = String::from_utf8_lossy(name);
@@ -553,7 +546,7 @@ impl DeclaredIds {
     /// # Errors
     ///
     /// Returns an error naming the record's position and the tag if it has one.
-    pub(crate) fn check_tags(&self, record: &Record) -> Result<()> {
+    pub fn check_tags(&self, record: &Record) -> Result<()> {
         let info = self
             .not_info
             .iter()
@@ -586,7 +579,7 @@ impl DeclaredIds {
     /// # Errors
     ///
     /// Returns an error naming the record's position if either is not so.
-    pub(crate) fn check(&self, record: &Record) -> Result<()> {
+    pub fn check(&self, record: &Record) -> Result<()> {
         if record.filters().any(|id| !self.ids.contains(&id)) {
             bail!(
                 "a FILTER of the record at {} is not declared with a ##FILTER line in the VCF \
@@ -612,7 +605,7 @@ impl DeclaredIds {
 /// The record's FILTER names joined with `;`, or `PASS` when it has none.
 ///
 /// The record's FILTERs must be declared in its header (see [`DeclaredIds`]).
-pub(crate) fn filter_string(record: &Record) -> String {
+pub fn filter_string(record: &Record) -> String {
     let header = record.header();
     let names: Vec<String> = record
         .filters()
@@ -622,12 +615,12 @@ pub(crate) fn filter_string(record: &Record) -> String {
 }
 
 /// The record's QUAL, or NaN if missing.
-pub(crate) fn qual(record: &Record) -> f64 {
+pub fn qual(record: &Record) -> f64 {
     float_to_f64(record.qual())
 }
 
 /// The record's contig name and 1-based position, for messages.
-pub(crate) fn position(record: &Record) -> String {
+pub fn position(record: &Record) -> String {
     let contig = record
         .rid()
         .and_then(|rid| record.header().rid2name(rid).ok())

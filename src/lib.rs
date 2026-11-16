@@ -9,9 +9,9 @@
 //! and it is not a stable API either.
 
 #![forbid(unsafe_code)]
-
-// The command-line interface names the other modules as `winnowr::...`, as the binary did.
-extern crate self as winnowr;
+// Items of the private modules are bare `pub` (visible in the crate only, as the modules are
+// private); `pub(crate)` is kept for items of the public `cli` module that are not public API.
+#![warn(clippy::redundant_pub_crate)]
 
 // Depended on only to enable their `static` features (see Cargo.toml).
 use bzip2_sys as _;
@@ -25,6 +25,7 @@ mod evidence;
 mod extraction;
 mod fasta;
 mod features;
+mod fitting;
 mod gvcf;
 mod io;
 mod labels;

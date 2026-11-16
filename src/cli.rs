@@ -1,46 +1,51 @@
 //! The command-line interface: global options, the subcommands, and dispatch.
 
+// The doc comments of the options are their `--help` text, where `<output>`-style placeholders
+// are literal, not HTML.
+#![allow(rustdoc::invalid_html_tags)]
+
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use log::info;
-use winnowr::common::{AUTOSOMES, PhaseTimer, Task, VariantType, repeated};
-use winnowr::evidence::read_tables;
-use winnowr::extraction::{TableInputs, TruthInputs, build_feature_table};
-use winnowr::features::feature_names;
-use winnowr::labels::UnfixableFlips;
-use winnowr::model::{CvFolds, MODEL_SUFFIX, TrainingParams, WinnowrModel, check_reference};
-use winnowr::model_evidence::{
+
+use crate::common::{AUTOSOMES, PhaseTimer, Task, VariantType, repeated};
+use crate::evidence::read_tables;
+use crate::extraction::{TableInputs, TruthInputs, build_feature_table};
+use crate::features::feature_names;
+use crate::labels::UnfixableFlips;
+use crate::model::{CvFolds, MODEL_SUFFIX, TrainingParams, WinnowrModel, check_reference};
+use crate::model_evidence::{
     Measuring, check_supplied, check_table, measure_and_decide, models_options, models_using,
     read_for_models, shared_options,
 };
-use winnowr::pileup::{PileupOptions, measure_pileup, write_pileup_table};
-use winnowr::pileup_features::PILEUP_FEATURES;
-use winnowr::policy::{
+use crate::pileup::{PileupOptions, measure_pileup, write_pileup_table};
+use crate::pileup_features::PILEUP_FEATURES;
+use crate::policy::{
     Abstention, CONFIDENT_REGIONS, DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP, Policy,
     decide_calls,
 };
-use winnowr::read_pass::ReadInputs;
-use winnowr::regions::{NamedBed, NamedPath, RegionSet, read_region_sets};
-use winnowr::repeat_features::STRLEN_FEATURES;
-use winnowr::rescore::{Mode, Rule};
-use winnowr::samples::{PromoteSampleCalls, SampleCalls};
-use winnowr::scoring::write_scored_vcf;
-use winnowr::strlen::{StrlenOptions, measure_regions_with, write_strlen_table};
-use winnowr::stutter::{
+use crate::read_pass::ReadInputs;
+use crate::regions::{NamedBed, NamedPath, RegionSet, read_region_sets};
+use crate::repeat_features::STRLEN_FEATURES;
+use crate::rescore::{Mode, Rule};
+use crate::samples::{PromoteSampleCalls, SampleCalls};
+use crate::scoring::write_scored_vcf;
+use crate::strlen::{StrlenOptions, measure_regions, write_strlen_table};
+use crate::stutter::{
     LENGTH_CALL_FEATURES, StutterFit, StutterModel, fit_stutter_from_feature_tables,
 };
-use winnowr::subset::restrict_table;
-use winnowr::table::{FeatureTable, FeatureTableInfo, TableSelection};
-use winnowr::thresholds::{DEFAULT_GRID, DEFAULT_PROMOTE_FLIP_GRID, DEFAULT_PROMOTE_GRID};
-use winnowr::training::{
+use crate::subset::restrict_table;
+use crate::table::{FeatureTable, FeatureTableInfo, TableSelection};
+use crate::thresholds::{DEFAULT_GRID, DEFAULT_PROMOTE_FLIP_GRID, DEFAULT_PROMOTE_GRID};
+use crate::training::{
     FoldTraining, TrainingSpec, fit_fold_stutter, group_samples, table_columns, train_model,
     train_promote_model,
 };
-use winnowr::vcf::VcfSummary;
-use winnowr::version::{LONG_VERSION, VERSION};
+use crate::vcf::VcfSummary;
+use crate::version::{LONG_VERSION, VERSION};
 
 /// The widest the help is wrapped to (narrower terminals wrap it narrower); the user guide's
 /// command reference shows the help at this width.
@@ -253,11 +258,6 @@ pub(crate) struct ExtractArgs {
     pub(crate) reference: Option<PathBuf>,
 }
 
-/// Parses a value ignoring case (e.g. `SNP` or `snp`).
-fn parse_ignoring_case<T: std::str::FromStr<Err = anyhow::Error>>(text: &str) -> Result<T, String> {
-    text.to_ascii_lowercase().parse().map_err(|e: anyhow::Error| e.to_string())
-}
-
 /// The options of `winnowr train`.
 #[derive(Debug, Args)]
 pub(crate) struct TrainArgs {
@@ -267,7 +267,7 @@ pub(crate) struct TrainArgs {
     pub(crate) tables: Vec<PathBuf>,
 
     /// The variant type to train for (snp or indel).
-    #[arg(long, value_parser = parse_ignoring_case::<VariantType>)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub(crate) variant_type: VariantType,
 
     /// The model file to write (`.winnowr.json` is appended if missing).
@@ -276,7 +276,7 @@ pub(crate) struct TrainArgs {
 
     /// genotype trains on PASS calls (drop/keep/flip; needs hap.py labels); promote trains on
     /// non-PASS calls (stay/promote/promote+flip; needs tables extracted with --truth-vcf).
-    #[arg(long, default_value = "genotype", value_parser = parse_ignoring_case::<Task>)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = Task::Genotype)]
     pub(crate) task: Task,
 
     /// Leave out the multi-site neighbourhood features.
@@ -314,7 +314,7 @@ pub(crate) struct TrainArgs {
     /// a call missing the second allele of a het-alt truth): flip trains them as flips, as
     /// hap.py labels them; drop trains them as drops; exclude leaves them out of the fits. They
     /// are scored as FPs in cross-validation either way. Recorded in the model.
-    #[arg(long, default_value = "flip", value_parser = parse_ignoring_case::<UnfixableFlips>)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = UnfixableFlips::Flip)]
     pub(crate) unfixable_flips: UnfixableFlips,
 
     /// Samples to hold out together in cross-validation, one comma-separated group per value
@@ -328,9 +328,8 @@ pub(crate) struct TrainArgs {
     /// chromosomes (--chromosome-folds groups of about equal calls) from every sample at once, so
     /// every fold fits every sample, and related samples' calls at the same site are held out
     /// together. Recorded in the model.
-    #[arg(long, default_value = "samples", ignore_case = true,
-          value_parser = ["samples", "chromosomes"])]
-    pub(crate) cv_folds: String,
+    #[arg(long, value_enum, ignore_case = true, default_value_t = CvFoldKind::Samples)]
+    pub(crate) cv_folds: CvFoldKind,
 
     /// The number of chromosome groups (folds) with --cv-folds chromosomes.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(2..))]
@@ -339,7 +338,7 @@ pub(crate) struct TrainArgs {
     /// Refit the final model on all its training calls, those held out for early stopping
     /// included, for the rounds its early stopping chose. Has no effect without early stopping
     /// (a zero --validation-fraction). Recorded in the model.
-    #[arg(long, default_value_t = winnowr::model::DEFAULT_REFIT_FINAL, num_args = 0..=1,
+    #[arg(long, default_value_t = crate::model::DEFAULT_REFIT_FINAL, num_args = 0..=1,
           default_missing_value = "true", action = clap::ArgAction::Set)]
     pub(crate) refit_final: bool,
 
@@ -435,20 +434,6 @@ pub(crate) struct EvaluateArgs {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OutsideTDrop(Option<f64>);
 
-/// Parses a probability: a finite number in `[0, 1]`.
-///
-/// # Errors
-///
-/// Returns an error naming the value if it is not a number, not finite, or outside `[0, 1]`.
-fn parse_probability(text: &str) -> Result<f64> {
-    let value: f64 = text.parse().with_context(|| format!("not a number: {text}"))?;
-    // A NaN fails the range check too.
-    if !(0.0..=1.0).contains(&value) {
-        bail!("must be a probability between 0 and 1, got {text}");
-    }
-    Ok(value)
-}
-
 impl std::fmt::Display for OutsideTDrop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
@@ -465,12 +450,86 @@ impl std::str::FromStr for OutsideTDrop {
         if text.eq_ignore_ascii_case("none") {
             return Ok(OutsideTDrop(None));
         }
-        let value: f64 = text.parse().with_context(|| format!("not a number or none: {text}"))?;
-        if !(0.0..=1.0).contains(&value) {
-            bail!("must be between 0 and 1, got {value}");
-        }
+        let value =
+            parse_probability(text).map_err(|error| anyhow::anyhow!("{error} (or none)"))?;
         Ok(OutsideTDrop(Some(value)))
     }
+}
+
+/// Parses a probability: a finite number in `[0, 1]`.
+///
+/// # Errors
+///
+/// Returns an error naming the value if it is not a number, not finite, or outside `[0, 1]`.
+fn parse_probability(text: &str) -> Result<f64> {
+    let value: f64 = text.parse().with_context(|| format!("not a number: {text}"))?;
+    // A NaN fails the range check too.
+    if !(0.0..=1.0).contains(&value) {
+        bail!("must be a probability between 0 and 1, got {text}");
+    }
+    Ok(value)
+}
+
+/// How `train`'s cross-validation forms its folds (see [`CvFolds`]), as --cv-folds takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum CvFoldKind {
+    /// Hold out each sample group in turn.
+    #[value(help = None::<&str>)]
+    Samples,
+    /// Hold out groups of whole chromosomes from every sample at once.
+    #[value(help = None::<&str>)]
+    Chromosomes,
+}
+
+/// A value of --keep-fallback: a variant type, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum KeepFallback {
+    /// SNP genotype models.
+    #[value(help = None::<&str>)]
+    Snp,
+    /// Indel genotype models.
+    #[value(help = None::<&str>)]
+    Indel,
+    /// No variant type (alone).
+    #[value(help = None::<&str>)]
+    None,
+}
+
+impl KeepFallback {
+    /// The variant type, unless none.
+    fn variant_type(self) -> Option<VariantType> {
+        match self {
+            KeepFallback::Snp => Some(VariantType::Snp),
+            KeepFallback::Indel => Some(VariantType::Indel),
+            KeepFallback::None => None,
+        }
+    }
+}
+
+impl From<VariantType> for KeepFallback {
+    fn from(variant_type: VariantType) -> Self {
+        match variant_type {
+            VariantType::Snp => KeepFallback::Snp,
+            VariantType::Indel => KeepFallback::Indel,
+        }
+    }
+}
+
+/// A value of --abstain-actions: an action withheld outside the confident regions, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum AbstainAction {
+    /// Flipping het <-> hom.
+    #[value(help = None::<&str>)]
+    Flip,
+    /// Re-genotyping repeat-length calls.
+    #[value(help = None::<&str>)]
+    Regenotype,
+    /// Promoting filtered calls.
+    #[value(help = None::<&str>)]
+    Promote,
+    /// No action (alone).
+    #[value(help = None::<&str>)]
+    None,
 }
 
 /// Options that change how genotype and promote models act, beyond their thresholds.
@@ -484,22 +543,22 @@ impl std::str::FromStr for OutsideTDrop {
 pub(crate) struct PolicyArgs {
     /// Variant types whose genotype model also drops the calls its thresholds leave alone when
     /// P(keep) is below 0.5 (none, alone: no variant type).
-    #[arg(long, num_args = 1.., default_values_t = DEFAULT_KEEP_FALLBACK.map(|vt| vt.to_string()),
-          ignore_case = true, value_parser = ["snp", "indel", "none"])]
-    pub(crate) keep_fallback: Vec<String>,
+    #[arg(long, num_args = 1.., value_enum, ignore_case = true,
+          default_values_t = DEFAULT_KEEP_FALLBACK.map(KeepFallback::from))]
+    pub(crate) keep_fallback: Vec<KeepFallback>,
 
     /// Experimental: variant types whose genotype model takes the action of greatest expected F1
     /// gain instead of using its thresholds (and in place of --keep-fallback): flip or
     /// re-genotype when its probability is above 0.5, else drop when P(keep) is below 0.5.
-    #[arg(long, num_args = 1.., value_parser = parse_ignoring_case::<VariantType>)]
+    #[arg(long, num_args = 1.., value_enum, ignore_case = true)]
     pub(crate) expected_f1: Vec<VariantType>,
 
     /// Experimental: actions withheld from calls outside the confident regions (--regions
     /// notinalldifficultregions=PATH; calls whose REF span is not inside it are "outside"); none,
     /// alone: no action.
-    #[arg(long, num_args = 1.., default_values = ["none"], ignore_case = true,
-          value_parser = ["flip", "regenotype", "promote", "none"])]
-    pub(crate) abstain_actions: Vec<String>,
+    #[arg(long, num_args = 1.., value_enum, ignore_case = true,
+          default_values_t = [AbstainAction::None])]
+    pub(crate) abstain_actions: Vec<AbstainAction>,
 
     /// The drop threshold of indel calls outside the confident regions: they are dropped when
     /// P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
@@ -532,17 +591,20 @@ impl PolicyArgs {
         regions: &[NamedBed],
         indel_genotype: bool,
     ) -> Result<Policy> {
-        let keep_fallback = without_none("--keep-fallback", &self.keep_fallback)?;
-        let abstain_actions = without_none("--abstain-actions", &self.abstain_actions)?;
+        let keep_fallback =
+            without_none("--keep-fallback", &self.keep_fallback, KeepFallback::None)?;
+        let abstain_actions =
+            without_none("--abstain-actions", &self.abstain_actions, AbstainAction::None)?;
         let mut policy = Policy::new(mode);
-        for vt in &keep_fallback {
-            policy.rules.insert(vt.parse()?, Rule::KeepFallback);
+        for vt in keep_fallback.iter().filter_map(|value| value.variant_type()) {
+            policy.rules.insert(vt, Rule::KeepFallback);
         }
         for &vt in &self.expected_f1 {
             policy.rules.insert(vt, Rule::ExpectedF1);
         }
-        let has = |action: &str| abstain_actions.iter().any(|a| a == action);
-        let (flip, regenotype, promote) = (has("flip"), has("regenotype"), has("promote"));
+        let has = |action: AbstainAction| abstain_actions.contains(&action);
+        let (flip, regenotype, promote) =
+            (has(AbstainAction::Flip), has(AbstainAction::Regenotype), has(AbstainAction::Promote));
         let indel_t_drop = self.outside_indel_t_drop.0;
         let path = regions.iter().find(|r| r.name == CONFIDENT_REGIONS).map(|r| r.path.as_path());
         // Read the confident regions only when something uses them, so an unused BED (e.g. in a
@@ -579,17 +641,25 @@ impl PolicyArgs {
     }
 }
 
-/// The values of a multi-valued option, lower-cased, without `none`, which means no value.
+/// The values of a multi-valued option without `none`, which means no value.
 ///
 /// # Errors
 ///
 /// Returns an error if `none` is given with other values.
-fn without_none(option: &str, values: &[String]) -> Result<Vec<String>> {
-    let values: Vec<String> = values.iter().map(|v| v.to_ascii_lowercase()).collect();
-    if values.len() > 1 && values.iter().any(|v| v == "none") {
-        bail!("{option} none cannot be given with other values, got: {}", values.join(" "));
+fn without_none<T: clap::ValueEnum + Copy + PartialEq>(
+    option: &str,
+    values: &[T],
+    none: T,
+) -> Result<Vec<T>> {
+    if values.len() > 1 && values.contains(&none) {
+        let names: Vec<String> = values
+            .iter()
+            .filter_map(|value| value.to_possible_value())
+            .map(|value| value.get_name().to_string())
+            .collect();
+        bail!("{option} none cannot be given with other values, got: {}", names.join(" "));
     }
-    Ok(values.into_iter().filter(|v| v != "none").collect())
+    Ok(values.iter().copied().filter(|&value| value != none).collect())
 }
 
 /// Whether any of the models is an indel genotype model.
@@ -794,32 +864,6 @@ pub(crate) struct StrlenArgs {
     /// in the table; a model scores only tables measured as its training tables were.
     #[arg(long, default_value_t = StrlenOptions::default())]
     pub(crate) reads: StrlenOptions,
-
-    /// Experimental: more tables to write from the same pass over the reads, as SETTINGS=PATH
-    /// (SETTINGS as for --reads).
-    #[arg(long, num_args = 1.., value_name = "SETTINGS=PATH", hide = true)]
-    pub(crate) also: Vec<AlsoOutput>,
-}
-
-/// One more `winnowr strlen` table, given as `SETTINGS=PATH` (see `--also`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AlsoOutput {
-    /// The read settings to measure the table with.
-    reads: StrlenOptions,
-    /// The table to write.
-    path: PathBuf,
-}
-
-impl std::str::FromStr for AlsoOutput {
-    type Err = anyhow::Error;
-
-    /// Parses `SETTINGS=PATH`, splitting at the first `=`.
-    fn from_str(spec: &str) -> Result<Self> {
-        let Ok(NamedPath { name, path }) = spec.parse::<NamedPath>() else {
-            bail!("expected SETTINGS=PATH, got {spec:?}");
-        };
-        Ok(AlsoOutput { reads: name.parse()?, path })
-    }
 }
 
 /// The options of `winnowr pileup`.
@@ -904,23 +948,11 @@ fn strlen(args: &StrlenArgs) -> Result<()> {
     let started = std::time::Instant::now();
     let inputs =
         ReadInputs { vcf: &args.vcf, alignments: &args.alignments, reference: &args.reference };
-    let mut outputs: Vec<(StrlenOptions, PathBuf)> = vec![(args.reads, args.output.clone())];
-    outputs.extend(args.also.iter().map(|also| (also.reads, also.path.clone())));
     check_output_dir("--output", &args.output)?;
-    for (_, path) in &outputs[1..] {
-        check_output_dir("--also", path)?;
-    }
-    // Each table is written in turn, so a repeated path would keep only the last.
-    if let Some(path) = repeated(outputs.iter().map(|(_, path)| path)).first() {
-        bail!("{} is given as more than one strlen output", path.display());
-    }
-    let options: Vec<StrlenOptions> = outputs.iter().map(|(options, _)| *options).collect();
-    let per_option = measure_regions_with(&inputs, &args.regions, &options)?;
-    let n_sites = per_option.first().map_or(0, Vec::len);
-    for ((options, path), sites) in outputs.iter().zip(&per_option) {
-        let n = write_strlen_table(path, sites, *options)?;
-        info!("Wrote {n} sites measured with {options} to {}", path.display());
-    }
+    let sites = measure_regions(&inputs, &args.regions, &args.reads)?;
+    let n_sites = sites.len();
+    let n = write_strlen_table(&args.output, &sites, args.reads)?;
+    info!("Wrote {n} sites measured with {} to {}", args.reads, args.output.display());
     let seconds = started.elapsed().as_secs_f64();
     info!(
         "Measured {n_sites} sites in {seconds:.1} s ({:.2} ms/site)",
@@ -1074,10 +1106,9 @@ fn training_params(args: &TrainArgs, threads: NonZeroUsize) -> Result<TrainingPa
         unfixable_flips: args.unfixable_flips,
         // Without early stopping the final model already fits every call.
         refit_final: args.refit_final && args.validation_fraction > 0.0,
-        cv_folds: if args.cv_folds.eq_ignore_ascii_case("chromosomes") {
-            CvFolds::Chromosomes { folds: args.chromosome_folds }
-        } else {
-            CvFolds::Samples
+        cv_folds: match args.cv_folds {
+            CvFoldKind::Samples => CvFolds::Samples,
+            CvFoldKind::Chromosomes => CvFolds::Chromosomes { folds: args.chromosome_folds },
         },
     };
     if !params.cv_folds.is_default() && !args.sample_groups.is_empty() {
@@ -1172,6 +1203,8 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
         params,
         groups: &groups,
         threads,
+        strlen_settings: strlen_options,
+        pileup_settings: pileup_options,
     };
     let mut timer = PhaseTimer::start();
     let model = if args.task == Task::Promote {
@@ -1253,9 +1286,6 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
             train_model(&samples, &spec, grid, None, false, None)?
         }
     };
-    let mut model = model;
-    model.info.strlen_settings = strlen_options;
-    model.info.pileup_settings = pileup_options;
     let mut timer = PhaseTimer::start();
     model.save(&output)?;
     timer.lap("saving the model");
@@ -1305,16 +1335,12 @@ fn log_samples(samples: &[SampleCalls], args: &TrainArgs) {
 
 /// Runs `winnowr evaluate`.
 fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
-    use winnowr::evaluation::{
+    use crate::evaluation::{
         EvaluationPolicy, baseline_metric, evaluate_model, evaluate_promote_model,
         write_policy_metrics,
     };
     check_output_dir("--output", &args.output)?;
-    let models = args
-        .models
-        .iter()
-        .map(|path| WinnowrModel::load(path, threads))
-        .collect::<Result<Vec<_>>>()?;
+    let models = load_models(&args.models, threads)?;
     let genotype: Vec<&WinnowrModel> =
         models.iter().filter(|m| m.info.task == Task::Genotype).collect();
     let promote: Vec<&WinnowrModel> =
@@ -1345,23 +1371,7 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
     };
     let table = FeatureTable::read_parquet_selected(&args.table, &selection)?;
     let info = table.info();
-    check_table_reference(&args.table, info, &models, &args.models)?;
-    check_table::<StrlenOptions>(&args.table, info, &models, &args.models)?;
-    check_table::<PileupOptions>(&args.table, info, &models, &args.models)?;
-    let trained_on: Vec<String> = args
-        .models
-        .iter()
-        .zip(&models)
-        .filter(|(_, m)| m.info.training_samples.contains(&info.sample))
-        .map(|(path, _)| path.display().to_string())
-        .collect();
-    if !trained_on.is_empty() {
-        log::warn!(
-            "{} is a training sample of {}: its metrics are in-sample and optimistic, not held-out",
-            info.sample,
-            trained_on.join(", ")
-        );
-    }
+    check_labelled_table(&args.table, info, &models, &args.models)?;
     warn_policy_only_regions(&args.regions);
     // The mode is a placeholder: evaluate reports both.
     let policy = args.policy.policy(
@@ -1402,7 +1412,7 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
         metrics.extend(promoted);
     }
     for m in &metrics {
-        let promoted = if m.t_promote < winnowr::common::NEVER {
+        let promoted = if m.t_promote < crate::common::NEVER {
             format!(
                 " t_promote={} t_promote_flip={} promoted={} (correct {}, flipped {})",
                 m.t_promote, m.t_promote_flip, m.promoted, m.promoted_correct, m.promoted_flipped
@@ -1441,6 +1451,47 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
         );
     }
     write_policy_metrics(&args.output, &metrics)
+}
+
+/// Loads model files.
+///
+/// # Errors
+///
+/// Returns an error if a model cannot be loaded.
+fn load_models(paths: &[PathBuf], threads: NonZeroUsize) -> Result<Vec<WinnowrModel>> {
+    paths.iter().map(|path| WinnowrModel::load(path, threads)).collect()
+}
+
+/// Checks that a labelled feature table (of `evaluate` or `stratify`) suits the models: that it is
+/// on their reference and has the evidence they need, measured as they need it. Warns if its
+/// sample is a training sample of a model, as its metrics are then in-sample.
+///
+/// # Errors
+///
+/// Returns an error if the table is not on a model's reference or lacks evidence a model needs.
+fn check_labelled_table(
+    table: &Path,
+    info: &FeatureTableInfo,
+    models: &[WinnowrModel],
+    paths: &[PathBuf],
+) -> Result<()> {
+    check_table_reference(table, info, models, paths)?;
+    check_table::<StrlenOptions>(table, info, models, paths)?;
+    check_table::<PileupOptions>(table, info, models, paths)?;
+    let trained_on: Vec<String> = paths
+        .iter()
+        .zip(models)
+        .filter(|(_, m)| m.info.training_samples.contains(&info.sample))
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+    if !trained_on.is_empty() {
+        log::warn!(
+            "{} is a training sample of {}: its metrics are in-sample and optimistic, not held-out",
+            info.sample,
+            trained_on.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Checks a feature table's reference contigs against each model's, warning if the table does
@@ -1485,9 +1536,9 @@ fn warn_policy_only_regions(regions: &[NamedBed]) {
 
 /// Runs `winnowr stratify`.
 fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
-    use winnowr::regions::RegionSet;
-    use winnowr::regions::read_stratification_manifest;
-    use winnowr::strata::{
+    use crate::regions::RegionSet;
+    use crate::regions::read_stratification_manifest;
+    use crate::strata::{
         CALL_KEY_COLUMNS, CallOutputs, TRUTH_LABEL_COLUMNS, TruthSets, check_region_names, stratify,
     };
     check_output_dir("--output", &args.output)?;
@@ -1497,11 +1548,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
     if let Some(dir) = args.labelled_calls.as_deref().filter(|dir| !dir.is_dir()) {
         bail!("the --labelled-calls directory {} does not exist", dir.display());
     }
-    let models = args
-        .models
-        .iter()
-        .map(|path| WinnowrModel::load(path, threads))
-        .collect::<Result<Vec<_>>>()?;
+    let models = load_models(&args.models, threads)?;
     let names: [String; 2] = [args.truth_names[0].clone(), args.truth_names[1].clone()];
     if names[0] == names[1] {
         bail!("--truth-names must differ, got {} twice", names[0]);
@@ -1536,23 +1583,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
     if second.info().sample != info.sample {
         bail!("--tables are of different samples: {} and {}", info.sample, second.info().sample);
     }
-    check_table_reference(&args.tables[0], info, &models, &args.models)?;
-    check_table::<StrlenOptions>(&args.tables[0], info, &models, &args.models)?;
-    check_table::<PileupOptions>(&args.tables[0], info, &models, &args.models)?;
-    let trained_on: Vec<String> = args
-        .models
-        .iter()
-        .zip(&models)
-        .filter(|(_, m)| m.info.training_samples.contains(&info.sample))
-        .map(|(path, _)| path.display().to_string())
-        .collect();
-    if !trained_on.is_empty() {
-        log::warn!(
-            "{} is a training sample of {}: its metrics are in-sample and optimistic, not held-out",
-            info.sample,
-            trained_on.join(", ")
-        );
-    }
+    check_labelled_table(&args.tables[0], info, &models, &args.models)?;
     let beds = [
         RegionSet::from_bed(&names[0], &args.truth_beds[0])?,
         RegionSet::from_bed(&names[1], &args.truth_beds[1])?,
@@ -1621,7 +1652,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
 
 /// Runs `winnowr subset`.
 fn subset(args: &SubsetArgs) -> Result<()> {
-    use winnowr::regions::RegionSet;
+    use crate::regions::RegionSet;
     check_output_dir("--output", &args.output)?;
     let table = FeatureTable::read_parquet(&args.table)?;
     let contigs =
@@ -1646,11 +1677,7 @@ fn subset(args: &SubsetArgs) -> Result<()> {
 /// Runs `winnowr score`.
 fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
     check_output_dir("--output", &args.output)?;
-    let models = args
-        .models
-        .iter()
-        .map(|path| WinnowrModel::load(path, threads))
-        .collect::<Result<Vec<_>>>()?;
+    let models = load_models(&args.models, threads)?;
     let supplied: Vec<&str> = args.regions.iter().map(|r| r.name.as_str()).collect();
     for (path, model) in args.models.iter().zip(&models) {
         let mut missing: Vec<&str> = model
@@ -1783,18 +1810,37 @@ pub fn run(cli: &Cli) -> Result<()> {
     // Only training needs the full OpenMP team (see check_openmp_environment).
     if matches!(cli.command, Command::Train(_)) {
         winnowr_xgboost::check_openmp_environment(threads, |name| std::env::var(name).ok())
-            .map_err(anyhow::Error::msg)?;
+            .map_err(openmp_error)?;
     }
     dispatch(&cli.command, threads)
 }
 
-/// A command line as one string, for the log: the arguments separated by spaces, each quoted
-/// when it is empty or holds whitespace or quotes.
+/// The error for an OpenMP environment that training cannot run in: the problem, with advice
+/// that names `-t` (see [`winnowr_xgboost::OpenMpProblem`]).
+fn openmp_error(error: winnowr_xgboost::Error) -> anyhow::Error {
+    use winnowr_xgboost::OpenMpProblem;
+    let Some(problem) = error.openmp_problem() else { return error.into() };
+    let explanation = problem.explanation();
+    match problem {
+        OpenMpProblem::Dynamic { .. } => anyhow::anyhow!(problem.to_string()),
+        OpenMpProblem::HiddenThreadLimit { variable, limit, .. } => {
+            anyhow::anyhow!("{explanation}; use -t {limit} or less, or raise or unset {variable}")
+        }
+        OpenMpProblem::ThreadLimit { limit, threads } => anyhow::anyhow!(
+            "{explanation}, and a model trained so is not the one -t {threads} names; use -t \
+             {limit} or less, or raise or unset OMP_THREAD_LIMIT"
+        ),
+    }
+}
+
+/// A command line as one string, for the log, that a POSIX shell reads back as the same arguments:
+/// the arguments separated by spaces, each single-quoted unless it is non-empty and holds only
+/// characters a shell takes literally (ASCII letters, digits and `-_./=:,@%+`).
 fn command_line<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> String {
     let quote = |arg: std::ffi::OsString| {
         let arg = arg.to_string_lossy().into_owned();
         let plain = !arg.is_empty()
-            && !arg.chars().any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\'));
+            && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c));
         if plain { arg } else { format!("'{}'", arg.replace('\'', r"'\''")) }
     };
     args.into_iter().map(quote).collect::<Vec<_>>().join(" ")
@@ -1843,6 +1889,11 @@ mod tests {
     #[case::spaces(&["winnowr", "--vcf", "my calls.vcf"], "winnowr --vcf 'my calls.vcf'")]
     #[case::empty(&["winnowr", ""], "winnowr ''")]
     #[case::quote(&["winnowr", "it's"], r"winnowr 'it'\''s'")]
+    #[case::settings(&["winnowr", "--regions", "a=x/b.bed.gz", "chr1:1-2,000"], "winnowr --regions a=x/b.bed.gz chr1:1-2,000")]
+    #[case::metacharacters(
+        &["winnowr", "a;b", "$HOME/x", "*.bed", "a&b", "(x)", "a|b", "~/x", "a>b", "`x`", "é"],
+        "winnowr 'a;b' '$HOME/x' '*.bed' 'a&b' '(x)' 'a|b' '~/x' 'a>b' '`x`' 'é'"
+    )]
     fn command_lines_are_logged_quoted(#[case] args: &[&str], #[case] expected: &str) {
         assert_eq!(command_line(args.iter().map(std::ffi::OsString::from)), expected);
     }
@@ -1958,8 +2009,8 @@ mod tests {
     #[case::train_zero_patience(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--early-stopping-rounds", "0"], ErrorKind::ValueValidation)]
     #[case::train_zero_block_size(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--validation-block-size", "0"], ErrorKind::ValueValidation)]
     #[case::train_huge_seed(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--seed", "9223372036854775808"], ErrorKind::ValueValidation)]
-    #[case::train_bad_unfixable_flips(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--unfixable-flips", "keep"], ErrorKind::ValueValidation)]
-    #[case::train_bad_variant_type(&["train", "--tables", "a", "--variant-type", "mnp", "-o", "m"], ErrorKind::ValueValidation)]
+    #[case::train_bad_unfixable_flips(&["train", "--tables", "a", "--variant-type", "snp", "-o", "m", "--unfixable-flips", "keep"], ErrorKind::InvalidValue)]
+    #[case::train_bad_variant_type(&["train", "--tables", "a", "--variant-type", "mnp", "-o", "m"], ErrorKind::InvalidValue)]
     #[case::score_without_models(&["score", "--vcf", "v", "-o", "o"], ErrorKind::MissingRequiredArgument)]
     #[case::score_bad_mode(&["score", "--vcf", "v", "-o", "o", "--models", "m", "--mode", "x"], ErrorKind::ValueValidation)]
     #[case::score_alignments_without_reference(&["score", "--vcf", "v", "-o", "o", "--models", "m", "--alignments", "a.cram"], ErrorKind::MissingRequiredArgument)]
@@ -2032,7 +2083,7 @@ mod tests {
         .unwrap();
         let Command::Train(args) = cli.command else { panic!("not train") };
         assert_eq!(args.unfixable_flips, UnfixableFlips::Exclude);
-        assert_eq!((args.cv_folds.as_str(), args.chromosome_folds), ("samples", 5));
+        assert_eq!((args.cv_folds, args.chromosome_folds), (CvFoldKind::Samples, 5));
         assert!(args.refit_final);
         let cli = parse(&[
             "train",
@@ -2050,7 +2101,7 @@ mod tests {
         ])
         .unwrap();
         let Command::Train(args) = cli.command else { panic!("not train") };
-        assert!(args.cv_folds.eq_ignore_ascii_case("chromosomes"));
+        assert_eq!(args.cv_folds, CvFoldKind::Chromosomes);
         assert_eq!(args.chromosome_folds, 4);
         assert!(args.refit_final);
         let cli = parse(&[
@@ -2127,10 +2178,8 @@ mod tests {
             dispatch(&cli.command, NonZeroUsize::new(1).unwrap()).unwrap();
         }
 
-        #[test]
-        fn extract_train_evaluate_and_score() {
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = |name: &str| dir.path().join(name).display().to_string();
+        /// Writes the calls (`calls.vcf.gz`) and their hap.py output (`happy.vcf`) to `dir`.
+        fn write_calls(dir: &Path) {
             let (mut vcf, mut happy) = (HEADER.to_string(), HAPPY_HEADER.to_string());
             for i in 0..CALLS {
                 let pos = 1000 + 200 * i;
@@ -2154,8 +2203,15 @@ mod tests {
                     "chr1\t{pos}\t.\tA\tG\t.\t.\t.\tGT:BD:BK:BVT\t0/1:FN:.:SNP\t.:.:.:NOCALL\n"
                 ));
             }
-            write_bgzf_indexed(&dir.path().join("calls.vcf.gz"), &vcf);
-            std::fs::write(dir.path().join("happy.vcf"), happy).unwrap();
+            write_bgzf_indexed(&dir.join("calls.vcf.gz"), &vcf);
+            std::fs::write(dir.join("happy.vcf"), happy).unwrap();
+        }
+
+        #[test]
+        fn extract_train_evaluate_and_score() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_calls(dir.path());
             for sample in ["S1", "S2"] {
                 run(&[
                     "extract",
@@ -2201,7 +2257,7 @@ mod tests {
             assert_eq!(info.params.cv_folds, CvFolds::Samples);
             for thresholds in info.thresholds.values() {
                 for t in [thresholds.t_drop, thresholds.t_flip] {
-                    assert!([0.3, 0.5, 0.7, winnowr::common::NEVER].contains(&t), "{t}");
+                    assert!([0.3, 0.5, 0.7, crate::common::NEVER].contains(&t), "{t}");
                 }
             }
 
@@ -2248,6 +2304,131 @@ mod tests {
             let n_dropped = records.iter().filter(|r| r[6] == "WinnowrDrop").count();
             let n_flipped = records.iter().filter(|r| r[7].contains("WINNOWR_FLIP")).count();
             assert_eq!((n_dropped, n_flipped), (dropped, flipped));
+        }
+
+        /// A model trained on pileup features records the tables' pileup settings.
+        #[test]
+        fn train_records_the_pileup_settings() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_calls(dir.path());
+            let mut pileup = format!(
+                "##pileup_settings=mapq20,bq9,flank5\n{}\n",
+                crate::pileup::PILEUP_COLUMNS.join("\t")
+            );
+            for i in 0..CALLS {
+                let (reference, alt) = if is_true(i) { (10, 10) } else { (18, 2) };
+                pileup.push_str(&format!(
+                    "chr1\t{}\tA\tC\t{}\t0\t0\t{reference}\t0\t0\t{alt}\t0\t0\t0\n",
+                    1000 + 200 * i,
+                    reference + alt
+                ));
+            }
+            std::fs::write(dir.path().join("pileup.tsv"), pileup).unwrap();
+            for sample in ["S1", "S2"] {
+                run(&[
+                    "extract",
+                    "--vcf",
+                    &path("calls.vcf.gz"),
+                    "--happy",
+                    &path("happy.vcf"),
+                    "--contigs",
+                    "chr1",
+                    "--sample",
+                    sample,
+                    "--pileup",
+                    &path("pileup.tsv"),
+                    "-o",
+                    &path(&format!("{sample}.parquet")),
+                ]);
+            }
+            run(&[
+                "train",
+                "--tables",
+                &path("S1.parquet"),
+                &path("S2.parquet"),
+                "--variant-type",
+                "snp",
+                "--pileup-features",
+                "--max-rounds",
+                "3",
+                "-o",
+                &path("snp"),
+            ]);
+            let model = WinnowrModel::load(path("snp.winnowr.json"), NonZeroUsize::new(1).unwrap())
+                .unwrap();
+            let expected: PileupOptions = "mapq20,bq9,flank5".parse().unwrap();
+            assert_eq!(model.info.pileup_settings, Some(expected));
+        }
+
+        /// `winnowr strlen` measures with the read settings of --reads and records them.
+        #[test]
+        fn strlen_measures_with_its_read_settings() {
+            use crate::strlen::{StrlenTables, measure_regions, sites_to_rows};
+            use crate::testing::TestRead;
+            let dir = tempfile::TempDir::new().unwrap();
+            // A 10-base A tract at 80 between non-repeating flanks, and a deletion of one A.
+            let left = "CGTC".repeat(20);
+            let reference = format!("{left}{}{}", "A".repeat(10), "GCTG".repeat(20));
+            let fasta = crate::testing::write_fasta(dir.path(), &[("chr1", &reference)]);
+            let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
+            let record = format!("chr1\t{}\t.\tCA\tC\t50\tPASS\t.\tGT\t0/1", left.len());
+            let vcf =
+                crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[&record]);
+            // Two low-MAPQ reads and the two mates of a pair: the settings measure all of them
+            // but count the pair once, so the table differs from one of the defaults.
+            let read = |name, pos, mapq| TestRead {
+                name,
+                pos,
+                cigar: "70M",
+                flag: 0,
+                mapq,
+                qual: 30,
+                bases: None,
+            };
+            let reads = [
+                read("pair", 45, 60),
+                read("ref", 50, 60),
+                read("low1", 50, 5),
+                read("low2", 50, 5),
+                read("pair", 55, 60),
+            ];
+            let bam =
+                crate::testing::write_bam(dir.path(), "reads.bam", reference.len() as u64, &reads);
+            let table = dir.path().join("strlen.tsv.gz");
+            let (vcf, bam, fasta) =
+                (vcf.display().to_string(), bam.display().to_string(), fasta.display().to_string());
+            run(&[
+                "strlen",
+                "--vcf",
+                &vcf,
+                "--alignments",
+                &bam,
+                "--reference",
+                &fasta,
+                "--regions",
+                "chr1",
+                "--reads",
+                "mapq0,mates",
+                "-o",
+                &table.display().to_string(),
+            ]);
+            let options: StrlenOptions = "mapq0,mates".parse().unwrap();
+            let inputs = ReadInputs {
+                vcf: Path::new(&vcf),
+                alignments: Path::new(&bam),
+                reference: Path::new(&fasta),
+            };
+            let measured =
+                |options| sites_to_rows(&measure_regions(&inputs, &["chr1"], options).unwrap());
+            let rows = measured(&options);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].n_spanning, 4);
+            assert_ne!(rows, measured(&StrlenOptions::default()));
+            assert_eq!(
+                read_tables::<StrlenOptions>(&[&table]).unwrap(),
+                StrlenTables { options, rows }
+            );
         }
     }
 
@@ -2352,7 +2533,7 @@ mod tests {
 
     #[test]
     fn the_default_policy_keeps_the_fallback_for_indels_and_an_outside_drop_threshold() {
-        use winnowr::policy::{DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP};
+        use crate::policy::{DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP};
         // Without the confident regions: the indel keep fallback only.
         let policy = score_policy(&[], &[]).unwrap();
         let expected: Vec<(VariantType, Rule)> =
@@ -2477,7 +2658,8 @@ mod tests {
     fn the_default_policy_options_come_from_the_constants() {
         let cli = parse(&["score", "--vcf", "v", "--models", "m", "-o", "o"]).unwrap();
         let Command::Score(args) = cli.command else { panic!("not score") };
-        let expected: Vec<String> = DEFAULT_KEEP_FALLBACK.iter().map(ToString::to_string).collect();
+        let expected: Vec<KeepFallback> =
+            DEFAULT_KEEP_FALLBACK.iter().map(|&vt| KeepFallback::from(vt)).collect();
         assert_eq!(args.policy.keep_fallback, expected);
         assert_eq!(
             args.policy.outside_indel_t_drop,
@@ -2491,9 +2673,92 @@ mod tests {
             assert!(!arg.is_hide_default_value_set(), "{id}");
             arg.get_default_values().iter().map(|v| v.to_string_lossy().into_owned()).collect()
         };
-        assert_eq!(shown("keep_fallback"), expected);
+        let names: Vec<String> = DEFAULT_KEEP_FALLBACK.iter().map(ToString::to_string).collect();
+        assert_eq!(shown("keep_fallback"), names);
         assert_eq!(shown("outside_indel_t_drop"), [DEFAULT_OUTSIDE_INDEL_T_DROP.to_string()]);
         assert_eq!(OutsideTDrop(None).to_string(), "none");
+    }
+
+    // The messages winnowr gave before the OpenMP check moved into winnowr-xgboost, unchanged.
+    #[rstest]
+    #[case::dynamic(
+        winnowr_xgboost::OpenMpProblem::Dynamic { value: "1".to_string() },
+        "OMP_DYNAMIC=1 lets OpenMP give XGBoost fewer threads than it asks for, which XGBoost's \
+         training does not handle (it can lose rows or crash); unset OMP_DYNAMIC or set it to false"
+    )]
+    #[case::hidden(
+        winnowr_xgboost::OpenMpProblem::HiddenThreadLimit {
+            variable: "KMP_DEVICE_THREAD_LIMIT",
+            limit: 1,
+            threads: NonZeroUsize::new(2).unwrap(),
+        },
+        "KMP_DEVICE_THREAD_LIMIT=1 is below the 2 threads requested, so OpenMP would give XGBoost \
+         fewer threads than it asks for, which XGBoost's training does not handle (it can lose rows \
+         or crash); use -t 1 or less, or raise or unset KMP_DEVICE_THREAD_LIMIT"
+    )]
+    #[case::thread_limit(
+        winnowr_xgboost::OpenMpProblem::ThreadLimit { limit: 1, threads: NonZeroUsize::new(2).unwrap() },
+        "OMP_THREAD_LIMIT=1 is below the 2 threads requested, so XGBoost would run with 1 thread, \
+         and a model trained so is not the one -t 2 names; use -t 1 or less, or raise or unset \
+         OMP_THREAD_LIMIT"
+    )]
+    fn openmp_errors_name_the_thread_option(
+        #[case] problem: winnowr_xgboost::OpenMpProblem,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(openmp_error(problem.into()).to_string(), expected);
+    }
+
+    #[test]
+    fn other_xgboost_errors_pass_through_openmp_error() {
+        let error = winnowr_xgboost::Booster::from_json(b"[]", NonZeroUsize::new(1).unwrap())
+            .expect_err("an invalid model");
+        let message = error.to_string();
+        assert_eq!(openmp_error(error).to_string(), message);
+    }
+
+    #[rstest]
+    #[case::none("None", Ok(OutsideTDrop(None)))]
+    #[case::probability("0.25", Ok(OutsideTDrop(Some(0.25))))]
+    #[case::not_a_number("x", Err("not a number: x (or none)"))]
+    #[case::above_one("1.5", Err("must be a probability between 0 and 1, got 1.5 (or none)"))]
+    #[case::nan("NaN", Err("must be a probability between 0 and 1, got NaN (or none)"))]
+    fn parses_the_outside_indel_t_drop(
+        #[case] text: &str,
+        #[case] expected: std::result::Result<OutsideTDrop, &str>,
+    ) {
+        let parsed = text.parse::<OutsideTDrop>().map_err(|error| error.to_string());
+        assert_eq!(parsed, expected.map_err(str::to_string));
+    }
+
+    /// The option enums name their values as the types they stand for do.
+    #[test]
+    fn option_values_are_named_as_their_types() {
+        use clap::ValueEnum;
+        let names = |values: &[_]| -> Vec<String> {
+            values
+                .iter()
+                .map(|value: &KeepFallback| {
+                    value.to_possible_value().unwrap().get_name().to_string()
+                })
+                .collect()
+        };
+        let mut expected: Vec<String> = VariantType::ALL.iter().map(ToString::to_string).collect();
+        expected.push("none".to_string());
+        assert_eq!(names(KeepFallback::value_variants()), expected);
+        for vt in VariantType::ALL {
+            assert_eq!(KeepFallback::from(*vt).variant_type(), Some(*vt));
+        }
+        let samples = CvFoldKind::Samples.to_possible_value().unwrap();
+        assert_eq!(
+            serde_json::to_string(&CvFolds::Samples).unwrap(),
+            format!("\"{}\"", samples.get_name())
+        );
+        let chromosomes = CvFoldKind::Chromosomes.to_possible_value().unwrap();
+        assert_eq!(
+            serde_json::to_string(&CvFolds::Chromosomes { folds: 5 }).unwrap(),
+            format!("{{\"{}\":{{\"folds\":5}}}}", chromosomes.get_name())
+        );
     }
 
     #[test]
@@ -2711,20 +2976,10 @@ mod tests {
     }
 
     #[test]
-    fn strlen_rejects_a_repeated_output_before_measuring() {
+    fn strlen_rejects_the_removed_also_option() {
         let args = ["strlen", "--vcf", "v", "--alignments", "a", "--reference", "r", "-o", "a.tsv"];
-        for also in [&["--also", "legacy=a.tsv"][..], &["--also", "legacy=b.tsv", "mapq0=b.tsv"]] {
-            let cli = parse(&[&args[..], also].concat()).unwrap();
-            let Command::Strlen(args) = cli.command else { panic!("not strlen") };
-            let message = strlen(&args).unwrap_err().to_string();
-            let path = also.last().unwrap().split_once('=').unwrap().1;
-            assert_eq!(message, format!("{path} is given as more than one strlen output"));
-        }
-        // A malformed --also fails as the command line is parsed.
-        for bad in ["mapq0", "=b.tsv", "nonsense=b.tsv"] {
-            let error = parse(&[&args[..], &["--also", bad]].concat()).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{bad}");
-        }
+        let error = parse(&[&args[..], &["--also", "legacy=b.tsv"]].concat()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]

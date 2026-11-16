@@ -51,24 +51,32 @@ impl Label {
 /// Only the training labels change: evaluation and the cross-validated threshold search score
 /// every call against its hap.py label, and an unfixable flip is an FP whatever it is labelled.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum UnfixableFlips {
     /// Train it as [`Label::Flip`], as hap.py labels it.
+    #[value(help = None::<&str>)]
     #[default]
     Flip,
     /// Train it as [`Label::Drop`]: dropping it is the only action that removes the FP.
+    #[value(help = None::<&str>)]
     Drop,
     /// Leave it out of the fits.
+    #[value(help = None::<&str>)]
     Exclude,
 }
 
 impl UnfixableFlips {
-    /// Every policy.
-    pub const ALL: [UnfixableFlips; 3] =
-        [UnfixableFlips::Flip, UnfixableFlips::Drop, UnfixableFlips::Exclude];
-
     /// The lowercase name, as written in model files and on the command line.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -89,17 +97,6 @@ impl UnfixableFlips {
 impl std::fmt::Display for UnfixableFlips {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for UnfixableFlips {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        let lower = s.to_ascii_lowercase();
-        UnfixableFlips::ALL.into_iter().find(|policy| policy.as_str() == lower).with_context(|| {
-            format!("unknown unfixable-flip policy '{s}' (expected one of: flip, drop, exclude)")
-        })
     }
 }
 
@@ -279,8 +276,28 @@ pub struct HappyLabels {
     pub truth_deltas: IndexMap<LabelKey, Option<(i64, i64)>>,
 }
 
+impl HappyLabels {
+    /// No labels, and zero FN counts for SNPs and indels.
+    fn empty() -> HappyLabels {
+        HappyLabels {
+            fn_counts: [(VariantType::Snp, 0), (VariantType::Indel, 0)].into_iter().collect(),
+            ..HappyLabels::default()
+        }
+    }
+
+    /// Adds the labels of other contigs (keys are disjoint, as they include the contig).
+    fn merge(&mut self, other: HappyLabels) {
+        self.labels.extend(other.labels);
+        for (variant_type, n) in other.fn_counts {
+            *self.fn_counts.entry(variant_type).or_default() += n;
+        }
+        self.fn_positions.extend(other.fn_positions);
+        self.truth_deltas.extend(other.truth_deltas);
+    }
+}
+
 /// The variant type of a hap.py BVT, if it is SNP or INDEL.
-pub(crate) fn variant_type_of_bvt(bvt: &str) -> Option<VariantType> {
+pub fn variant_type_of_bvt(bvt: &str) -> Option<VariantType> {
     match bvt {
         "SNP" => Some(VariantType::Snp),
         "INDEL" => Some(VariantType::Indel),
@@ -306,26 +323,6 @@ where
     let mut labels = HappyLabels::empty();
     let n_on_contigs = add_happy_records(&mut labels, records, &wanted)?;
     finish_happy_labels(labels, n_on_contigs, &wanted)
-}
-
-impl HappyLabels {
-    /// No labels, and zero FN counts for SNPs and indels.
-    fn empty() -> HappyLabels {
-        HappyLabels {
-            fn_counts: [(VariantType::Snp, 0), (VariantType::Indel, 0)].into_iter().collect(),
-            ..HappyLabels::default()
-        }
-    }
-
-    /// Adds the labels of other contigs (keys are disjoint, as they include the contig).
-    fn merge(&mut self, other: HappyLabels) {
-        self.labels.extend(other.labels);
-        for (variant_type, n) in other.fn_counts {
-            *self.fn_counts.entry(variant_type).or_default() += n;
-        }
-        self.fn_positions.extend(other.fn_positions);
-        self.truth_deltas.extend(other.truth_deltas);
-    }
 }
 
 /// Adds the labels of hap.py records on the `wanted` contigs to `labels`, in record order, and
@@ -416,7 +413,7 @@ fn finish_happy_labels(
 
 /// A truth FN record of a hap.py output VCF.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HappyFn {
+pub struct HappyFn {
     /// The contig.
     pub chrom: String,
     /// The variant type (from the TRUTH BVT).
@@ -431,7 +428,7 @@ pub(crate) struct HappyFn {
 /// # Errors
 ///
 /// Returns an error if the VCF cannot be read or is not hap.py output.
-pub(crate) fn read_happy_fns<F: Fn(&str) -> bool>(
+pub fn read_happy_fns<F: Fn(&str) -> bool>(
     path: &Path,
     on: F,
 ) -> Result<impl Iterator<Item = Result<HappyFn>>> {
@@ -990,17 +987,6 @@ pub fn labelled_mask(table: &FeatureTable, variant_type: VariantType) -> Result<
         .collect())
 }
 
-/// Counts the labels of each class, for logging.
-#[must_use]
-#[cfg(test)]
-pub fn label_counts(labels: &[f64]) -> HashMap<i64, usize> {
-    let mut counts = HashMap::new();
-    for &label in labels.iter().filter(|l| !l.is_nan()) {
-        *counts.entry(label as i64).or_default() += 1;
-    }
-    counts
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1009,6 +995,16 @@ mod tests {
 
     use super::*;
     use crate::testing::call_table;
+
+    /// Counts the labels of each class, for logging.
+    #[must_use]
+    fn label_counts(labels: &[f64]) -> HashMap<i64, usize> {
+        let mut counts = HashMap::new();
+        for &label in labels.iter().filter(|l| !l.is_nan()) {
+            *counts.entry(label as i64).or_default() += 1;
+        }
+        counts
+    }
 
     fn gt(text: &str) -> Genotype {
         if text == "./." { Genotype::MISSING } else { text.parse().unwrap() }
@@ -1497,14 +1493,18 @@ mod tests {
     }
 
     #[test]
-    fn unfixable_flip_policies_parse_and_print() {
-        for policy in UnfixableFlips::ALL {
-            assert_eq!(policy.as_str().parse::<UnfixableFlips>().unwrap(), policy);
+    fn unfixable_flip_policies_are_named_alike_everywhere() {
+        use clap::ValueEnum;
+        let policies = [UnfixableFlips::Flip, UnfixableFlips::Drop, UnfixableFlips::Exclude];
+        assert_eq!(UnfixableFlips::value_variants(), policies);
+        for policy in policies {
+            // The command line (clap), the model file (serde) and messages (Display) agree.
+            assert_eq!(policy.to_possible_value().unwrap().get_name(), policy.as_str());
             assert_eq!(policy.to_string(), policy.as_str());
             assert_eq!(serde_json::to_string(&policy).unwrap(), format!("\"{policy}\""));
         }
-        assert_eq!("DROP".parse::<UnfixableFlips>().unwrap(), UnfixableFlips::Drop);
-        assert!("keep".parse::<UnfixableFlips>().is_err());
+        assert_eq!(UnfixableFlips::from_str("DROP", true).unwrap(), UnfixableFlips::Drop);
+        assert!(UnfixableFlips::from_str("keep", true).is_err());
         assert!(UnfixableFlips::default().is_default());
         assert!(!UnfixableFlips::Exclude.is_default());
     }

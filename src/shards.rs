@@ -8,7 +8,7 @@ use crate::vcf::VcfSummary;
 /// A shard of a contig's records: those whose 0-based POS is in `[start, end)`, or from `start`
 /// to the contig's end if `end` is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ContigShard<'a> {
+pub struct ContigShard<'a> {
     /// The contig's index in the contigs the shards were planned for.
     pub index: usize,
     /// The contig.
@@ -22,7 +22,7 @@ pub(crate) struct ContigShard<'a> {
 /// Splits each of `contigs` into shards of `span` bp by its length in the VCF header (a contig
 /// without one is a single shard), in contig order. A contig's last shard is open-ended, so a
 /// record past the declared length is still in a shard.
-pub(crate) fn contig_shards<'a, S: AsRef<str>>(
+pub fn contig_shards<'a, S: AsRef<str>>(
     summary: &VcfSummary,
     contigs: &'a [S],
     span: u64,
@@ -44,22 +44,22 @@ pub(crate) fn contig_shards<'a, S: AsRef<str>>(
 /// Reader sets shared by the shards processed in parallel: a shard takes a set and puts it back
 /// when done, so at most one set per worker thread is ever opened. A panicking shard does not
 /// poison the pool.
-pub(crate) struct ReaderPool<T>(Mutex<Vec<T>>);
+pub struct ReaderPool<T>(Mutex<Vec<T>>);
 
 impl<T> ReaderPool<T> {
     /// An empty pool.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         ReaderPool(Mutex::new(Vec::new()))
     }
 
     /// Takes the set last put back, if any.
-    pub(crate) fn take(&self) -> Option<T> {
+    pub fn take(&self) -> Option<T> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).pop()
     }
 
     /// Takes a set that `prefer` accepts (e.g. one already holding a contig's sequence), else the
     /// set last put back, if any.
-    pub(crate) fn take_preferring(&self, prefer: impl Fn(&T) -> bool) -> Option<T> {
+    pub fn take_preferring(&self, prefer: impl Fn(&T) -> bool) -> Option<T> {
         let mut pool = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         match pool.iter().position(prefer) {
             Some(index) => Some(pool.swap_remove(index)),
@@ -68,7 +68,7 @@ impl<T> ReaderPool<T> {
     }
 
     /// Puts a set back for other shards to take.
-    pub(crate) fn put(&self, readers: T) {
+    pub fn put(&self, readers: T) {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).push(readers);
     }
 }
