@@ -5,7 +5,7 @@ members = ["xgboost"]
 # Metadata shared by both crates. The toolchain used for development and CI is pinned in
 # rust-toolchain.toml; rust-version is the oldest Rust the crates support, tested in CI.
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Nils Homer <nils@fulcrumgenomics.com>"]
 edition = "2024"
 rust-version = "1.88"
@@ -74,7 +74,7 @@ serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 smallvec = "1.16.5"
 # XGBoost, built from the vendored source and linked statically with OpenMP, so the binary is
 # self-contained (see xgboost/build.rs).
-winnowr-xgboost = { version = "0.1.0", path = "xgboost" }
+winnowr-xgboost = { version = "0.1.1", path = "xgboost" }
 
 # On Linux, mimalloc also replaces malloc for the C and C++ code (XGBoost, htslib, the OpenMP
 # runtime), so their allocations come from mimalloc's arenas, which it marks for transparent huge
