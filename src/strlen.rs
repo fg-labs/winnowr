@@ -222,8 +222,8 @@ impl Default for StrlenOptions {
 }
 
 impl StrlenOptions {
-    /// The settings of strlen tables, feature tables and models that do not record theirs (made
-    /// by winnowr before the settings were recorded): any MAPQ and two flank bases.
+    /// The settings of strlen tables, feature tables and models that do not record theirs: any
+    /// MAPQ and two flank bases.
     pub const LEGACY: StrlenOptions =
         StrlenOptions { min_mapq: 0, collapse_mates: false, flank: 2, flank_unit: false };
 
@@ -291,7 +291,7 @@ impl Evidence for StrlenOptions {
     const OPTION: &'static str = "--reads";
     const COLUMNS: &'static [&'static str] = &STRLEN_COLUMNS;
     const SETTINGS_PREFIX: &'static str = SETTINGS_PREFIX;
-    /// Tables without a settings line were measured with the legacy settings.
+    /// Tables without a settings line are read as measured with the legacy settings.
     const UNRECORDED: Option<Self> = Some(StrlenOptions::LEGACY);
 
     fn parse_row(line: &str) -> Result<StrlenRow> {
@@ -381,7 +381,7 @@ pub fn find_tract(
         }
         start -= 1;
     }
-    // Sliced as Python does: a tract cut off at the context's end gives a shorter unit.
+    // Clamped to the context: a tract cut off at the context's end gives a shorter unit.
     let unit = if end > start {
         &context[start..(start + period).min(context.len())]
     } else {
@@ -943,7 +943,7 @@ mod tests {
         )
         .unwrap();
         let tables = read_tables::<StrlenOptions>(&[first, second]).unwrap();
-        // Tables without a settings line were measured with the legacy settings.
+        // Tables without a settings line are read as measured with the legacy settings.
         assert_eq!(tables.options, StrlenOptions::LEGACY);
         let rows = tables.rows;
         assert_eq!(rows.len(), 2);
@@ -982,9 +982,9 @@ mod tests {
     #[test]
     fn mismatched_strlen_settings_say_how_to_measure_again() {
         let model = Path::new("m.winnowr.json");
-        let (new, old) = (StrlenOptions::default(), StrlenOptions::LEGACY);
-        assert!(check_options(new, "strlen tables", new, model).is_ok());
-        let message = check_options(old, "strlen tables", new, model).unwrap_err();
+        let (default, legacy) = (StrlenOptions::default(), StrlenOptions::LEGACY);
+        assert!(check_options(default, "strlen tables", default, model).is_ok());
+        let message = check_options(legacy, "strlen tables", default, model).unwrap_err();
         let message = message.to_string();
         assert!(
             message.contains("strlen tables was measured with strlen read settings mapq0,flank2")
@@ -1077,10 +1077,10 @@ mod tests {
     #[test]
     fn a_deletion_cut_off_at_the_contig_end_gives_a_shorter_unit() {
         // The deletion's REF runs one base past the contig, so its tract ends at the context's
-        // end; Python's slicing gives a one-base unit rather than failing.
+        // end; the unit is clamped to the context, giving a one-base unit rather than failing.
         let contig = b"ACGTACGTAC";
         let tract = tract_of_record(contig, 9, b"ACG", &["A"]).unwrap();
-        assert_eq!((tract.start, tract.end, tract.period), (9, 11, 2)); // as in Python
+        assert_eq!((tract.start, tract.end, tract.period), (9, 11, 2));
         assert_eq!(tract.unit, "C");
         assert!(tract_of_record(contig, 0, b"AC", &["A"]).is_none());
     }

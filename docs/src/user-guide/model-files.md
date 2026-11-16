@@ -35,8 +35,8 @@ refitted.
 
 When it loads a model, winnowr checks:
 
-- **Format version.** This winnowr reads format version 3 only. The Python version's models (two
-  files, formats 1 and 2) are refused, and cannot be converted: train new models.
+- **Format version.** This winnowr reads format version 3 only, and refuses other versions:
+  train new models with `winnowr train`.
 - **winnowr version.** A model trained by another winnowr version (comparing package versions,
   not git commits) loads with a warning.
 - **Reference.** `score` stops with an error when a contig the model was trained on is missing from
@@ -47,11 +47,9 @@ When it loads a model, winnowr checks:
   `--regions`.
 - **Evidence settings.** A model with repeat-length features scores only strlen evidence measured
   with its `strlen_settings`, and a model with pileup features only pileup evidence measured with
-  its `pileup_settings`. Models trained before the strlen settings were recorded are read as
-  measured with any MAPQ and two flank bases (`strlen --reads legacy`).
+  its `pileup_settings`. Models that record no strlen settings are read as measured with
+  any MAPQ and two flank bases (`strlen --reads legacy`).
 - **Consistency.** The booster must have the model's features, in order, and its number of classes.
 
 The models given to one `score` run must be trained on the same contigs, with at most one genotype
 and one promote model per variant type.
-
-Feature tables written by the Python version can still be read.

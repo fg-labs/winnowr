@@ -26,11 +26,6 @@ truth-labelled samples.**
 > been validated, and is not intended for clinical, diagnostic or production use. No trained models
 > are distributed. Use it at your own risk.
 
-> [!NOTE]
-> winnowr has been rewritten in Rust, and its outputs and models differ from the Python version's by
-> design. Models from the Python version are not usable: train new ones. See
-> [Coming from the Python version](https://winnowr.readthedocs.io/en/latest/getting-started/python-version.html).
-
 <p>
 <a href="https://fulcrumgenomics.com">
 <picture>

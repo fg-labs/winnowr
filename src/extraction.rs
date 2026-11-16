@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn table_columns_match_the_python_version() {
+    fn table_columns_have_the_expected_names_and_order() {
         let dir = TempDir::new().unwrap();
         let vcf = write_vcf(&dir, &["S1"], &RECORDS);
         let regions = read_region_sets(&[bed(&dir, "segdups", "chr1\t110\t130\n")]).unwrap();
@@ -518,10 +518,10 @@ mod tests {
         assert!(message.ends_with("table.txt is not a Parquet file"), "{message}");
     }
 
-    /// The Python version's tables are Snappy-compressed (pyarrow's default), with `string` key
-    /// columns and `large_string` (or, from newer pandas, all `large_string`) text columns.
+    /// Tables from other Parquet writers may be Snappy-compressed (a common default), with `string`
+    /// or `large_string` text columns.
     #[test]
-    fn snappy_python_written_tables_with_large_strings_are_read() {
+    fn snappy_tables_with_large_strings_are_read() {
         use std::sync::Arc;
 
         use arrow_array::{ArrayRef, Float64Array, Int64Array, LargeStringArray, StringArray};
@@ -530,7 +530,7 @@ mod tests {
         use parquet::file::properties::WriterProperties;
 
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("python.parquet");
+        let path = dir.path().join("other-writer.parquet");
         let fields = vec![
             Field::new("chrom", DataType::Utf8, true),
             Field::new("pos", DataType::Int64, true),
@@ -584,9 +584,9 @@ mod tests {
     }
 
     #[test]
-    fn nulls_in_python_written_tables_read_as_nan() {
+    fn nulls_in_other_writers_tables_read_as_nan() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("python.parquet");
+        let path = dir.path().join("other-writer.parquet");
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("mq", arrow_schema::DataType::Float64, true),
             arrow_schema::Field::new("pos", arrow_schema::DataType::Int64, true),
@@ -618,10 +618,10 @@ mod tests {
         assert!(mq[1].is_nan());
         let message = table.i64_column("pos").unwrap_err().to_string();
         assert_eq!(message, "column pos has 1 missing values");
-        // Older metadata without strlen or reference contigs reads with defaults.
+        // Metadata without strlen or reference contigs reads with defaults.
         assert!(!table.info().strlen && table.info().reference_contigs.is_none());
         assert_eq!(table.info().strlen_options(), None);
-        // Strlen evidence without recorded settings was measured with the legacy settings.
+        // Strlen evidence without recorded settings is read as measured with the legacy settings.
         let mut info = table.info().clone();
         info.strlen = true;
         assert_eq!(info.strlen_options(), Some(crate::strlen::StrlenOptions::LEGACY));

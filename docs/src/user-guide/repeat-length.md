@@ -27,14 +27,14 @@ per `--regions` range) to `extract --strlen` or `score --strlen`.
 
 - `mapqN`: only reads with MAPQ of at least N (default 20),
 - `flankN`: N aligned flank bases on each side of the tract (default 5, at most 10000),
-- `legacy`: `mapq0,flank2`, as winnowr measured before the settings were recorded.
+- `legacy`: `mapq0,flank2`, reads of any MAPQ with two flank bases.
 
 The settings are written at the top of the strlen table, kept in the feature table and recorded in
 the trained model. A model only scores repeat-length evidence measured with its training tables'
 settings: `score --strlen`, `evaluate` and `stratify` stop with an error otherwise, and `score
---alignments` measures with the model's settings. Tables and models made before winnowr recorded
-the settings were measured with any MAPQ and two flank bases, and are read that way; to score such
-a model from `strlen` tables, measure them with `winnowr strlen --reads legacy`.
+--alignments` measures with the model's settings. Tables and models that record no settings are
+read as measured with any MAPQ and two flank bases; to score such a model from `strlen` tables,
+measure them with `winnowr strlen --reads legacy`.
 
 ## Training with repeat-length features
 

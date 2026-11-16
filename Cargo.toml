@@ -39,8 +39,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-# Feature tables: columnar in memory (Arrow), Parquet on disk. Snappy reads tables written by
-# the Python version; zstd writes new ones.
+# Feature tables: columnar in memory (Arrow), Parquet on disk. Snappy reads tables from other
+# Parquet writers; zstd writes new ones.
 arrow-array = "60.1.0"
 arrow-schema = "60.1.0"
 arrow-select = "60.1.0"

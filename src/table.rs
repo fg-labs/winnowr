@@ -1,9 +1,9 @@
 //! Per-sample feature tables: columnar (Arrow) in memory, Parquet on disk, with winnowr metadata
 //! in the schema.
 //!
-//! Column names and types match the Python version's tables: string keys (`chrom`, `ref`, `alt`,
-//! `filter`, `variant_type`, `gt`), `pos` as Int64, flags as Boolean, and every other column as
-//! Float64 with NaN for missing values.
+//! Columns have fixed names and types: strings (the keys `chrom`, `ref`, `alt`, `filter`,
+//! `variant_type` and `gt`, and the repeat-length evidence's `sl_unit` and `sl_histogram`), `pos`
+//! as Int64, flags as Boolean, and every other column as Float64 with NaN for missing values.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -59,7 +59,7 @@ pub struct FeatureTableInfo {
     #[serde(default)]
     pub strlen: bool,
     /// The read settings the repeat-length evidence was measured with (`None` without evidence,
-    /// or for tables extracted before the settings were recorded: see
+    /// or for tables that record none: see
     /// [`FeatureTableInfo::strlen_options`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strlen_settings: Option<StrlenOptions>,
@@ -74,7 +74,7 @@ pub struct FeatureTableInfo {
 
 impl FeatureTableInfo {
     /// The read settings of the table's repeat-length evidence, if it has any: those recorded, or
-    /// [`StrlenOptions::LEGACY`] for tables extracted before the settings were recorded.
+    /// [`StrlenOptions::LEGACY`] for tables that record none.
     #[must_use]
     pub fn strlen_options(&self) -> Option<StrlenOptions> {
         self.strlen.then(|| self.strlen_settings.unwrap_or(StrlenOptions::LEGACY))
@@ -110,7 +110,7 @@ pub struct FeatureTable {
 
 impl FeatureTable {
     /// Builds a table from raw records and their derived features, with the raw columns first,
-    /// then the derived ones, in the Python version's column order.
+    /// then the derived ones, in a fixed column order.
     ///
     /// # Errors
     ///
@@ -382,7 +382,7 @@ impl FeatureTable {
         })
     }
 
-    /// The values of a Float64 column, with nulls (as Python-written tables have for missing
+    /// The values of a Float64 column, with nulls (as other Parquet writers may use for missing
     /// values) read as NaN.
     ///
     /// # Errors
@@ -507,7 +507,8 @@ impl FeatureTable {
         Ok(())
     }
 
-    /// Reads a table written by [`FeatureTable::write_parquet`] (or by the Python version).
+    /// Reads a table written by [`FeatureTable::write_parquet`], or by another Parquet writer
+    /// with the same columns and metadata, uncompressed or compressed with Snappy or Zstandard.
     ///
     /// # Errors
     ///
@@ -574,7 +575,7 @@ impl FeatureTable {
             builder = builder.with_projection(mask.clone());
         }
         let row_groups = builder.metadata().num_row_groups();
-        // Drop the schema metadata (e.g. pandas'): it is carried in `info`.
+        // Drop the schema metadata (e.g. a writer's own): it is carried in `info`.
         let reader = builder.build()?;
         let schema =
             Arc::new(Schema::new(arrow_array::RecordBatchReader::schema(&reader).fields().clone()));
@@ -654,8 +655,8 @@ fn string_equals(batch: &RecordBatch, name: &str, value: &str) -> Result<Boolean
     bail!("column {name} is {}, not a string column", column.data_type())
 }
 
-/// Columns are declared nullable, as the Python version's (pandas) tables are, so the schemas of
-/// the two match; winnowr itself writes NaN, not nulls, for missing numbers.
+/// Columns are declared nullable, as most Parquet writers declare them, so the schemas of tables
+/// from other writers match; winnowr itself writes NaN, not nulls, for missing numbers.
 const NULLABLE: bool = true;
 
 /// A string column with one value per record, written by `write_value`.

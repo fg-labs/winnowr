@@ -56,7 +56,7 @@ pub(crate) const HELP_WIDTH: usize = 100;
 pub(crate) const DEFAULT_THREADS: NonZeroUsize = NonZeroUsize::new(4).expect("4 is non-zero");
 
 /// The environment variable that gives the number of threads when `-t` is not given, as it gives
-/// XGBoost's own default (and as the Python version of winnowr used it).
+/// XGBoost's own default.
 pub(crate) const THREADS_VARIABLE: &str = "OMP_NUM_THREADS";
 
 /// Machine-learned genotyping and filtering of germline small-variant calls.
@@ -873,9 +873,9 @@ pub(crate) struct StrlenArgs {
     /// Which reads measure the tracts, as comma-separated settings over the defaults: mapqN
     /// (only reads with MAPQ >= N; the MAPQ summaries still cover every spanning read) and flankN
     /// (N aligned flank bases on each side), plus the experimental mates (count a read pair once)
-    /// and unit (at least one repeat unit of flank). `legacy` (mapq0,flank2) measures as winnowr
-    /// did before the settings were recorded, for models trained then. The settings are recorded
-    /// in the table; a model scores only tables measured as its training tables were.
+    /// and unit (at least one repeat unit of flank). `legacy` (mapq0,flank2) measures reads of any
+    /// MAPQ with two flank bases, the settings of tables and models that record none. The settings
+    /// are recorded in the table; a model scores only tables measured as its training tables were.
     #[arg(long, default_value_t = StrlenOptions::default())]
     pub(crate) reads: StrlenOptions,
 }
@@ -1079,8 +1079,8 @@ fn shared_reference_contigs(
 ) -> Result<Option<indexmap::IndexMap<String, Option<u64>>>> {
     if infos.iter().any(|info| info.reference_contigs.is_none()) {
         log::warn!(
-            "some --tables do not record their reference contigs (extracted by an older \
-             winnowr); the model will not record them either, so score cannot check the reference"
+            "some --tables do not record their reference contigs; the model will not record them \
+             either, so score cannot check the reference"
         );
         return Ok(None);
     }
@@ -1523,8 +1523,8 @@ fn check_table_reference(
 ) -> Result<()> {
     let Some(contigs) = &info.reference_contigs else {
         log::warn!(
-            "{} does not record its reference contigs (extracted by an older winnowr), so it \
-             cannot be checked against the models' reference",
+            "{} does not record its reference contigs, so it cannot be checked against the \
+             models' reference",
             table.display()
         );
         return Ok(());
@@ -1913,10 +1913,10 @@ mod tests {
         assert_eq!(command_line(args.iter().map(std::ffi::OsString::from)), expected);
     }
 
-    /// The command lines the Python version took, as pipelines run them: `--output`, `--mode` in
-    /// upper case, sidecar paths, NAME=PATH regions and one region per `strlen`.
+    /// Command lines as pipelines run them: `--output`, `--mode` in upper case, sidecar paths,
+    /// NAME=PATH regions and one region per `strlen`.
     #[test]
-    fn python_command_lines_parse() {
+    fn pipeline_command_lines_parse() {
         let score = [
             "score",
             "--vcf",

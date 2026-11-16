@@ -8,7 +8,6 @@
   - [Installation](getting-started/installation.md)
   - [Quick start: scoring](getting-started/quick-scoring.md)
   - [Quick start: training](getting-started/quick-training.md)
-  - [Coming from the Python version](getting-started/python-version.md)
 - [User guide]()
   - [Classes and labels](user-guide/classes-and-labels.md)
   - [Training](user-guide/training.md)

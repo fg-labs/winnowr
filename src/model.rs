@@ -4,8 +4,8 @@
 //! The file is a JSON object holding [`ModelInfo`]'s fields (the ordered feature names, the variant
 //! type and task, the cross-validated thresholds, the training samples, the reference contigs, the
 //! stutter model of models with repeat-length features, and the versions that trained it) plus
-//! `booster`, the XGBoost booster in its JSON format. Format version 3 is this bundled format; the
-//! Python version's two-file models (formats 1 and 2) are not read, and cannot be converted.
+//! `booster`, the XGBoost booster in its JSON format. Format version 3 is this format, and the
+//! only one read.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -184,15 +184,14 @@ pub struct ModelInfo {
     /// Whether the model has the re-genotype class ([`Label::Regenotype`]).
     pub regenotype: bool,
     /// The read settings the strlen evidence of the training tables was measured with (`None`
-    /// without a stutter model, or for models trained before the settings were recorded: see
-    /// [`ModelInfo::strlen_options`]). The strlen evidence a model scores must be measured the
-    /// same way.
+    /// without a stutter model, or for models that record none: see
+    /// [`ModelInfo::strlen_options`]). The strlen evidence a model scores must be measured the same
+    /// way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strlen_settings: Option<StrlenOptions>,
     /// The settings the allele read counts by MAPQ of the training tables were measured with, for
-    /// a model with pileup features (see [`crate::pileup`]); `None` for a model without them
-    /// (every model trained before they existed). The pileup evidence a model scores must be
-    /// measured the same way.
+    /// a model with pileup features (see [`crate::pileup`]); `None` for a model without them.
+    /// The pileup evidence a model scores must be measured the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pileup_settings: Option<PileupOptions>,
     /// The winnowr version that trained the model.
@@ -203,8 +202,7 @@ pub struct ModelInfo {
 
 impl ModelInfo {
     /// The read settings of the strlen evidence a model with repeat-length features needs: those
-    /// recorded, or [`StrlenOptions::LEGACY`] for models trained before the settings were
-    /// recorded.
+    /// recorded, or [`StrlenOptions::LEGACY`] for models that record none.
     #[must_use]
     pub fn strlen_options(&self) -> Option<StrlenOptions> {
         self.stutter.as_ref().map(|_| self.strlen_settings.unwrap_or(StrlenOptions::LEGACY))
@@ -323,8 +321,7 @@ impl WinnowrModel {
         if versions.format_version != Some(u64::from(MODEL_FORMAT_VERSION)) {
             bail!(
                 "unsupported model format version {} (written by winnowr {}); this winnowr reads \
-                 version {MODEL_FORMAT_VERSION}: train new models with this winnowr (the Python version's \
-                 models cannot be converted)",
+                 version {MODEL_FORMAT_VERSION}: train new models with this winnowr",
                 versions.format_version.map_or_else(|| "none".to_string(), |v| v.to_string()),
                 versions.winnowr_version.as_deref().unwrap_or("unknown")
             );
@@ -836,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn models_record_strlen_settings_and_old_models_need_the_legacy_settings() {
+    fn models_record_strlen_settings_and_unrecorded_ones_need_the_legacy_settings() {
         use crate::stutter::{LENGTH_BINS, N_ERRORS, N_PERIOD_CLASSES, StutterModel};
         let mut info = genotype_info(&["a", "b"]);
         assert_eq!(info.strlen_options(), None);
@@ -859,11 +856,11 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains(r#""strlen_settings":"mapq20,flank5""#), "{text}");
         assert_eq!(WinnowrModel::load(&path, THREADS).unwrap().info, model.info);
-        // A model saved before the settings were recorded needs the legacy settings.
+        // A model that records no settings needs the legacy settings.
         fs::write(&path, text.replace(r#""strlen_settings":"mapq20,flank5","#, "")).unwrap();
-        let old = WinnowrModel::load(&path, THREADS).unwrap();
-        assert_eq!(old.info.strlen_settings, None);
-        assert_eq!(old.info.strlen_options(), Some(StrlenOptions::LEGACY));
+        let unrecorded = WinnowrModel::load(&path, THREADS).unwrap();
+        assert_eq!(unrecorded.info.strlen_settings, None);
+        assert_eq!(unrecorded.info.strlen_options(), Some(StrlenOptions::LEGACY));
     }
 
     #[test]
@@ -926,9 +923,24 @@ mod tests {
         };
         assert_eq!(load(&json), None);
 
-        let mut python_format = json.clone();
-        python_format["format_version"] = 2.into();
-        assert!(load(&python_format).unwrap().contains("unsupported model format version 2"));
+        // Any format version but 3, or none, is refused.
+        let mut other_format = json.clone();
+        other_format["winnowr_version"] = "0.0.1".into();
+        for (version, shown) in [(Some(2), "2"), (Some(4), "4"), (None, "none")] {
+            match version {
+                Some(version) => other_format["format_version"] = version.into(),
+                None => {
+                    other_format.as_object_mut().unwrap().remove("format_version");
+                }
+            }
+            assert_eq!(
+                load(&other_format).unwrap(),
+                format!(
+                    "unsupported model format version {shown} (written by winnowr 0.0.1); this \
+                     winnowr reads version 3: train new models with this winnowr"
+                )
+            );
+        }
 
         let mut unknown = json.clone();
         unknown["extra"] = true.into();
