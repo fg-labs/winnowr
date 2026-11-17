@@ -283,8 +283,17 @@ jobs:
         run: rustup toolchain install
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      # Cargo only warns when a target's file is left out of a package (e.g. a test missing from a
+      # crate's include list), so the warning fails the job.
       - name: Package and build both crates
-        run: cargo package --workspace --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --workspace --locked 2>&1 | tee package.log
+          if grep 'is not included in the published package' package.log; then
+            echo "::error::a target's file is not in its crate's package; add it to the crate's include list"
+            exit 1
+          fi
 
   # Lints the workflows, so that a mistake in one that runs only on main (publish.yml) or on a tag
   # (release.yml) is caught before it merges.
