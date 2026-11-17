@@ -4,9 +4,9 @@ A statically linked [XGBoost](https://github.com/dmlc/xgboost) with a small safe
 [winnowr](https://github.com/fg-labs/winnowr).
 
 The crate vendors XGBoost (a git submodule pinned to a release tag or an upstream commit), applies
-the small fixes in `patches/` to a copy of it (the submodule itself is never modified), builds it
-with CMake as a static library, and links it and the OpenMP runtime statically (LLVM's `libomp.a`
-on macOS, GCC's `libgomp.a` on Linux), so binaries that use it need no XGBoost or OpenMP shared
+the fixes and performance changes in `patches/` (from upstream pull requests) to a copy of it (the
+submodule itself is never modified), builds it with CMake as a static library, and links it and the
+OpenMP runtime statically (LLVM's `libomp.a` on macOS, GCC's `libgomp.a` on Linux), so binaries that use it need no XGBoost or OpenMP shared
 libraries at run time. Some builds link the OpenMP runtime shared instead, with a build warning:
 on a Linux distribution whose `libgomp.a` was built without `-fPIC` (e.g. RHEL, Amazon Linux), a
 position-independent binary does unless built with `RUSTFLAGS='-C relocation-model=static'`; so

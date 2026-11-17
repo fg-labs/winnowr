@@ -19,7 +19,8 @@ include = [
     "/src/**",
     "/README.md",
     "/LICENSE-MIT",
-    # winnowr's fixes to the vendored sources, applied by build.rs to a copy of them.
+    # winnowr's fixes and performance changes to the vendored sources, applied by build.rs to a
+    # copy of them.
     "/patches/*.patch",
     # Keeps the patches directory, which build.rs reads, when there are no patches.
     "/patches/.gitkeep",

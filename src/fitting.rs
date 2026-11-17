@@ -8,9 +8,40 @@ use winnowr_xgboost::{Booster, DMatrix};
 
 use crate::model::{TrainingParams, named_matrix};
 
-/// The XGBoost booster parameters for `num_class` classes, as `(name, value)` pairs.
+/// The fewest threads (requested) for which a fit asks XGBoost to build its classes' trees at the
+/// same time (`parallel_target_trees`, patch 0003 in `xgboost/patches/`), each with a share of the
+/// threads. With fewer, each class's tree using every thread is as fast; with more, a tree of small
+/// data uses the threads poorly, and building the classes' trees at once is 25-40% faster per round
+/// at 15 and 30 threads (measured on an M5 with real training tables).
+///
+/// Each class's tree is then the tree a fit with its share of the threads builds, so the model is
+/// that of fewer threads: XGBoost's histogram sums depend on the thread count, and a model can
+/// differ in its last bits from one built with the classes in turn. A given thread count still
+/// always trains the same model.
+const MIN_THREADS_FOR_PARALLEL_TARGET_TREES: usize = 9;
+
+/// Whether a fit with `threads` threads asks XGBoost to build its classes' trees at the same time:
+/// with at least [`MIN_THREADS_FOR_PARALLEL_TARGET_TREES`], unless the OpenMP runtime has a thread
+/// limit XGBoost does not read (see [`winnowr_xgboost::hidden_thread_limit`]), which teams built at
+/// once could exceed. XGBoost may still build them in turn (e.g. if its CPU quota leaves too few
+/// threads), with a warning.
+///
+/// `var` looks up an environment variable (`std::env::var` outside tests).
+fn builds_class_trees_at_once(threads: NonZeroUsize, var: impl Fn(&str) -> Option<String>) -> bool {
+    threads.get() >= MIN_THREADS_FOR_PARALLEL_TARGET_TREES
+        && winnowr_xgboost::hidden_thread_limit(var).is_none()
+}
+
+/// The XGBoost booster parameters for `num_class` classes, as `(name, value)` pairs, asking
+/// XGBoost to build the classes' trees at the same time if `class_trees_at_once` (see
+/// [`builds_class_trees_at_once`]).
 #[must_use]
-pub fn xgboost_params(params: &TrainingParams, num_class: usize) -> Vec<(&'static str, String)> {
+pub fn xgboost_params(
+    params: &TrainingParams,
+    num_class: usize,
+    class_trees_at_once: bool,
+) -> Vec<(&'static str, String)> {
+    let parallel_target_trees = class_trees_at_once;
     vec![
         ("objective", "multi:softprob".to_string()),
         ("num_class", num_class.to_string()),
@@ -23,6 +54,7 @@ pub fn xgboost_params(params: &TrainingParams, num_class: usize) -> Vec<(&'stati
         ("min_child_weight", params.min_child_weight.to_string()),
         ("lambda", params.reg_lambda.to_string()),
         ("seed", params.seed.to_string()),
+        ("parallel_target_trees", parallel_target_trees.to_string()),
     ]
 }
 
@@ -207,7 +239,8 @@ pub fn fit_booster<S: AsRef<str>>(
     let mut booster = Booster::new(&cache, threads)?;
     // XGBoost configures the booster with each batch of parameters, and the objective needs
     // `num_class`, so they are set together.
-    let xgb_params = xgboost_params(params, num_class);
+    let class_trees_at_once = builds_class_trees_at_once(threads, |name| std::env::var(name).ok());
+    let xgb_params = xgboost_params(params, num_class, class_trees_at_once);
     let pairs: Vec<(&str, &str)> =
         xgb_params.iter().map(|(name, value)| (*name, value.as_str())).collect();
     booster.set_params(&pairs)?;
@@ -242,8 +275,9 @@ pub fn fit_booster<S: AsRef<str>>(
         booster = booster.truncated(round + 1)?;
     }
     log::debug!(
-        "fit timing: setup {setup:.2?}, {rounds_run} rounds updating {updating:.2?} ({:.2?}/round), \
-         evaluating {evaluating:.2?}, truncating {:.2?}",
+        "fit timing ({threads} threads, class trees requested {}): setup {setup:.2?}, {rounds_run} rounds \
+         updating {updating:.2?} ({:.2?}/round), evaluating {evaluating:.2?}, truncating {:.2?}",
+        if class_trees_at_once { "at once" } else { "in turn" },
         updating / u32::try_from(rounds_run.max(1))?,
         truncate_start.elapsed()
     );
@@ -265,6 +299,32 @@ mod tests {
     use crate::model::predict_probabilities;
 
     const THREADS: NonZeroUsize = NonZeroUsize::new(1).expect("1 is non-zero");
+
+    #[rstest]
+    #[case::one_thread(1, None, false)]
+    #[case::below(MIN_THREADS_FOR_PARALLEL_TARGET_TREES - 1, None, false)]
+    #[case::at(MIN_THREADS_FOR_PARALLEL_TARGET_TREES, None, true)]
+    #[case::above(64, None, true)]
+    #[case::hidden_limit(64, Some("KMP_DEVICE_THREAD_LIMIT"), !cfg!(target_os = "macos"))]
+    #[case::old_hidden_limit(64, Some("KMP_ALL_THREADS"), !cfg!(target_os = "macos"))]
+    fn builds_the_class_trees_at_once_only_with_enough_threads_and_no_hidden_limit(
+        #[case] threads: usize,
+        #[case] limit: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let threads = NonZeroUsize::new(threads).expect("the cases are non-zero");
+        let var = |name: &str| (Some(name) == limit).then(|| "128".to_string());
+        assert_eq!(builds_class_trees_at_once(threads, var), expected);
+    }
+
+    #[rstest]
+    #[case::at_once(true, "true")]
+    #[case::in_turn(false, "false")]
+    fn asks_xgboost_for_the_class_trees_at_once(#[case] at_once: bool, #[case] expected: &str) {
+        let params = xgboost_params(&TrainingParams::default(), 3, at_once);
+        let value = params.iter().find(|(name, _)| *name == "parallel_target_trees");
+        assert_eq!(value.map(|(_, value)| value.as_str()), Some(expected));
+    }
 
     #[rstest]
     #[case::first(None, 0.5, true)]
