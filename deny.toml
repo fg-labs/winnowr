@@ -25,6 +25,10 @@ ignore = [
     # custom_derive (via rust-htslib) is unmaintained but has no known vulnerability; it only
     # provides compile-time derive macros. Drop this when rust-htslib replaces it.
     { id = "RUSTSEC-2025-0058", reason = "unmaintained macro-only dependency of rust-htslib" },
+    # chrono (a dependency of both arrow-array and parquet) is unmaintained but has no known
+    # vulnerability, and no maintained version exists. Drop this when arrow-rs (arrow-array and
+    # parquet) replaces it.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained dependency of arrow/parquet, no fix available" },
 ]
 
 # ---------------------------------------------------------------------------
