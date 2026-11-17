@@ -76,6 +76,8 @@ library (`libomp.a` from Homebrew on macOS, GCC's `libgomp.a` on Linux). A sourc
 distribution whose `libgomp.a` is not position-independent (e.g. RHEL, Amazon Linux) links the
 shared libgomp instead, with a warning, unless built with `RUSTFLAGS='-C relocation-model=static'`
 and an explicit `--target`; so does any build whose static-link test fails (see `xgboost/build.rs`).
+On macOS, a `WINNOWR_LIBOMP_PREFIX` with only `libomp.dylib` (e.g. conda-forge's `llvm-openmp`)
+links the shared libomp, with a warning (see DEVELOPING).
 
 ```console
 git clone --recursive https://github.com/fg-labs/winnowr.git

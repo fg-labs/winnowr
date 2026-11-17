@@ -9,9 +9,9 @@ If you do not have `rustup`, install it with (assuming [`curl`](https://everythi
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-winnowr builds XGBoost and htslib from C/C++ source and links them, the OpenMP runtime and htslib's compression libraries statically, so you also need [CMake](https://cmake.org/) and:
+winnowr builds XGBoost and htslib from C/C++ source and links them, the OpenMP runtime (except in the cases below) and htslib's compression libraries statically, so you also need [CMake](https://cmake.org/) and:
 
-* On macOS, Apple clang and LLVM's OpenMP runtime: `brew install libomp`. If `libomp` is installed elsewhere, set `WINNOWR_LIBOMP_PREFIX` to the prefix holding `lib/libomp.a`.
+* On macOS, Apple clang and LLVM's OpenMP runtime: `brew install libomp`. If `libomp` is installed elsewhere, set `WINNOWR_LIBOMP_PREFIX` to the prefix holding `lib/libomp.a`. A prefix with only `lib/libomp.dylib` (e.g. conda-forge's `llvm-openmp`, which bioconda builds with) links the shared libomp instead, with a build warning (shown for a local build; `cargo install` from crates.io shows it only with `-vv`). Binaries load it from the prefix by its absolute path, with no rpath, so they need the prefix to stay where it is.
 * On Linux, GCC (`gcc` and `g++`), whose static OpenMP runtime (`libgomp.a`) is linked. clang is not supported on Linux: distributions do not ship LLVM's OpenMP runtime as a static library. Set `CC`/`CXX` if GCC is not the default compiler. Some distributions (e.g. RHEL, Amazon Linux) build `libgomp.a` without `-fPIC`, so it cannot go into the default position-independent executable: the build then links the shared libgomp, with a warning, unless built with `RUSTFLAGS='-C relocation-model=static'` (and `--target`). Debian and Ubuntu, which the release binaries are built on, link it statically.
 * libclang, which rust-htslib's bindings generator (bindgen) needs to build htslib: on Debian or Ubuntu, `apt-get install libclang-dev`. On macOS, Apple clang provides it.
 * The vendored XGBoost sources: clone with `git clone --recursive`, or run `git submodule update --init --recursive` in an existing clone.
@@ -45,7 +45,7 @@ This project uses the [conventional Cargo package layout](https://doc.rust-lang.
 * `README.md`: The project description. This is displayed on GitHub, on the [crates.io](https://crates.io/) page for the project, and on the [docs.rs](https://docs.rs/) documentation for the project.
 * `release-plz.toml`: Configuration for [release-plz](https://release-plz.ieni.dev/), which is used to automate releases.
 * `rust-toolchain.toml`: The pinned Rust toolchain.
-* `xgboost/`: The `winnowr-xgboost` crate: builds the vendored XGBoost (`xgboost/vendor/xgboost`, a git submodule pinned to an upstream release tag or, between releases, an upstream `master` commit) as a static library, links it and OpenMP statically (see the Linux note under [Getting Started](#getting-started)), and provides a small safe Rust API over XGBoost's C API.
+* `xgboost/`: The `winnowr-xgboost` crate: builds the vendored XGBoost (`xgboost/vendor/xgboost`, a git submodule pinned to an upstream release tag or, between releases, an upstream `master` commit) as a static library, links it and OpenMP statically (see the Linux and macOS exceptions under [Getting Started](#getting-started)), and provides a small safe Rust API over XGBoost's C API.
 * `rustfmt.toml`: Configuration for [rustfmt](https://github.com/rust-lang/rustfmt), which is used to automatically format the project's code, and to check code formatting in the CI workflow.
 * `src/`: The `winnowr` library and command-line tool, including unit tests.
 
