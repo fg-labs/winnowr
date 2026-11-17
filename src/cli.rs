@@ -24,7 +24,7 @@ use crate::model_evidence::{
 use crate::pileup::{PileupOptions, measure_pileup, write_pileup_table};
 use crate::pileup_features::PILEUP_FEATURES;
 use crate::policy::{
-    Abstention, CONFIDENT_REGIONS, DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP, Policy,
+    Abstention, DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP, NOT_DIFFICULT_REGIONS, Policy,
     decide_calls,
 };
 use crate::read_pass::ReadInputs;
@@ -161,7 +161,7 @@ pub(crate) enum Command {
     ///
     /// Each model acts at its cross-validated thresholds. Indel genotype models also drop the
     /// calls their thresholds leave alone when P(keep) is below 0.5 (--keep-fallback). Given the
-    /// confident regions (--regions notinalldifficultregions=PATH, GIAB's GRCh38 genome
+    /// not-difficult regions (--regions notinalldifficultregions=PATH, GIAB's GRCh38 genome
     /// stratification), indel calls outside them are dropped at P(drop) >= 0.6 (in veto mode,
     /// P(drop) + P(flip) (+ P(re-genotype)) >= 0.6; --outside-indel-t-drop) in place of the
     /// model's drop threshold, whether that is lower or higher, and the keep fallback still drops
@@ -437,14 +437,14 @@ pub(crate) struct EvaluateArgs {
     pub(crate) policy: PolicyArgs,
 
     /// The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
-    /// with these. Only the confident regions (notinalldifficultregions) are read; the models'
+    /// with these. Only the not-difficult regions (notinalldifficultregions) are read; the models'
     /// region features come from the table.
     #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
     pub(crate) regions: Vec<NamedBed>,
 }
 
-/// The drop threshold of indel calls outside the confident regions: a P(drop), or `none` for the
-/// model's threshold.
+/// The drop threshold of indel calls outside the not-difficult regions: a P(drop), or `none` for
+/// the model's threshold.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OutsideTDrop(Option<f64>);
 
@@ -529,7 +529,7 @@ impl From<VariantType> for KeepFallback {
     }
 }
 
-/// A value of --abstain-actions: an action withheld outside the confident regions, or none.
+/// A value of --abstain-actions: an action withheld outside the not-difficult regions, or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum AbstainAction {
     /// Flipping het <-> hom.
@@ -550,8 +550,8 @@ pub(crate) enum AbstainAction {
 ///
 /// By default ([`DEFAULT_KEEP_FALLBACK`] and [`DEFAULT_OUTSIDE_INDEL_T_DROP`]), indel genotype
 /// models also drop calls their thresholds leave alone when P(keep) is below 0.5, and, given the
-/// confident regions (`--regions notinalldifficultregions=PATH`), drop indel calls outside them at
-/// P(drop) >= 0.6 in place of the model's drop threshold (whether that is lower or higher); the
+/// not-difficult regions (`--regions notinalldifficultregions=PATH`), drop indel calls outside them
+/// at P(drop) >= 0.6 in place of the model's drop threshold (whether that is lower or higher); the
 /// keep fallback still drops those calls when P(keep) is below 0.5.
 #[derive(Debug, Args)]
 pub(crate) struct PolicyArgs {
@@ -567,14 +567,14 @@ pub(crate) struct PolicyArgs {
     #[arg(long, num_args = 1.., value_enum, ignore_case = true)]
     pub(crate) expected_f1: Vec<VariantType>,
 
-    /// Experimental: actions withheld from calls outside the confident regions (--regions
+    /// Experimental: actions withheld from calls outside the not-difficult regions (--regions
     /// notinalldifficultregions=PATH; calls whose REF span is not inside it are "outside"); none,
     /// alone: no action.
     #[arg(long, num_args = 1.., value_enum, ignore_case = true,
           default_values_t = [AbstainAction::None])]
     pub(crate) abstain_actions: Vec<AbstainAction>,
 
-    /// The drop threshold of indel calls outside the confident regions: they are dropped when
+    /// The drop threshold of indel calls outside the not-difficult regions: they are dropped when
     /// P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
     /// model's veto threshold is compared with), in place of the model's threshold, even when that
     /// is higher (none: the model's threshold). The keep fallback (--keep-fallback) still drops
@@ -586,17 +586,17 @@ pub(crate) struct PolicyArgs {
 }
 
 impl PolicyArgs {
-    /// The policy in a mode, checking the confident regions name some of `contigs`.
+    /// The policy in a mode, checking the not-difficult regions name some of `contigs`.
     ///
-    /// The confident regions are the `regions` named [`CONFIDENT_REGIONS`]. Without them, the
-    /// outside indel drop threshold is not applied (with a warning when `indel_genotype`, i.e. an
-    /// indel genotype model will score). They are read only if an action is withheld outside them
-    /// or an indel genotype model will drop calls outside them.
+    /// The not-difficult regions are the `regions` named [`NOT_DIFFICULT_REGIONS`]. Without them,
+    /// the outside indel drop threshold is not applied (with a warning when `indel_genotype`, i.e.
+    /// an indel genotype model will score). They are read only if an action is withheld outside
+    /// them or an indel genotype model will drop calls outside them.
     ///
     /// # Errors
     ///
     /// Returns an error if `none` is given with other values of --keep-fallback or
-    /// --abstain-actions, actions are withheld without the confident regions, or they cannot be
+    /// --abstain-actions, actions are withheld without the not-difficult regions, or they cannot be
     /// read or name none of `contigs`.
     fn policy<S: AsRef<str>>(
         &self,
@@ -620,29 +620,30 @@ impl PolicyArgs {
         let (flip, regenotype, promote) =
             (has(AbstainAction::Flip), has(AbstainAction::Regenotype), has(AbstainAction::Promote));
         let indel_t_drop = self.outside_indel_t_drop.0;
-        let path = regions.iter().find(|r| r.name == CONFIDENT_REGIONS).map(|r| r.path.as_path());
-        // Read the confident regions only when something uses them, so an unused BED (e.g. in a
+        let path =
+            regions.iter().find(|r| r.name == NOT_DIFFICULT_REGIONS).map(|r| r.path.as_path());
+        // Read the not-difficult regions only when something uses them, so an unused BED (e.g. in a
         // run without an indel genotype model) cannot fail the run.
         let outside_t_drop = indel_t_drop.filter(|_| indel_genotype);
         match path {
             Some(path) if flip || regenotype || promote || outside_t_drop.is_some() => {
-                let regions = RegionSet::from_bed(CONFIDENT_REGIONS, path)?;
+                let regions = RegionSet::from_bed(NOT_DIFFICULT_REGIONS, path)?;
                 regions.check_contigs(contigs)?;
-                info!("Confident regions (acting fully inside): {}", path.display());
+                info!("Not-difficult regions (acting fully inside): {}", path.display());
                 policy.abstain =
                     Some(Abstention { regions, flip, regenotype, promote, indel_t_drop });
             }
             Some(_) => {}
             None if flip || regenotype || promote => bail!(
-                "--abstain-actions needs the confident regions: --regions \
-                 {CONFIDENT_REGIONS}=PATH"
+                "--abstain-actions needs the not-difficult regions: --regions \
+                 {NOT_DIFFICULT_REGIONS}=PATH"
             ),
             None => {
                 if let Some(t_drop) = outside_t_drop {
                     log::warn!(
-                        "no confident regions given, so indel calls are dropped at the model's \
-                         threshold everywhere; pass --regions {CONFIDENT_REGIONS}=PATH (GIAB's \
-                         GRCh38 genome stratification {CONFIDENT_REGIONS}.bed.gz) to drop indel \
+                        "--regions has no {NOT_DIFFICULT_REGIONS}=PATH, so indel calls are \
+                         dropped at the model's threshold everywhere; pass it (GIAB's GRCh38 \
+                         genome stratification {NOT_DIFFICULT_REGIONS}.bed.gz) to drop indel \
                          calls outside it at P(drop) >= {t_drop} instead"
                     );
                 }
@@ -716,7 +717,7 @@ pub(crate) struct StratifyArgs {
     pub(crate) policy: PolicyArgs,
 
     /// The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
-    /// with these. Only the confident regions (notinalldifficultregions) are read; the models'
+    /// with these. Only the not-difficult regions (notinalldifficultregions) are read; the models'
     /// region features come from the table. Not reported within: see --report-region.
     #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
     pub(crate) regions: Vec<NamedBed>,
@@ -797,9 +798,9 @@ pub(crate) struct ScoreArgs {
     #[arg(long)]
     pub(crate) gvcf: Option<PathBuf>,
 
-    /// Region BEDs as NAME=PATH, with the names the models were trained with, plus the confident
-    /// regions as notinalldifficultregions=PATH (GIAB's GRCh38 genome stratification; outside
-    /// them, indel calls are dropped at --outside-indel-t-drop in place of the model's
+    /// Region BEDs as NAME=PATH, with the names the models were trained with, plus the
+    /// not-difficult regions as notinalldifficultregions=PATH (GIAB's GRCh38 genome stratification;
+    /// outside them, indel calls are dropped at --outside-indel-t-drop in place of the model's
     /// threshold).
     #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
     pub(crate) regions: Vec<NamedBed>,
@@ -1537,10 +1538,10 @@ fn check_table_reference(
 }
 
 /// Warns about --regions that only `score`'s models use: `evaluate` and `stratify` read the
-/// models' region features from the table, and only the confident regions from --regions.
+/// models' region features from the table, and only the not-difficult regions from --regions.
 fn warn_policy_only_regions(regions: &[NamedBed]) {
     let ignored: Vec<&str> =
-        regions.iter().map(|r| r.name.as_str()).filter(|n| *n != CONFIDENT_REGIONS).collect();
+        regions.iter().map(|r| r.name.as_str()).filter(|n| *n != NOT_DIFFICULT_REGIONS).collect();
     if !ignored.is_empty() {
         log::warn!(
             "--regions {} are ignored: region features come from the feature table",
@@ -1627,12 +1628,12 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
         happy: [&args.happy[0], &args.happy[1]],
     };
     warn_policy_only_regions(&args.regions);
-    if !args.regions.iter().any(|r| r.name == CONFIDENT_REGIONS)
-        && named.iter().any(|named| named.name == CONFIDENT_REGIONS)
+    if !args.regions.iter().any(|r| r.name == NOT_DIFFICULT_REGIONS)
+        && named.iter().any(|named| named.name == NOT_DIFFICULT_REGIONS)
     {
         log::warn!(
-            "{CONFIDENT_REGIONS} is reported within but not given to the policy: pass --regions \
-             {CONFIDENT_REGIONS}=PATH to decide calls as score does with it"
+            "{NOT_DIFFICULT_REGIONS} is reported within but not given to the policy: pass \
+             --regions {NOT_DIFFICULT_REGIONS}=PATH to decide calls as score does with it"
         );
     }
     let policy =
@@ -1717,7 +1718,7 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         .iter()
         .copied()
         .filter(|name| {
-            *name != CONFIDENT_REGIONS
+            *name != NOT_DIFFICULT_REGIONS
                 && !models.iter().any(|m| m.info.region_names.iter().any(|n| n == name))
         })
         .collect();
@@ -2561,17 +2562,17 @@ mod tests {
         args.policy.policy(Mode::Genotyper, &["chr1"], regions, true)
     }
 
-    /// A one-interval BED of chr1 and a `--regions` entry naming it the confident regions.
-    fn confident_regions(dir: &tempfile::TempDir) -> Vec<NamedBed> {
-        let path = dir.path().join("confident.bed");
+    /// A one-interval BED of chr1 and a `--regions` entry naming it the not-difficult regions.
+    fn not_difficult_regions(dir: &tempfile::TempDir) -> Vec<NamedBed> {
+        let path = dir.path().join("not-difficult.bed");
         std::fs::write(&path, "chr1\t100\t200\n").unwrap();
-        vec![NamedBed { name: CONFIDENT_REGIONS.to_string(), path }]
+        vec![NamedBed { name: NOT_DIFFICULT_REGIONS.to_string(), path }]
     }
 
     #[test]
     fn the_default_policy_keeps_the_fallback_for_indels_and_an_outside_drop_threshold() {
         use crate::policy::{DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP};
-        // Without the confident regions: the indel keep fallback only.
+        // Without the not-difficult regions: the indel keep fallback only.
         let policy = score_policy(&[], &[]).unwrap();
         let expected: Vec<(VariantType, Rule)> =
             DEFAULT_KEEP_FALLBACK.iter().map(|&vt| (vt, Rule::KeepFallback)).collect();
@@ -2580,17 +2581,18 @@ mod tests {
         // With them: indels outside are dropped at the outside threshold, in place of the
         // model's; no action is withheld.
         let dir = tempfile::TempDir::new().unwrap();
-        let policy = score_policy(&[], &confident_regions(&dir)).unwrap();
+        let policy = score_policy(&[], &not_difficult_regions(&dir)).unwrap();
         let abstain = policy.abstain.unwrap();
         assert_eq!(abstain.indel_t_drop, Some(DEFAULT_OUTSIDE_INDEL_T_DROP));
         assert!(!abstain.flip && !abstain.regenotype && !abstain.promote);
-        // Another name is not the confident regions.
-        let other = vec![NamedBed { name: "segdups".into(), ..confident_regions(&dir).remove(0) }];
+        // A BED under another name is not taken as the not-difficult regions.
+        let other =
+            vec![NamedBed { name: "segdups".into(), ..not_difficult_regions(&dir).remove(0) }];
         assert!(score_policy(&[], &other).unwrap().abstain.is_none());
     }
 
     #[test]
-    fn withheld_actions_read_the_confident_regions_without_an_indel_genotype_model() {
+    fn withheld_actions_read_the_not_difficult_regions_without_an_indel_genotype_model() {
         let dir = tempfile::TempDir::new().unwrap();
         let cli = parse(&[
             "score",
@@ -2605,14 +2607,14 @@ mod tests {
         ])
         .unwrap();
         let Command::Score(args) = cli.command else { panic!("not score") };
-        let regions = confident_regions(&dir);
+        let regions = not_difficult_regions(&dir);
         let policy = args.policy.policy(Mode::Genotyper, &["chr1"], &regions, false).unwrap();
         let abstain = policy.abstain.unwrap();
         assert!(abstain.flip && !abstain.regenotype && !abstain.promote);
         assert_eq!(abstain.indel_t_drop, args.policy.outside_indel_t_drop.0);
         // A missing BED is still an error.
         let missing = vec![NamedBed {
-            name: CONFIDENT_REGIONS.to_string(),
+            name: NOT_DIFFICULT_REGIONS.to_string(),
             path: dir.path().join("missing.bed"),
         }];
         let error = args.policy.policy(Mode::Genotyper, &["chr1"], &missing, false).unwrap_err();
@@ -2620,10 +2622,10 @@ mod tests {
     }
 
     #[test]
-    fn the_confident_regions_are_not_read_without_an_indel_genotype_model() {
+    fn the_not_difficult_regions_are_not_read_without_an_indel_genotype_model() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("missing.bed");
-        let regions = vec![NamedBed { name: CONFIDENT_REGIONS.to_string(), path }];
+        let regions = vec![NamedBed { name: NOT_DIFFICULT_REGIONS.to_string(), path }];
         let cli = parse(&["score", "--vcf", "v", "--models", "m", "-o", "o"]).unwrap();
         let Command::Score(args) = cli.command else { panic!("not score") };
         let policy = args.policy.policy(Mode::Genotyper, &["chr1"], &regions, false).unwrap();
@@ -2636,7 +2638,7 @@ mod tests {
     #[test]
     fn the_default_policy_can_be_turned_off() {
         let dir = tempfile::TempDir::new().unwrap();
-        let regions = confident_regions(&dir);
+        let regions = not_difficult_regions(&dir);
         let policy =
             score_policy(&["--keep-fallback", "none", "--outside-indel-t-drop", "none"], &regions)
                 .unwrap();
@@ -2661,9 +2663,9 @@ mod tests {
         assert_eq!(policy.rule(VariantType::Snp), Rule::KeepFallback);
         let abstain = policy.abstain.unwrap();
         assert_eq!((abstain.indel_t_drop, abstain.flip), (Some(0.7), true));
-        // Withholding actions needs the confident regions.
+        // Withholding actions needs the not-difficult regions.
         let error = score_policy(&["--abstain-actions", "flip"], &[]).unwrap_err();
-        assert!(error.to_string().contains(CONFIDENT_REGIONS), "{error}");
+        assert!(error.to_string().contains(NOT_DIFFICULT_REGIONS), "{error}");
     }
 
     #[rstest]
@@ -2672,7 +2674,7 @@ mod tests {
     #[case::abstain_actions(&["--abstain-actions", "flip", "none"], "--abstain-actions none cannot be given with other values, got: flip none")]
     fn none_cannot_be_given_with_other_values(#[case] extra: &[&str], #[case] expected: &str) {
         let dir = tempfile::TempDir::new().unwrap();
-        let error = score_policy(extra, &confident_regions(&dir)).unwrap_err().to_string();
+        let error = score_policy(extra, &not_difficult_regions(&dir)).unwrap_err().to_string();
         assert_eq!(error, expected);
     }
 
@@ -2680,13 +2682,13 @@ mod tests {
     fn abstain_actions_ignore_case() {
         let dir = tempfile::TempDir::new().unwrap();
         let policy =
-            score_policy(&["--abstain-actions", "Flip", "PROMOTE"], &confident_regions(&dir))
+            score_policy(&["--abstain-actions", "Flip", "PROMOTE"], &not_difficult_regions(&dir))
                 .unwrap();
         let abstain = policy.abstain.unwrap();
         assert!(abstain.flip && abstain.promote && !abstain.regenotype);
         // `none` alone, in any case, withholds nothing.
         let policy =
-            score_policy(&["--abstain-actions", "NONE"], &confident_regions(&dir)).unwrap();
+            score_policy(&["--abstain-actions", "NONE"], &not_difficult_regions(&dir)).unwrap();
         let abstain = policy.abstain.unwrap();
         assert!(!abstain.flip && !abstain.promote && !abstain.regenotype);
     }

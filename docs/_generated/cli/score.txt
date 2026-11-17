@@ -1,7 +1,7 @@
 Score a sample's calls and write a VCF with drops, promotions, flips and re-genotypes.
 
 Each model acts at its cross-validated thresholds. Indel genotype models also drop the calls their
-thresholds leave alone when P(keep) is below 0.5 (--keep-fallback). Given the confident regions
+thresholds leave alone when P(keep) is below 0.5 (--keep-fallback). Given the not-difficult regions
 (--regions notinalldifficultregions=PATH, GIAB's GRCh38 genome stratification), indel calls outside
 them are dropped at P(drop) >= 0.6 (in veto mode, P(drop) + P(flip) (+ P(re-genotype)) >= 0.6;
 --outside-indel-t-drop) in place of the model's drop threshold, whether that is lower or higher, and
@@ -30,9 +30,10 @@ Options:
           annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ)
 
       --regions <NAME=PATH>...
-          Region BEDs as NAME=PATH, with the names the models were trained with, plus the confident
-          regions as notinalldifficultregions=PATH (GIAB's GRCh38 genome stratification; outside
-          them, indel calls are dropped at --outside-indel-t-drop in place of the model's threshold)
+          Region BEDs as NAME=PATH, with the names the models were trained with, plus the
+          not-difficult regions as notinalldifficultregions=PATH (GIAB's GRCh38 genome
+          stratification; outside them, indel calls are dropped at --outside-indel-t-drop in place
+          of the model's threshold)
 
       --mode <MODE>
           How genotype models act: genotyper (drop, flip and re-genotype) or veto (drop only)
@@ -54,7 +55,7 @@ Options:
           [possible values: snp, indel]
 
       --abstain-actions <ABSTAIN_ACTIONS>...
-          Experimental: actions withheld from calls outside the confident regions (--regions
+          Experimental: actions withheld from calls outside the not-difficult regions (--regions
           notinalldifficultregions=PATH; calls whose REF span is not inside it are "outside"); none,
           alone: no action
 
@@ -62,7 +63,7 @@ Options:
           [possible values: flip, regenotype, promote, none]
 
       --outside-indel-t-drop <P|none>
-          The drop threshold of indel calls outside the confident regions: they are dropped when
+          The drop threshold of indel calls outside the not-difficult regions: they are dropped when
           P(drop) is at least this (in veto mode, P(drop) + P(flip) (+ P(re-genotype)), as the
           model's veto threshold is compared with), in place of the model's threshold, even when
           that is higher (none: the model's threshold). The keep fallback (--keep-fallback) still

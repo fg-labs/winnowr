@@ -59,8 +59,8 @@ promote and flip.
 
 By default `score` also applies two indel rules that are fixed, not chosen by cross-validation. An
 indel call that the thresholds leave alone is dropped when its P(keep) is below 0.5. Given GIAB's
-confident regions (`--regions notinalldifficultregions=...`), an indel call outside them is dropped
-at a threshold of 0.6, in place of the model's drop threshold.
+not-difficult regions (`--regions notinalldifficultregions=...`), an indel call outside them is
+dropped at a threshold of 0.6, in place of the model's drop threshold.
 
 The [user guide](https://winnowr.readthedocs.io) explains the classes, labels, training and scoring
 in full.
@@ -140,7 +140,7 @@ winnowr evaluate --models indel.winnowr.json --table HG002.parquet \
   --regions notinalldifficultregions=GRCh38_notinalldifficultregions.bed.gz -o HG002.indel.tsv
 ```
 
-`evaluate` needs the confident regions to decide indel calls as `score` does; without them its
+`evaluate` needs the not-difficult regions to decide indel calls as `score` does; without them its
 indel F1 is not that of the calls `score` writes. Then score with the models as above. For
 repeat-length or pileup features, give `extract` the `--strlen` or `--pileup` tables and `train`
 `--repeat-length` (or `--regenotype`) or `--pileup-features`.
