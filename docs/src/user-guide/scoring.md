@@ -14,7 +14,7 @@ contigs (models trained from tables that record them do), `score` stops with an 
 missing from the VCF's header or has another length there.
 
 `--regions` must name every region BED the models were trained with, under the same names. It
-also takes the confident regions, `notinalldifficultregions=PATH`, described below. Models with
+also takes the not-difficult regions, `notinalldifficultregions=PATH`, described below. Models with
 repeat-length or pileup features need `--strlen` or `--pileup` tables, or `--alignments` and
 `--reference` to measure the reads while scoring (see
 [Repeat-length features](repeat-length.md) and [Pileup features](pileup.md)).
@@ -45,7 +45,7 @@ both modes.
 - **Keep fallback.** An indel call that the thresholds leave alone is dropped when the model's
   P(keep) is below 0.5. `--keep-fallback` lists the variant types this applies to (default
   `indel`); `--keep-fallback none` turns it off.
-- **Outside the confident regions.** An indel call whose REF span is not inside GIAB's GRCh38
+- **Outside the not-difficult regions.** An indel call whose REF span is not inside GIAB's GRCh38
   `notinalldifficultregions` is dropped when P(drop) is at least 0.6 (in veto mode, P(drop) +
   P(flip) (+ P(re-genotype)), the quantity the veto threshold is compared with), in place of the
   model's drop threshold, whether that is lower or higher (so a model that would never drop does
@@ -63,15 +63,15 @@ Two more options are experimental:
 
 - `--expected-f1 <snp|indel>`: the genotype models of these variant types take the action of
   greatest expected F1 gain in place of the keep fallback. In genotyper mode this replaces their
-  thresholds: drop an indel call outside the confident regions when P(drop) reaches
+  thresholds: drop an indel call outside the not-difficult regions when P(drop) reaches
   `--outside-indel-t-drop`, else flip when P(flip) is above 0.5, else re-genotype when
   P(re-genotype) is above 0.5, else drop when P(keep) is below 0.5. In veto mode `t_drop` still
   applies: a call is dropped when P(drop) + P(flip) (+ P(re-genotype)) reaches `t_drop`, or when
   P(keep) is below 0.5.
 - `--abstain-actions <flip|regenotype|promote>`: withhold these actions from calls outside the
-  confident regions.
+  not-difficult regions.
 
-`evaluate` and `stratify` take the same options, and the confident regions as
+`evaluate` and `stratify` take the same options, and the not-difficult regions as
 `--regions notinalldifficultregions=PATH`, so their metrics are those of the calls `score` writes.
 They read only that BED from `--regions` (the models' region features come from the feature
 table), and warn that other names are ignored.

@@ -27,8 +27,8 @@ annotations.
 
 By default `score` also applies two indel rules that are fixed, not chosen by cross-validation. An
 indel call that the thresholds leave alone is dropped when its P(keep) is below 0.5. Given GIAB's
-confident regions (`--regions notinalldifficultregions=...`), an indel call outside them is dropped
-at a threshold of 0.6, in place of the model's drop threshold. See
+not-difficult regions (`--regions notinalldifficultregions=...`), an indel call outside them is
+dropped at a threshold of 0.6, in place of the model's drop threshold. See
 [Scoring](user-guide/scoring.md).
 
 > **Demonstration code only.** winnowr is a research prototype, shared to illustrate an approach

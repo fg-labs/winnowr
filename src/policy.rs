@@ -23,13 +23,13 @@ use crate::table::FeatureTable;
 
 /// The name of the region set (`--regions NAME=PATH`) that the default policy acts fully inside:
 /// GIAB's GRCh38 genome stratification "notinalldifficultregions" (sample-independent).
-pub const CONFIDENT_REGIONS: &str = "notinalldifficultregions";
+pub const NOT_DIFFICULT_REGIONS: &str = "notinalldifficultregions";
 
 /// The variant types whose genotype models use [`Rule::KeepFallback`] by default.
 pub const DEFAULT_KEEP_FALLBACK: [VariantType; 1] = [VariantType::Indel];
 
 /// The P(drop) at or above which the default policy drops indel calls outside
-/// [`CONFIDENT_REGIONS`], in place of the model's drop threshold.
+/// [`NOT_DIFFICULT_REGIONS`], in place of the model's drop threshold.
 pub const DEFAULT_OUTSIDE_INDEL_T_DROP: f64 = 0.6;
 
 /// How models' probabilities become actions: the genotype models' mode and rules, and the
@@ -522,9 +522,9 @@ mod tests {
         assert!(!merged[&b].drop);
     }
 
-    /// The confident regions chr1:[100, 200) (0-based), withholding `actions`.
+    /// The not-difficult regions chr1:[100, 200) (0-based), withholding `actions`.
     fn abstention(flip: bool, promote: bool, indel_t_drop: Option<f64>) -> Abstention {
-        let regions = RegionSet::from_spans(CONFIDENT_REGIONS, [("chr1", 100, 200)]);
+        let regions = RegionSet::from_spans(NOT_DIFFICULT_REGIONS, [("chr1", 100, 200)]);
         Abstention { regions, flip, regenotype: false, promote, indel_t_drop }
     }
 
@@ -557,10 +557,16 @@ mod tests {
     }
 
     #[test]
-    fn actions_outside_the_confident_regions_are_withheld() {
+    fn the_not_difficult_regions_key_is_the_giab_stratification_name() {
+        // Users and trained models pass `--regions notinalldifficultregions=PATH`.
+        assert_eq!(NOT_DIFFICULT_REGIONS, "notinalldifficultregions");
+    }
+
+    #[test]
+    fn actions_outside_the_not_difficult_regions_are_withheld() {
         // Of the scored calls, only chr1:300 and chr1:450 are outside these.
         let regions =
-            RegionSet::from_spans(CONFIDENT_REGIONS, [("chr1", 0, 299), ("chr1", 300, 400)]);
+            RegionSet::from_spans(NOT_DIFFICULT_REGIONS, [("chr1", 0, 299), ("chr1", 300, 400)]);
         let abstain = Abstention {
             regions,
             flip: true,

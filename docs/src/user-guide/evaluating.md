@@ -14,7 +14,7 @@ winnowr evaluate --models snp.winnowr.json snp-promote.winnowr.json --table HG00
 
 A training sample of the models gives in-sample, optimistic metrics, and `evaluate` warns.
 `--regions` takes the region BEDs `score` would get, so that calls are decided as `score` decides
-them; only the confident regions (`notinalldifficultregions`) are read, since the models' region
+them; only the not-difficult regions (`notinalldifficultregions`) are read, since the models' region
 features come from the table. `evaluate` also takes the options that change how `score` acts
 (`--keep-fallback`, `--outside-indel-t-drop` and the experimental ones; see
 [Scoring](scoring.md)).

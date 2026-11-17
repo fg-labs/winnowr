@@ -28,7 +28,7 @@ winnowr evaluate --models indel.winnowr.json --table HG002.parquet \
   --regions notinalldifficultregions=GRCh38_notinalldifficultregions.bed.gz -o HG002.indel.tsv
 ```
 
-`evaluate` needs the confident regions to decide indel calls as `score` does; without them its
+`evaluate` needs the not-difficult regions to decide indel calls as `score` does; without them its
 indel F1 is not that of the calls `score` writes.
 
 Run `extract` the same way for every sample, the held-out one included. `train` writes
