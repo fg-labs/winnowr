@@ -11,7 +11,8 @@ Options:
 
       --tables <TABLES>...
           Labelled feature tables (from `extract --happy`), one per training sample: at least two,
-          of distinct samples
+          of distinct samples, on the same reference. They may cover different contigs: the model
+          records the contigs of all the tables, and `score` scores the calls on all of them
 
       --variant-type <VARIANT_TYPE>
           The variant type to train for (snp or indel)

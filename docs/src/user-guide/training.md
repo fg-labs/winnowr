@@ -10,9 +10,14 @@ winnowr train --tables HG001.parquet HG005.parquet HG006.parquet HG007.parquet \
   --sample-groups HG005,HG006,HG007 --variant-type snp -o snp
 ```
 
-The tables must be of at least two distinct samples, and must have been extracted from the same
-contigs, with the same region names, from calls on the same reference (`train` checks the contig
-lengths each table records).
+The tables must be of at least two distinct samples, extracted with the same region names from
+calls on the same reference. They may cover different contigs, e.g. one sample's odd chromosomes
+(`extract --contigs`) with other samples' whole genomes: the model records every contig any table
+covers, starting from the table covering the most, and `score` scores the calls on all of them.
+`train` checks that the tables record the same length of each contig they share, and warns of a
+table that shares no contig with the others, whose reference it cannot check (e.g. `1` against
+`chr1`: a different reference). A table from `subset` lists all the contigs it was extracted from,
+so `train` takes it as covering them all.
 
 ## Choosing the thresholds by cross-validation
 

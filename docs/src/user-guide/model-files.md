@@ -17,7 +17,7 @@ information and, under `booster`, the XGBoost booster in XGBoost's JSON format. 
 | `thresholds`         | a genotype model's cross-validated thresholds per mode (`genotyper`, `veto`)   |
 | `promote_thresholds` | a promote model's cross-validated thresholds                                   |
 | `training_samples`   | the training sample names                                                      |
-| `contigs`            | the contigs the training calls came from                                       |
+| `contigs`            | the contigs the training calls came from (of every training table)             |
 | `reference_contigs`  | the lengths of those contigs in the reference the calls were made on           |
 | `params`             | the training parameters, including the thread count                            |
 | `stutter`            | the stutter model of a model with repeat-length features                       |
