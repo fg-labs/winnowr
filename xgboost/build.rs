@@ -1,9 +1,13 @@
-//! Builds the vendored XGBoost as a static library and links it, with OpenMP, statically.
+//! Builds the vendored XGBoost as a static library and links it, with OpenMP, statically where
+//! it can (see below).
 //!
 //! Supported targets are macOS and Linux:
 //!
 //! - **macOS**: XGBoost is compiled with Apple clang and LLVM's OpenMP runtime, `libomp.a`, found
-//!   under `$WINNOWR_LIBOMP_PREFIX` when set, else under Homebrew's `libomp` prefix.
+//!   under `$WINNOWR_LIBOMP_PREFIX` when set, else under Homebrew's `libomp` prefix. A
+//!   `$WINNOWR_LIBOMP_PREFIX` with only the shared `libomp.dylib` (e.g. conda-forge's
+//!   `llvm-openmp`) links that instead, with a warning. Binaries record its absolute path (see
+//!   [`link_copy`]), so they load it from the prefix with no rpath, and need it there at run time.
 //! - **Linux**: XGBoost is compiled with GCC and GCC's OpenMP runtime, `libgomp.a`, found by
 //!   asking the compiler. (clang on Linux would need LLVM's `libomp.a`, which distributions do not
 //!   ship as a static library.) Some distributions (e.g. RHEL and Amazon Linux) build `libgomp.a`
@@ -87,10 +91,20 @@ fn main() {
 
     match openmp.static_link(&compiler, &out_dir) {
         StaticLink::Links => {
-            link_static_copy(&openmp.archive, &out_dir, openmp.name);
+            link_copy(&openmp.archive, &out_dir, openmp.name, Kind::Static);
             if openmp.name == "gomp" {
                 println!("cargo:rustc-cfg=winnowr_static_libgomp");
             }
+        }
+        StaticLink::NoArchive(dylib) => {
+            println!(
+                "cargo:warning=there is no {}, so the shared {} is linked: binaries load it from \
+                 there, so it must stay there. To link libomp statically, point \
+                 WINNOWR_LIBOMP_PREFIX at a prefix with lib/libomp.a (e.g. `brew install libomp`).",
+                openmp.archive.display(),
+                dylib.display()
+            );
+            link_copy(&dylib, &out_dir, openmp.name, Kind::Dylib);
         }
         StaticLink::NotPositionIndependent => {
             println!(
@@ -136,6 +150,7 @@ fn declare_rerun_triggers(manifest_dir: &Path, source: &Path) {
     }
     println!("cargo:rerun-if-env-changed=WINNOWR_LIBOMP_PREFIX");
     println!("cargo:rerun-if-env-changed=HOMEBREW_PREFIX");
+    println!("cargo:rerun-if-env-changed=INSTALL_NAME_TOOL");
 }
 
 /// The vendored files and directories that the CMake build reads, relative to the XGBoost source
@@ -263,9 +278,10 @@ fn vendored_version(source: &Path) -> String {
     format!("{}.{}.{}", component("MAJOR"), component("MINOR"), component("PATCH"))
 }
 
-/// The OpenMP runtime to link statically, and how CMake should find it.
+/// The OpenMP runtime to link (statically if it can be), and how CMake should find it.
 struct OpenMp {
-    /// The static archive, `lib<name>.a`.
+    /// The static archive, `lib<name>.a`. On macOS it may not exist (see
+    /// [`StaticLink::NoArchive`]).
     archive: PathBuf,
     /// The library name (`omp` or `gomp`).
     name: &'static str,
@@ -284,21 +300,32 @@ impl OpenMp {
              compiler is {}",
             compiler.path().display()
         );
+        // Absolute, so that CMake (run from OUT_DIR) and the link see the same directory.
         let prefix = libomp_prefix();
-        Self {
-            archive: prefix.join("lib/libomp.a"),
-            name: "omp",
-            cmake_root: Some(prefix),
-            system_libraries: &["c++"],
-        }
+        let prefix = std::path::absolute(&prefix)
+            .unwrap_or_else(|e| panic!("resolving {}: {e}", prefix.display()));
+        let archive = prefix.join("lib/libomp.a");
+        // Rerun when the library linked changes. Only a path that exists can be watched (Cargo
+        // reruns every build for a missing one), and watching the whole lib/ would rerun on any
+        // change to a conda environment; so a libomp.a added later to a dylib-only prefix is not
+        // noticed until WINNOWR_LIBOMP_PREFIX changes or `cargo clean -p winnowr-xgboost`.
+        let linked =
+            if archive.is_file() { archive.clone() } else { prefix.join("lib/libomp.dylib") };
+        println!("cargo:rerun-if-changed={}", linked.display());
+        Self { archive, name: "omp", cmake_root: Some(prefix), system_libraries: &["c++"] }
     }
 
-    /// Whether the static runtime can be linked into the binary: always on macOS; on Linux, if
-    /// the binary is not position-independent, or a position-independent test program links
-    /// against the archive (it does not when the archive was built without `-fPIC`).
+    /// Whether the static runtime can be linked into the binary: on macOS, if `libomp.a` exists
+    /// (else the shared libomp beside it is linked); on Linux, if the binary is not
+    /// position-independent, or a position-independent test program links against the archive
+    /// (it does not when the archive was built without `-fPIC`).
     fn static_link(&self, compiler: &cc::Tool, out_dir: &Path) -> StaticLink {
         if self.name != "gomp" {
-            return StaticLink::Links;
+            return if self.archive.is_file() {
+                StaticLink::Links
+            } else {
+                StaticLink::NoArchive(self.archive.with_file_name("libomp.dylib"))
+            };
         }
         let rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
         if rustflags.split('\x1f').any(|flag| flag.ends_with("relocation-model=static")) {
@@ -346,7 +373,7 @@ impl OpenMp {
     }
 }
 
-/// Whether the OpenMP runtime's static archive can be linked into the binary.
+/// Whether the OpenMP runtime's static archive can be linked into the binary, and if not, why.
 #[derive(Debug, PartialEq)]
 enum StaticLink {
     /// It can.
@@ -356,6 +383,10 @@ enum StaticLink {
     NotPositionIndependent,
     /// The test program failed for another reason, given by the end of the compiler's output.
     ProbeFailed(String),
+    /// There is no static archive, only this shared library beside where it would be (e.g.
+    /// conda-forge's llvm-openmp, which ships only `libomp.dylib`): it is linked, and binaries
+    /// load it from there.
+    NoArchive(PathBuf),
 }
 
 impl StaticLink {
@@ -373,16 +404,18 @@ impl StaticLink {
     }
 }
 
-/// The installation prefix of LLVM's OpenMP runtime (holding `lib/libomp.a`) on macOS.
+/// The installation prefix of LLVM's OpenMP runtime (holding `lib/libomp.a`, or only
+/// `lib/libomp.dylib` when given by `WINNOWR_LIBOMP_PREFIX`) on macOS.
 ///
-/// `WINNOWR_LIBOMP_PREFIX`, when set, must hold it: an explicit override is never silently
-/// replaced by another installation.
+/// `WINNOWR_LIBOMP_PREFIX`, when set, must hold it or, failing that, `lib/libomp.dylib` (linked
+/// shared): an explicit override is never silently replaced by another installation.
 fn libomp_prefix() -> PathBuf {
     let has_archive = |prefix: &Path| prefix.join("lib/libomp.a").is_file();
     if let Some(prefix) = env::var_os("WINNOWR_LIBOMP_PREFIX").map(PathBuf::from) {
         assert!(
-            has_archive(&prefix),
-            "WINNOWR_LIBOMP_PREFIX is set to {}, which has no lib/libomp.a",
+            has_archive(&prefix) || prefix.join("lib/libomp.dylib").is_file(),
+            "WINNOWR_LIBOMP_PREFIX is set to {}, which has neither lib/libomp.a nor \
+             lib/libomp.dylib",
             prefix.display()
         );
         return prefix;
@@ -395,32 +428,77 @@ fn libomp_prefix() -> PathBuf {
     candidates.iter().find(|prefix| has_archive(prefix)).cloned().unwrap_or_else(|| {
         panic!(
             "libomp.a not found (tried {}): install it (e.g. `brew install libomp`) or set \
-             WINNOWR_LIBOMP_PREFIX to the prefix holding lib/libomp.a",
+             WINNOWR_LIBOMP_PREFIX to the prefix holding lib/libomp.a (or only lib/libomp.dylib, \
+             to link it shared)",
             candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
         )
     })
 }
 
-/// Copy the static library `archive` into a directory of its own under `out_dir`, as
-/// `lib<name>.a`, and link it statically from there.
+/// How [`link_copy`] links a library.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// A static archive, `lib<name>.a`.
+    Static,
+    /// A shared library, `lib<name>.dylib` (macOS).
+    Dylib,
+}
+
+/// Copy `library` into a directory of its own under `out_dir`, as `lib<name>.a` or
+/// `lib<name>.dylib`, and link it from there.
 ///
-/// Linkers prefer a shared library over a static one of the same name, and the system's
-/// `libomp.dylib` / `libgomp.so` sits beside the archive. (Naming the archive verbatim,
-/// `-l:libgomp.a`, is not supported by Apple's linker.)
-fn link_static_copy(archive: &Path, out_dir: &Path, name: &str) {
-    let dir = out_dir.join(format!("static-{name}"));
+/// Searching the directory holding `library` instead would pick the wrong libraries: linkers
+/// prefer a shared library over a static one of the same name, and the system's `libomp.dylib` /
+/// `libgomp.so` sits beside the archive (naming the archive verbatim, `-l:libgomp.a`, is not
+/// supported by Apple's linker); and a conda environment's `lib/`, which holds `libomp.dylib`,
+/// also holds e.g. a libc++ that would take the place of the system's.
+///
+/// A shared copy's install name is set to the absolute path of `library`, so that binaries record
+/// and load the original from its prefix, with no rpath (conda-forge's `libomp.dylib` is named
+/// `@rpath/libomp.dylib`, which a binary could only load through an rpath that every dependent
+/// package would have to add). `$INSTALL_NAME_TOOL` is used when set (conda's compilers set it),
+/// else `install_name_tool`.
+fn link_copy(library: &Path, out_dir: &Path, name: &str, kind: Kind) {
+    let (dir, file, link) = match kind {
+        Kind::Static => ("static", format!("lib{name}.a"), "static"),
+        Kind::Dylib => ("shared", format!("lib{name}.dylib"), "dylib"),
+    };
+    let dir = out_dir.join(format!("{dir}-{name}"));
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("creating {}: {e}", dir.display()));
-    let copy = dir.join(format!("lib{name}.a"));
-    // The copy keeps the archive's (often read-only) permissions, so a rerun of this build script
+    let copy = dir.join(file);
+    // The copy keeps the library's (often read-only) permissions, so a rerun of this build script
     // must remove it rather than overwrite it.
     if copy.exists() {
         std::fs::remove_file(&copy)
             .unwrap_or_else(|e| panic!("removing the stale {}: {e}", copy.display()));
     }
-    std::fs::copy(archive, &copy)
-        .unwrap_or_else(|e| panic!("copying {} to {}: {e}", archive.display(), copy.display()));
+    std::fs::copy(library, &copy)
+        .unwrap_or_else(|e| panic!("copying {} to {}: {e}", library.display(), copy.display()));
+    if let Kind::Dylib = kind {
+        let mut permissions = std::fs::metadata(&copy)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", copy.display()))
+            .permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&copy, permissions)
+            .unwrap_or_else(|e| panic!("making {} writable: {e}", copy.display()));
+        let tool = env::var_os("INSTALL_NAME_TOOL").unwrap_or_else(|| "install_name_tool".into());
+        let status = std::process::Command::new(&tool)
+            .arg("-id")
+            .arg(library)
+            .arg(&copy)
+            .status()
+            .unwrap_or_else(|e| panic!("running {}: {e}", Path::new(&tool).display()));
+        assert!(
+            status.success(),
+            "{} -id {} {} failed ({status})",
+            Path::new(&tool).display(),
+            library.display(),
+            copy.display()
+        );
+    }
     println!("cargo:rustc-link-search=native={}", dir.display());
-    println!("cargo:rustc-link-lib=static={name}");
+    println!("cargo:rustc-link-lib={link}={name}");
 }
 
 /// The path of a library that ships with the compiler (e.g. GCC's `libgomp.a`).

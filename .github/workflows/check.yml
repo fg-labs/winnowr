@@ -68,6 +68,60 @@ jobs:
           "$binary" --version
           .github/scripts/check-static-link.sh "$binary"
 
+  # Builds against a libomp prefix with only libomp.dylib, as conda-forge's llvm-openmp (which
+  # bioconda builds with) is: see "StaticLink::NoArchive" in xgboost/build.rs. The prefix holds a
+  # copy of Homebrew's libomp.dylib named @rpath/libomp.dylib, as conda-forge's is, and a decoy
+  # libc++ that must not replace the system's.
+  macos-shared-libomp:
+    runs-on: macos-15
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install libomp
+        run: brew install libomp
+      - name: Make a libomp prefix with only libomp.dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/omp"
+          mkdir -p "$prefix/lib"
+          cp -R "$(brew --prefix libomp)/include" "$prefix/"
+          cp "$(brew --prefix libomp)/lib/libomp.dylib" "$prefix/lib/"
+          chmod u+w "$prefix/lib/libomp.dylib"
+          install_name_tool -id @rpath/libomp.dylib "$prefix/lib/libomp.dylib"
+          codesign --force --sign - "$prefix/lib/libomp.dylib"
+          echo 'void winnowr_decoy(void) {}' > "$RUNNER_TEMP/decoy.c"
+          cc -dynamiclib -install_name @rpath/libc++.1.dylib -o "$prefix/lib/libc++.dylib" "$RUNNER_TEMP/decoy.c"
+          echo "WINNOWR_LIBOMP_PREFIX=$prefix" >> "$GITHUB_ENV"
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Set up compilation cache (sccache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Tests
+        run: cargo test --locked --workspace
+      # Outside cargo, which puts its build directories on the dyld fallback path: every binary
+      # must name the prefix's libomp.dylib by its absolute path, and the system's libc++.
+      - name: Binaries load the prefix's libomp.dylib by its absolute path
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked
+          tests=$(cargo test --locked --workspace --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable')
+          for binary in target/debug/winnowr $tests; do
+            echo "$binary"
+            otool -L "$binary" | grep -F "$WINNOWR_LIBOMP_PREFIX/lib/libomp.dylib"
+            otool -L "$binary" | grep -F /usr/lib/libc++.1.dylib
+            if otool -L "$binary" | grep -F '@rpath/'; then exit 1; fi
+          done
+          target/debug/winnowr --version
+
   # Builds and tests in Debian 12 (bookworm), with only the packages a Debian image needs to
   # build winnowr (see docs/Dockerfile.bookworm), on x86_64 and aarch64. Debian's GCC and its
   # position-independent libgomp.a differ from Ubuntu 22.04's, and pipelines build winnowr there.
