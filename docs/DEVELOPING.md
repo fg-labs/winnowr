@@ -322,8 +322,10 @@ gh release view v<version> --repo fg-labs/winnowr --json body --jq .body > "$tmp
 
 The `publish` workflow needs:
 
-* The `RELEASE_PLZ_TOKEN` repository secret: a personal access token that release-plz opens the release PR and pushes the tag with. The workflow's built-in `GITHUB_TOKEN` would not run CI on the release PR or trigger the `release` workflow on the tag. A fine-grained token for `fg-labs/winnowr` needs *Contents: read and write* and *Pull requests: read and write* (the `fg-labs` organization must allow fine-grained tokens); a classic token needs the `repo` scope.
+* A token of the `fg-labs-bot` GitHub App, which release-plz opens the release PR and creates the tag with (through the GitHub API). Each job creates one from the organization secrets `FG_LABS_BOT_APP_ID` and `FG_LABS_BOT_PRIVATE_KEY`, which must be visible to this repository, so the repository needs no secret of its own. The `release-pr` job asks for *Contents*, *Pull requests* and *Workflows* write, and the `release` job for *Contents* and *Workflows* write and *Pull requests* read; the app must have them, or the token step fails. The workflow's built-in `GITHUB_TOKEN` would not run CI on the release PR or trigger the `release` workflow on the tag. Both jobs run only in `fg-labs/winnowr`, so they are skipped on forks.
 * crates.io [trusted publishing](https://crates.io/docs/trusted-publishing) for both crates, with no registry token: on each crate's *Settings* page on crates.io, add a GitHub trusted publisher with owner `fg-labs`, repository `winnowr`, workflow `publish.yml` and no environment. The `release` job requests an OIDC token (`id-token: write`), which release-plz exchanges for a short-lived crates.io token when a crate needs publishing.
+
+If the `release` job fails after publishing the crates but before creating the tag (e.g. the app token, valid for an hour, expired while waiting for crates.io, or GitHub refused the tag), rerunning it does not create the tag: release-plz skips a version that is already published. Tag the commit the failed run built (the release PR's squash commit on `main`, shown as the run's commit) by hand, which runs the `release` workflow: `git tag -s vX.Y.Z <commit> -m 'winnowr vX.Y.Z' && git push origin vX.Y.Z`.
 
 ### The first crates.io release (0.1.1)
 
