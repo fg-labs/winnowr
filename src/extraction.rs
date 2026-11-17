@@ -124,6 +124,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
         pileup_settings: None,
         reference_contigs: Some(summary.lengths_of(contigs)),
         dp_norm_divisor: Some(derived.dp_norm_divisor),
+        restricted_to: None,
     };
     let mut table = FeatureTable::from_records(&records, derived, info)?;
     drop(records);

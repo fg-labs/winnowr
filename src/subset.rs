@@ -16,7 +16,7 @@ use anyhow::{Result, bail};
 use crate::common::VariantType;
 use crate::labels::{HappyFn, read_happy_fns};
 use crate::regions::{RegionSet, ref_span};
-use crate::table::FeatureTable;
+use crate::table::{FeatureTable, Restriction};
 
 /// Truth FN counts by variant type.
 type FnCounts = BTreeMap<VariantType, u64>;
@@ -45,8 +45,9 @@ fn count_fns(
 /// with the truth FN counts of the same part of the genome, from the hap.py VCF it was labelled
 /// from.
 ///
-/// The table's metadata is otherwise unchanged; in particular it still lists every contig it was
-/// extracted from, as its per-sample features come from all of them.
+/// The table records the restriction (`restricted_to`), and its metadata is otherwise unchanged;
+/// in particular it still lists every contig it was extracted from, as its per-sample features come
+/// from all of them.
 ///
 /// # Arguments
 ///
@@ -57,7 +58,9 @@ fn count_fns(
 ///
 /// # Errors
 ///
-/// Returns an error if the table is not labelled, a contig is not one of the table's, the hap.py
+/// Returns an error if the table is not labelled or was already restricted (its FN counts are no
+/// longer of all its contigs, so they cannot be checked against the hap.py VCF; restrict the table
+/// as extracted instead), a contig is not one of the table's, the hap.py
 /// VCF cannot be read, or its FN counts on the table's contigs differ from the table's (it is not
 /// the VCF the table was labelled from).
 pub fn restrict_table(
@@ -69,6 +72,16 @@ pub fn restrict_table(
     let info = table.info();
     if !info.is_labelled() {
         bail!("the feature table for {} has no hap.py labels (extract with --happy)", info.sample);
+    }
+    if let Some(restriction) = &info.restricted_to {
+        let excluded =
+            restriction.excluded.as_ref().map_or(String::new(), |bed| format!(", outside {bed}"));
+        bail!(
+            "the feature table for {} was already restricted by `winnowr subset` (to [{}]{excluded}), \
+             so its truth FN counts cannot be recounted; restrict the table as extracted instead",
+            info.sample,
+            restriction.contigs.join(", ")
+        );
     }
     let unknown: Vec<&str> =
         contigs.iter().filter(|c| !info.contigs.contains(c)).map(String::as_str).collect();
@@ -103,12 +116,33 @@ pub fn restrict_table(
         })
         .collect();
     let mut restricted = table.filter(&mask)?;
+    restricted.info_mut().restricted_to =
+        Some(Restriction { contigs: contigs.to_vec(), excluded: exclude.map(RegionSet::source) });
     restricted.info_mut().fn_counts = Some(
         [VariantType::Snp, VariantType::Indel]
             .into_iter()
             .map(|vt| (vt.to_string(), retained.get(&vt).copied().unwrap_or(0)))
             .collect(),
     );
+    Ok(restricted)
+}
+
+/// A labelled feature table's calls and truth FN counts on `contigs`, as [`restrict_table`] gives
+/// them, but listing only those contigs, so that its truth FNs, per-chromosome rates and policy are
+/// of those contigs alone: for evaluating some of a table's contigs (`evaluate` and `stratify`
+/// with `--contigs`), not for writing a table to train on, whose per-sample features come from all
+/// its contigs.
+///
+/// # Errors
+///
+/// Returns an error if the table cannot be restricted (see [`restrict_table`]).
+pub fn restrict_to_contigs(
+    table: &FeatureTable,
+    happy: &Path,
+    contigs: &[String],
+) -> Result<FeatureTable> {
+    let mut restricted = restrict_table(table, happy, contigs, None)?;
+    restricted.info_mut().contigs.retain(|contig| contigs.contains(contig));
     Ok(restricted)
 }
 
@@ -156,6 +190,40 @@ mod tests {
     fn fn_counts(table: &FeatureTable) -> (u64, u64) {
         let info = table.info();
         (info.fn_count(VariantType::Snp).unwrap(), info.fn_count(VariantType::Indel).unwrap())
+    }
+
+    #[test]
+    fn restricting_to_contigs_lists_only_those_contigs() {
+        let dir = TempDir::new().unwrap();
+        let happy = happy(dir.path());
+        let got = restrict_to_contigs(&table(), &happy, &["chr2".to_string()]).unwrap();
+        assert_eq!(got.str_column("chrom").unwrap(), ["chr2"]);
+        assert_eq!(fn_counts(&got), (1, 1));
+        assert_eq!(got.info().contigs, ["chr2"]);
+    }
+
+    #[test]
+    fn a_restricted_table_records_its_restriction_and_is_not_restricted_again() {
+        let dir = TempDir::new().unwrap();
+        let happy = happy(dir.path());
+        assert_eq!(table().info().restricted_to, None);
+        let chr2 = ["chr2".to_string()];
+        let got = restrict_table(&table(), &happy, &chr2, None).unwrap();
+        let expected = Restriction { contigs: chr2.to_vec(), excluded: None };
+        assert_eq!(got.info().restricted_to, Some(expected));
+        // Its FN counts are no longer of all its contigs, so the hap.py VCF cannot check them.
+        for again in
+            [restrict_table(&got, &happy, &chr2, None), restrict_to_contigs(&got, &happy, &chr2)]
+        {
+            let message = again.unwrap_err().to_string();
+            assert!(
+                message.contains(
+                    "the feature table for S1 was already restricted by `winnowr \
+                                  subset` (to [chr2])"
+                ),
+                "{message}"
+            );
+        }
     }
 
     #[test]

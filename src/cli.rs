@@ -37,7 +37,7 @@ use crate::strlen::{StrlenOptions, measure_regions, write_strlen_table};
 use crate::stutter::{
     LENGTH_CALL_FEATURES, StutterFit, StutterModel, fit_stutter_from_feature_tables,
 };
-use crate::subset::restrict_table;
+use crate::subset::{restrict_table, restrict_to_contigs};
 use crate::table::{FeatureTable, FeatureTableInfo, TableSelection};
 use crate::thresholds::{DEFAULT_GRID, DEFAULT_PROMOTE_FLIP_GRID, DEFAULT_PROMOTE_GRID};
 use crate::training::{
@@ -450,6 +450,16 @@ pub(crate) struct EvaluateArgs {
     /// region features come from the table.
     #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
     pub(crate) regions: Vec<NamedBed>,
+
+    /// The contigs to evaluate: only their calls and truth FNs are counted (e.g. the chromosomes
+    /// held out from a model's training) [default: all the table's contigs]. Needs --happy, and a
+    /// table as extracted, not one from `subset`.
+    #[arg(long, num_args = 1.., requires = "happy")]
+    pub(crate) contigs: Vec<String>,
+
+    /// The hap.py output VCF the table was labelled from, to recount its truth FNs on --contigs.
+    #[arg(long, requires = "contigs")]
+    pub(crate) happy: Option<PathBuf>,
 }
 
 /// The drop threshold of indel calls outside the not-difficult regions: a P(drop), or `none` for
@@ -1485,13 +1495,21 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
         variant_type: Some(variant_type),
     };
     let table = FeatureTable::read_parquet_selected(&args.table, &selection)?;
+    // The contigs the calls were extracted from, before any --contigs, which the not-difficult
+    // regions are checked against (see `stratify`).
+    let extracted = table.info().contigs.clone();
+    // clap gives --contigs and --happy together or not at all.
+    let table = match &args.happy {
+        None => table,
+        Some(happy) => restrict_to_contigs(&table, happy, &args.contigs)?,
+    };
     let info = table.info();
     check_labelled_table(&args.table, info, &models, &args.models)?;
     warn_policy_only_regions(&args.regions);
     // The mode is a placeholder: evaluate reports both.
     let policy = args.policy.policy(
         Mode::Genotyper,
-        &info.contigs,
+        &extracted,
         &args.regions,
         !genotype.is_empty() && variant_type == VariantType::Indel,
     )?;
@@ -1721,18 +1739,17 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
         &args.tables[1],
         &TableSelection { columns: Some(label_columns), variant_type: None },
     )?;
+    // The contigs the calls were extracted from, before any --contigs: the region BEDs are checked
+    // against them, to catch BEDs whose contig names differ from the calls', which a BED that
+    // merely lacks a selected contig is not.
+    let extracted = table.info().contigs.clone();
     let (table, second) = if args.contigs.is_empty() {
         (table, second)
     } else {
-        // Each table with its calls and FN counts on the contigs, listing only those contigs, so
-        // that the truth FNs and per-chromosome rates are of those contigs too.
-        let restrict = |table: &FeatureTable, happy: &PathBuf| -> Result<FeatureTable> {
-            let mut restricted = restrict_table(table, happy, &args.contigs, None)?;
-            let info = restricted.info_mut();
-            info.contigs.retain(|contig| args.contigs.contains(contig));
-            Ok(restricted)
-        };
-        (restrict(&table, &args.happy[0])?, restrict(&second, &args.happy[1])?)
+        (
+            restrict_to_contigs(&table, &args.happy[0], &args.contigs)?,
+            restrict_to_contigs(&second, &args.happy[1], &args.contigs)?,
+        )
     };
     let info = table.info();
     if second.info().sample != info.sample {
@@ -1744,7 +1761,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
         RegionSet::from_bed(&names[1], &args.truth_beds[1])?,
     ];
     for bed in &beds {
-        bed.check_contigs(&info.contigs)?;
+        bed.check_contigs(&extracted)?;
     }
     let mut named = match &args.stratification {
         Some(path) => read_stratification_manifest(path)?,
@@ -1757,7 +1774,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
         .map(|named| RegionSet::from_bed(&named.name, &named.path))
         .collect::<Result<Vec<_>>>()?;
     for region in &regions {
-        if let Err(e) = region.check_contigs(&info.contigs) {
+        if let Err(e) = region.check_contigs(&extracted) {
             log::warn!("region {}: {e:#}", region.name());
         }
     }
@@ -1776,7 +1793,7 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
         );
     }
     let policy =
-        args.policy.policy(args.mode, &info.contigs, &args.regions, has_indel_genotype(&models))?;
+        args.policy.policy(args.mode, &extracted, &args.regions, has_indel_genotype(&models))?;
     let outputs =
         CallOutputs { calls: args.calls.as_deref(), labelled_dir: args.labelled_calls.as_deref() };
     let (report, by_region) =
@@ -2111,6 +2128,27 @@ mod tests {
         assert_eq!(cli.global.threads(|_| None), (DEFAULT_THREADS, ThreadsFrom::Default));
         let Command::Evaluate(args) = cli.command else { panic!("not evaluate") };
         assert!(!args.tuned);
+        assert!(args.contigs.is_empty() && args.happy.is_none());
+        let restricted =
+            [&EVALUATE[..], &["--contigs", "chr2", "chr4", "--happy", "h.vcf"]].concat();
+        let Command::Evaluate(args) = parse(&restricted).unwrap().command else {
+            panic!("not evaluate")
+        };
+        assert_eq!(args.contigs, ["chr2", "chr4"]);
+        assert_eq!(args.happy, Some(PathBuf::from("h.vcf")));
+        // --contigs needs --happy to recount the truth FNs, and --happy is only for --contigs.
+        for (extra, missing) in
+            [(&["--contigs", "chr2"][..], "--happy <HAPPY>"), (&["--happy", "h.vcf"], "--contigs")]
+        {
+            let error = parse(&[&EVALUATE[..], extra].concat()).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument, "{extra:?}");
+            let Some(clap::error::ContextValue::Strings(args)) =
+                error.get(clap::error::ContextKind::InvalidArg)
+            else {
+                panic!("no missing argument named: {error}")
+            };
+            assert!(args[0].starts_with(missing), "{args:?}");
+        }
     }
 
     #[test]
@@ -2350,7 +2388,8 @@ mod tests {
         }
 
         /// Writes the calls and their hap.py output, as [`write_calls`] does, with the same calls
-        /// and truth FNs on each of `contigs`.
+        /// on each of `contigs` and 3 truth FNs on the first contig, 6 on the second, and so on, so
+        /// that counts tell the contigs apart.
         fn write_calls_on(dir: &Path, contigs: &[&str]) {
             let declare = |header: &str| {
                 let lines: String = contigs
@@ -2360,7 +2399,7 @@ mod tests {
                 header.replace("##contig=<ID=chr1,length=100000>\n", &lines)
             };
             let (mut vcf, mut happy) = (declare(HEADER), declare(HAPPY_HEADER));
-            for contig in contigs {
+            for (k, contig) in contigs.iter().enumerate() {
                 for i in 0..CALLS {
                     let pos = 1000 + 200 * i;
                     let (qual, gq, ad, mq) =
@@ -2378,7 +2417,7 @@ mod tests {
                         "{contig}\t{pos}\t.\tA\tC\t.\t.\t.\tGT:BD:BK:BVT\t{decision}\n"
                     ));
                 }
-                for pos in [50_000, 50_100, 50_200] {
+                for pos in (0..3 * (k + 1)).map(|j| 50_000 + 100 * j) {
                     happy.push_str(&format!(
                         "{contig}\t{pos}\t.\tA\tG\t.\t.\t.\tGT:BD:BK:BVT\t0/1:FN:.:SNP\t.:.:.:NOCALL\n"
                     ));
@@ -2480,6 +2519,99 @@ mod tests {
             assert_eq!(scored.iter().filter(|chrom| **chrom == "chr2").count(), CALLS);
         }
 
+        /// The baseline and genotyper rows of an `evaluate` metrics file: TP, FP, FN, dropped
+        /// and flipped.
+        fn evaluated_counts(metrics: &Path) -> [[String; 5]; 2] {
+            let metrics = std::fs::read_to_string(metrics).unwrap();
+            let rows: Vec<Vec<&str>> = metrics.lines().map(|l| l.split('\t').collect()).collect();
+            let column = |name: &str| rows[0].iter().position(|c| *c == name).unwrap();
+            let row = |policy: &str| {
+                let row = rows.iter().find(|r| r[column("policy")] == policy).unwrap();
+                ["tp", "fp", "fn", "dropped", "flipped"].map(|name| row[column(name)].to_string())
+            };
+            [row("baseline"), row("genotyper")]
+        }
+
+        /// `evaluate --contigs` counts only the calls and truth FNs on the contigs.
+        #[test]
+        fn evaluate_counts_only_the_contigs() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_calls_on(dir.path(), &["chr1", "chr2"]);
+            for sample in ["S1", "S2"] {
+                run(&[
+                    "extract",
+                    "--vcf",
+                    &path("calls.vcf.gz"),
+                    "--happy",
+                    &path("happy.vcf"),
+                    "--contigs",
+                    "chr1",
+                    "chr2",
+                    "--sample",
+                    sample,
+                    "-o",
+                    &path(&format!("{sample}.parquet")),
+                ]);
+            }
+            run(&[
+                "train",
+                "--tables",
+                &path("S1.parquet"),
+                &path("S2.parquet"),
+                "--variant-type",
+                "snp",
+                "--validation-fraction",
+                "0",
+                "--max-rounds",
+                "10",
+                "-o",
+                &path("snp"),
+            ]);
+            let (model, table, happy) =
+                (path("snp.winnowr.json"), path("S1.parquet"), path("happy.vcf"));
+            let evaluate = |extra: &[&str], output: &str| {
+                let base = ["evaluate", "--models", &model, "--table", &table, "-o", output];
+                run(&[&base[..], extra].concat());
+                evaluated_counts(Path::new(output))
+            };
+            let all = evaluate(&[], &path("all.tsv"));
+            let chr1 = evaluate(&["--contigs", "chr1", "--happy", &happy], &path("chr1.tsv"));
+            let chr2 = evaluate(&["--contigs", "chr2", "--happy", &happy], &path("chr2.tsv"));
+            // The same calls on each contig, with 3 truth FNs on chr1 and 6 on chr2.
+            assert_eq!(all[0][..3], ["60", "60", "9"]);
+            assert_eq!(chr1[0][..3], ["30", "30", "3"]);
+            assert_eq!(chr2[0][..3], ["30", "30", "6"]);
+            assert!(chr2[1][3] != "0", "the genotyper drops calls: {chr2:?}");
+            // The model decides the calls on each contig alike, so the contigs' counts add up.
+            for (policy, (one, two)) in all.iter().zip(chr1.iter().zip(&chr2)) {
+                for (total, (a, b)) in policy.iter().zip(one.iter().zip(two)) {
+                    let sum = a.parse::<usize>().unwrap() + b.parse::<usize>().unwrap();
+                    assert_eq!(sum.to_string(), *total, "{all:?} vs {chr1:?} + {chr2:?}");
+                }
+            }
+            // Both contigs, named, are the whole table.
+            let both = ["--contigs", "chr1", "chr2", "--happy", &happy];
+            assert_eq!(evaluate(&both, &path("both.tsv")), all);
+
+            let cli = parse(&[
+                "evaluate",
+                "--models",
+                &model,
+                "--table",
+                &table,
+                "-o",
+                &path("chr3.tsv"),
+                "--contigs",
+                "chr3",
+                "--happy",
+                &happy,
+            ])
+            .unwrap();
+            let error = dispatch(&cli.command, NonZeroUsize::new(1).unwrap()).unwrap_err();
+            assert!(error.to_string().contains("not extracted from contigs chr3"), "{error}");
+        }
+
         #[test]
         fn extract_train_evaluate_and_score() {
             let dir = tempfile::TempDir::new().unwrap();
@@ -2543,17 +2675,11 @@ mod tests {
                 "-o",
                 &path("metrics.tsv"),
             ]);
-            let metrics = std::fs::read_to_string(path("metrics.tsv")).unwrap();
-            let rows: Vec<Vec<&str>> = metrics.lines().map(|l| l.split('\t').collect()).collect();
-            let column = |name: &str| rows[0].iter().position(|c| *c == name).unwrap();
-            let row = |policy: &str| rows.iter().find(|r| r[column("policy")] == policy).unwrap();
-            let baseline = row("baseline");
-            let counts = [column("tp"), column("fp"), column("fn")].map(|c| baseline[c]);
-            assert_eq!(counts, ["30", "30", "3"]);
-            let genotyper = row("genotyper");
-            let dropped: usize = genotyper[column("dropped")].parse().unwrap();
-            let flipped: usize = genotyper[column("flipped")].parse().unwrap();
-            assert!(dropped > 0, "{metrics}");
+            let [baseline, genotyper] = evaluated_counts(Path::new(&path("metrics.tsv")));
+            assert_eq!(baseline[..3], ["30", "30", "3"]);
+            let dropped: usize = genotyper[3].parse().unwrap();
+            let flipped: usize = genotyper[4].parse().unwrap();
+            assert!(dropped > 0, "{genotyper:?}");
 
             run(&[
                 "score",

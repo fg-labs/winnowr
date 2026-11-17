@@ -1,7 +1,9 @@
 # subset
 
 Restricts a labelled feature table to some of its contigs, or away from some regions, and recounts
-the truth FNs from the hap.py VCF on the same terms. See [Holding out half of a training
+the truth FNs from the hap.py VCF on the same terms. The table records the restriction, and cannot
+be restricted again (by `subset`, or by `evaluate` or `stratify` with `--contigs`): restrict the
+table as extracted. See [Holding out half of a training
 sample](../user-guide/evaluating.md#holding-out-half-of-a-training-sample).
 
 ## Usage
