@@ -1,12 +1,33 @@
 //! Model features: their names, and the features derived from raw record values.
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::alleles::{Genotype, first_alt_index};
 use crate::common::{PASS, Task, VariantType};
 use crate::neighbourhood::{Call, N_FEATURES, NEIGHBOURHOOD_FEATURES, neighbourhood_features};
 use crate::raw_records::RawRecord;
 use crate::regions::RegionSet;
+
+/// The smallest depth `dp_norm` may divide by in place of the calls' median depth (see
+/// [`derive_features`]): a read depth of at least one read. A smaller divisor makes `dp_norm` of
+/// ordinary depths huge, or infinite, which a model reads as missing.
+pub const MIN_DP_MEDIAN: f64 = 1.0;
+
+/// Checks a depth for `dp_norm` to divide by in place of the calls' median depth: finite and at
+/// least [`MIN_DP_MEDIAN`].
+///
+/// # Errors
+///
+/// Returns an error naming the value if it is not finite or is below [`MIN_DP_MEDIAN`].
+pub fn check_dp_median(value: f64) -> anyhow::Result<f64> {
+    if !(value.is_finite() && value >= MIN_DP_MEDIAN) {
+        anyhow::bail!(
+            "the depth median must be a finite depth of at least {MIN_DP_MEDIAN}, got {value:?}"
+        );
+    }
+    Ok(value)
+}
 
 /// The features used for every variant type.
 pub const COMMON_FEATURES: [&str; 14] = [
@@ -90,6 +111,38 @@ pub fn strand_odds_ratio(ref_fwd: f64, ref_rev: f64, alt_fwd: f64, alt_rev: f64)
     (ratio + 1.0 / ratio).ln() + ref_ratio.ln() - alt_ratio.ln()
 }
 
+/// The depth `dp_norm` divides each call's RAW_MQandDP depth by (see [`derive_features`]), as a
+/// feature table records it for provenance.
+///
+/// Equality compares `depth` bit for bit (the type is `Eq` so that the table metadata holding it
+/// can be); recorded depths are finite, so this is ordinary equality on them.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct DpNormDivisor {
+    /// The depth divided by; `None` when it is the calls' median and that median is not finite
+    /// (no call has a depth, so every call's `dp_norm` is missing). JSON has no NaN, hence the
+    /// option. The default (`None`, not given) is the calls' median of no calls.
+    pub depth: Option<f64>,
+    /// True if the depth was given (`--dp-median`), false if it is the calls' median depth.
+    pub given: bool,
+}
+
+impl DpNormDivisor {
+    /// The divisor of a depth, `None` if the depth is not finite (e.g. the NaN median of no
+    /// depths).
+    #[must_use]
+    pub fn from_depth(depth: f64, given: bool) -> Self {
+        Self { depth: depth.is_finite().then_some(depth), given }
+    }
+}
+
+impl PartialEq for DpNormDivisor {
+    fn eq(&self, other: &Self) -> bool {
+        self.given == other.given && self.depth.map(f64::to_bits) == other.depth.map(f64::to_bits)
+    }
+}
+
+impl Eq for DpNormDivisor {}
+
 /// The features derived from raw record values, one value per record in each column.
 #[derive(Debug, Clone, Default)]
 pub struct DerivedFeatures {
@@ -107,7 +160,8 @@ pub struct DerivedFeatures {
     pub qd: Vec<f64>,
     /// The alternate alleles' share of AS_RAW_MQ (NaN if the total is not positive).
     pub as_alt_frac: Vec<f64>,
-    /// The RAW_MQandDP depth over the median of that depth across all records.
+    /// The RAW_MQandDP depth over the median of that depth across the records, or over a given
+    /// depth (see [`derive_features`]); NaN if the divisor is not positive.
     pub dp_norm: Vec<f64>,
     /// The length change of the first non-`*` alternate allele.
     pub indel_len: Vec<f64>,
@@ -122,14 +176,26 @@ pub struct DerivedFeatures {
     pub overlaps_pass: Vec<bool>,
     /// The neighbourhood features, in [`NEIGHBOURHOOD_FEATURES`] order.
     pub neighbourhood: Vec<[f64; N_FEATURES]>,
+    /// The depth `dp_norm` divides by. Not a column: a feature table records it in its metadata.
+    pub dp_norm_divisor: DpNormDivisor,
 }
 
 /// Derives the model features of raw records.
 ///
 /// The REF span of a record is `[pos - 1, pos - 1 + len(REF))` (0-based, half-open), so a
 /// deletion overlaps a region through its deleted bases.
+///
+/// `dp_median` is the depth `dp_norm` divides by in place of the median RAW_MQandDP depth of
+/// `records` (e.g. for calls of only a target footprint, whose median is not the genome-wide one).
+/// It must pass [`check_dp_median`] (callers check it; debug builds assert it). The divisor, and
+/// with a given one the records' own median, is logged, and returned as
+/// [`DerivedFeatures::dp_norm_divisor`].
 #[must_use]
-pub fn derive_features(records: &[RawRecord], regions: &[RegionSet]) -> DerivedFeatures {
+pub fn derive_features(
+    records: &[RawRecord],
+    regions: &[RegionSet],
+    dp_median: Option<f64>,
+) -> DerivedFeatures {
     let positive_or_nan = |value: f64| if value > 0.0 { value } else { f64::NAN };
     // Each column is computed in parallel over the records, keeping their order.
     let column = |f: &(dyn Fn(&RawRecord) -> f64 + Sync)| -> Vec<f64> {
@@ -140,7 +206,29 @@ pub fn derive_features(records: &[RawRecord], regions: &[RegionSet]) -> DerivedF
         first_alt_index(&r.alts)
             .map_or(f64::NAN, |index| r.alts[index].len() as f64 - r.reference.len() as f64)
     });
-    let median_dp = median(records.iter().map(|record| record.raw.raw_dp));
+    debug_assert!(
+        dp_median.is_none_or(|given| check_dp_median(given).is_ok()),
+        "unchecked dp_median {dp_median:?}"
+    );
+    let calls_median = || median(records.iter().map(|record| record.raw.raw_dp));
+    let median_dp = match dp_median {
+        None => {
+            let median_dp = calls_median();
+            log::info!("dp_norm divides each call's depth by the calls' median depth, {median_dp}");
+            median_dp
+        }
+        Some(given) => {
+            // The calls' own median only for the log, as a check on the given depth.
+            if log::log_enabled!(log::Level::Info) {
+                log::info!(
+                    "dp_norm divides each call's depth by the given depth median, {given}, not the \
+                     calls' median depth, {}",
+                    calls_median()
+                );
+            }
+            given
+        }
+    };
     let mut derived = DerivedFeatures {
         sor: column(&|r| strand_odds_ratio(r.sb_ref_fwd, r.sb_ref_rev, r.sb_alt_fwd, r.sb_alt_rev)),
         het: column(&|r| f64::from(u8::from(r.genotype == Genotype::HET))),
@@ -154,6 +242,7 @@ pub fn derive_features(records: &[RawRecord], regions: &[RegionSet]) -> DerivedF
         indel_len,
         n_alt_rec: column(&|r| r.alts.len() as f64),
         dp_norm: column(&|r| if median_dp > 0.0 { r.raw.raw_dp / median_dp } else { f64::NAN }),
+        dp_norm_divisor: DpNormDivisor::from_depth(median_dp, dp_median.is_some()),
         ab,
         ..DerivedFeatures::default()
     };
@@ -338,7 +427,7 @@ mod tests {
         missing_gt.genotype = Genotype::MISSING;
         missing_gt.raw.raw_dp = 0.0;
 
-        let derived = derive_features(&[first, deletion, missing_gt], &[]);
+        let derived = derive_features(&[first, deletion, missing_gt], &[], None);
         assert_eq!(derived.ab[0], 0.25);
         assert!(derived.ab[1].is_nan(), "zero total depth");
         assert!((derived.sor[0] - 2f64.ln()).abs() < 1e-12);
@@ -359,9 +448,47 @@ mod tests {
 
     #[test]
     fn dp_norm_is_missing_without_a_positive_median() {
-        let derived = derive_features(&[snp(1), snp(2)], &[]);
+        let derived = derive_features(&[snp(1), snp(2)], &[], None);
         assert!(derived.dp_norm.iter().all(|value| value.is_nan()));
-        assert!(derive_features(&[], &[]).dp_norm.is_empty());
+        assert!(derive_features(&[], &[], None).dp_norm.is_empty());
+    }
+
+    #[test]
+    fn dp_norm_divides_by_a_given_median() {
+        let depths = [4.0, 2.0, 0.0, f64::NAN];
+        let records: Vec<RawRecord> = depths
+            .iter()
+            .zip(1..)
+            .map(|(&depth, pos)| {
+                let mut call = snp(pos);
+                call.raw.raw_dp = depth;
+                call
+            })
+            .collect();
+        let given = derive_features(&records, &[], Some(8.0)).dp_norm;
+        assert_eq!(given[..3], [0.5, 0.25, 0.0]);
+        assert!(given[3].is_nan(), "a missing depth stays missing");
+        // Without one, the median of the depths (4, 2 and 0: 2), as before.
+        assert_eq!(derive_features(&records, &[], None).dp_norm[..3], [2.0, 1.0, 0.0]);
+        // A given median applies even where the calls' own median is not positive.
+        let zero = derive_features(&records[2..], &[], Some(10.0)).dp_norm;
+        assert_eq!(zero[0], 0.0);
+    }
+
+    #[test]
+    fn returns_the_dp_norm_divisor() {
+        let mut deep = snp(1);
+        deep.raw.raw_dp = 6.0;
+        let mut shallow = snp(2);
+        shallow.raw.raw_dp = 0.0;
+        let calls = [deep, shallow]; // depths 6 and 0: median 3
+        let divisor =
+            |records: &[RawRecord], given| derive_features(records, &[], given).dp_norm_divisor;
+        assert_eq!(divisor(&calls, None), DpNormDivisor { depth: Some(3.0), given: false });
+        assert_eq!(divisor(&calls, Some(8.0)), DpNormDivisor { depth: Some(8.0), given: true });
+        // No call has a depth: the median is NaN, recorded as no depth.
+        assert_eq!(divisor(&[snp(3)], None), DpNormDivisor { depth: None, given: false });
+        assert_eq!(divisor(&[], None), DpNormDivisor::default());
     }
 
     #[test]
@@ -373,7 +500,7 @@ mod tests {
             record("chr1", 110, "A", &["C"], PASS),  // base 109, the region's last
             record("chr2", 105, "A", &["C"], PASS),  // another contig
         ];
-        let derived = derive_features(&records, &[regions]);
+        let derived = derive_features(&records, &[regions], None);
         assert_eq!(derived.regions, [("segdups".to_string(), vec![1.0, 0.0, 1.0, 0.0])]);
     }
 
@@ -387,7 +514,7 @@ mod tests {
             record("chr1", 203, "T", &["C"], PASS),    // ... covering a later PASS SNP
             record("chr2", 102, "G", &["C"], "LowQual"), // same position, other contig
         ];
-        let derived = derive_features(&records, &[]);
+        let derived = derive_features(&records, &[], None);
         assert_eq!(derived.overlaps_pass, [true, true, false, true, true, false]);
     }
 
@@ -398,7 +525,7 @@ mod tests {
         let mut hom = snp(200);
         hom.genotype = Genotype::HOM_ALT;
         let filtered = record("chr1", 300, "A", &["C"], "LowQual");
-        let derived = derive_features(&[multi, hom, filtered], &[]);
+        let derived = derive_features(&[multi, hom, filtered], &[], None);
         let names = NEIGHBOURHOOD_FEATURES;
         let column = |name: &str| names.iter().position(|n| *n == name).unwrap();
         // From 200: the 0/2 call is a het; the 1/1 call itself is not counted.

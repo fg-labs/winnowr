@@ -117,6 +117,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::features::DpNormDivisor;
     use crate::testing::{call_table, vcf_header, write_indexed_vcf};
 
     /// A hap.py VCF of FNs: SNPs at chr1:10, chr1:60, chr2:10 and an indel at chr2:100.
@@ -148,6 +149,7 @@ mod tests {
         info.contigs = vec!["chr1".to_string(), "chr2".to_string()];
         info.fn_counts =
             Some([("snp".to_string(), 3), ("indel".to_string(), 1)].into_iter().collect());
+        info.dp_norm_divisor = Some(DpNormDivisor { depth: Some(30.0), given: true });
         table
     }
 
@@ -164,6 +166,7 @@ mod tests {
         assert_eq!(got.str_column("chrom").unwrap(), ["chr2"]);
         assert_eq!(fn_counts(&got), (1, 1));
         assert_eq!(got.info().contigs, ["chr1", "chr2"]);
+        assert_eq!(got.info().dp_norm_divisor, table().info().dp_norm_divisor);
         let all = ["chr1".to_string(), "chr2".to_string()];
         let unchanged = restrict_table(&table(), &happy, &all, None).unwrap();
         assert_eq!(unchanged.num_rows(), 4);

@@ -30,7 +30,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::common::VariantType;
-use crate::features::{DerivedFeatures, region_feature};
+use crate::features::{DerivedFeatures, DpNormDivisor, region_feature};
 use crate::neighbourhood::NEIGHBOURHOOD_FEATURES;
 use crate::pileup::PileupOptions;
 use crate::raw_records::RawRecord;
@@ -70,6 +70,11 @@ pub struct FeatureTableInfo {
     /// The lengths of `contigs` in the VCF header (`None` where the header gives none).
     #[serde(default)]
     pub reference_contigs: Option<IndexMap<String, Option<u64>>>,
+    /// The depth `dp_norm` divided each call's depth by, and whether it was given
+    /// (`--dp-median`) or is the calls' median, for provenance only: nothing checks it. `None`
+    /// for tables not built from calls, and for tables written before it was recorded (unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dp_norm_divisor: Option<DpNormDivisor>,
 }
 
 impl FeatureTableInfo {
@@ -217,6 +222,7 @@ impl FeatureTable {
             n_alt_rec,
             overlaps_pass,
             neighbourhood,
+            dp_norm_divisor: _, // recorded in the metadata by the caller
         } = derived;
         columns.push("ab", floats(ab));
         columns.push("sor", floats(sor));
@@ -734,6 +740,7 @@ mod tests {
             strlen_settings: None,
             pileup_settings: None,
             reference_contigs: None,
+            dp_norm_divisor: None,
         };
         let table = FeatureTable::new(batch, info);
         let dir = TempDir::new().unwrap();
@@ -756,5 +763,47 @@ mod tests {
         assert_eq!(qual.len(), expected.len());
         assert!(qual.iter().eq(expected.iter()), "the selected rows' values differ");
         assert_eq!(indels.info(), table.info());
+    }
+
+    /// Table metadata with the given record of the depth `dp_norm` divided by.
+    fn info_with_divisor(dp_norm_divisor: Option<DpNormDivisor>) -> FeatureTableInfo {
+        FeatureTableInfo {
+            sample: "S1".to_string(),
+            contigs: vec!["chr1".to_string()],
+            region_names: vec![],
+            fn_counts: None,
+            promote_labelled: false,
+            strlen: false,
+            strlen_settings: None,
+            pileup_settings: None,
+            reference_contigs: None,
+            dp_norm_divisor,
+        }
+    }
+
+    #[test]
+    fn the_dp_norm_divisor_round_trips_through_json() {
+        for divisor in [
+            DpNormDivisor { depth: Some(31.5), given: false },
+            DpNormDivisor { depth: Some(8.0), given: true },
+            DpNormDivisor { depth: None, given: false },
+        ] {
+            let info = info_with_divisor(Some(divisor));
+            let json = serde_json::to_string(&info).unwrap();
+            assert!(json.contains("\"dp_norm_divisor\""), "{json}");
+            let read: FeatureTableInfo = serde_json::from_str(&json).unwrap();
+            assert_eq!(read, info);
+        }
+        let json = serde_json::to_string(&info_with_divisor(None)).unwrap();
+        assert!(!json.contains("dp_norm_divisor"), "the key is left out when unknown: {json}");
+    }
+
+    #[test]
+    fn tables_without_a_dp_norm_divisor_read_as_unknown() {
+        // The metadata of a table written before the divisor was recorded.
+        let json = r#"{"sample":"S1","contigs":["chr1"],"region_names":[],"fn_counts":null,
+            "promote_labelled":false,"strlen":false,"reference_contigs":null}"#;
+        let info: FeatureTableInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info, info_with_divisor(None));
     }
 }

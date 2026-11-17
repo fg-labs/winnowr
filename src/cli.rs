@@ -238,6 +238,14 @@ pub(crate) struct ExtractArgs {
     #[arg(long, num_args = 1..)]
     pub(crate) pileup: Vec<PathBuf>,
 
+    /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth by, in
+    /// place of the median depth of the calls on --contigs [default: that median]; at least 1. Use
+    /// it for calls of only part of the genome (e.g. a target footprint), whose median depth is
+    /// skewed, with the median RAW_MQandDP depth of the sample's genome-wide calls (which a
+    /// whole-genome extract logs).
+    #[arg(long, value_parser = parse_dp_median)]
+    pub(crate) dp_median: Option<f64>,
+
     /// The hap.py output VCF for this sample (run with --engine vcfeval, preferably with
     /// --pass-only; see --happy-pass-only), which labels PASS calls; needed for training and
     /// evaluation tables.
@@ -482,6 +490,16 @@ fn parse_probability(text: &str) -> Result<f64> {
         bail!("must be a probability between 0 and 1, got {text}");
     }
     Ok(value)
+}
+
+/// Parses a depth for `dp_norm` to divide by (see [`crate::features::check_dp_median`]).
+///
+/// # Errors
+///
+/// Returns an error naming the value if it is not a number, not finite, or below one read.
+fn parse_dp_median(text: &str) -> Result<f64> {
+    let value: f64 = text.parse().with_context(|| format!("not a number: {text}"))?;
+    crate::features::check_dp_median(value)
 }
 
 /// How `train`'s cross-validation forms its folds (see [`CvFolds`]), as --cv-folds takes it.
@@ -798,6 +816,14 @@ pub(crate) struct ScoreArgs {
     #[arg(long)]
     pub(crate) gvcf: Option<PathBuf>,
 
+    /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth by, in
+    /// place of the median depth of the calls on the models' contigs [default: that median]; at
+    /// least 1. Use it for calls of only part of the genome (e.g. a target footprint), whose median
+    /// depth is skewed, with the median RAW_MQandDP depth of the sample's genome-wide calls (which a
+    /// whole-genome extract or score logs), as the models' training tables were normalized.
+    #[arg(long, value_parser = parse_dp_median)]
+    pub(crate) dp_median: Option<f64>,
+
     /// Region BEDs as NAME=PATH, with the names the models were trained with, plus the
     /// not-difficult regions as notinalldifficultregions=PATH (GIAB's GRCh38 genome stratification;
     /// outside them, indel calls are dropped at --outside-indel-t-drop in place of the model's
@@ -1012,6 +1038,7 @@ fn extract(args: &ExtractArgs) -> Result<()> {
         strlen: strlen.as_ref(),
         pileup: pileup.as_ref(),
         truth,
+        dp_median: args.dp_median,
     };
     let table = build_feature_table(&sample, &args.vcf, &args.contigs, &summary, &inputs)?;
     let mut timer = PhaseTimer::start();
@@ -1550,6 +1577,24 @@ fn warn_policy_only_regions(regions: &[NamedBed]) {
     }
 }
 
+/// The inputs of the feature table `score` builds: the gVCF, `regions`, the repeat-length and pileup
+/// evidence, and the depth median of the command line, with no truth labels.
+fn score_table_inputs<'a>(
+    args: &'a ScoreArgs,
+    regions: &'a [RegionSet],
+    strlen: Option<&'a crate::strlen::StrlenTables>,
+    pileup: Option<&'a crate::pileup::PileupTables>,
+) -> TableInputs<'a> {
+    TableInputs {
+        gvcf: args.gvcf.as_deref(),
+        regions,
+        strlen,
+        pileup,
+        dp_median: args.dp_median,
+        ..TableInputs::default()
+    }
+}
+
 /// Runs `winnowr stratify`.
 fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
     use crate::regions::RegionSet;
@@ -1784,13 +1829,7 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         .collect();
     let regions = read_region_sets(&used)?;
     let sample = summary.sample_name(&args.vcf);
-    let inputs = TableInputs {
-        gvcf: args.gvcf.as_deref(),
-        regions: &regions,
-        strlen: strlen.as_ref(),
-        pileup: pileup.as_ref(),
-        ..TableInputs::default()
-    };
+    let inputs = score_table_inputs(args, &regions, strlen.as_ref(), pileup.as_ref());
     let table = build_feature_table(&sample, &args.vcf, contigs, &summary, &inputs)?;
     let mut timer = PhaseTimer::start();
     let policy =
@@ -2501,6 +2540,7 @@ mod tests {
         let Command::Extract(args) = cli.command else { panic!("not extract") };
         assert_eq!(args.contigs, AUTOSOMES.to_vec());
         assert!(args.regions.is_empty() && args.gvcf.is_none() && args.sample.is_none());
+        assert_eq!(args.dp_median, None);
 
         let cli = parse(&[
             "extract",
@@ -2518,9 +2558,12 @@ mod tests {
             "chr21",
             "--sample",
             "S",
+            "--dp-median",
+            "31.5",
         ])
         .unwrap();
         let Command::Extract(args) = cli.command else { panic!("not extract") };
+        assert_eq!(args.dp_median, Some(31.5));
         assert_eq!(args.regions.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!(args.contigs, ["chr20", "chr21"]);
         assert_eq!(args.sample.as_deref(), Some("S"));
@@ -2552,6 +2595,50 @@ mod tests {
         let cli = parse(&["score", "--vcf", "v", "--models", "m", "-o", "o"]).unwrap();
         let Command::Score(args) = cli.command else { panic!("not score") };
         assert_eq!(args.mode, Mode::Genotyper);
+        assert_eq!(args.dp_median, None);
+        let cli = parse(&["score", "--vcf", "v", "--models", "m", "-o", "o", "--dp-median", "40"])
+            .unwrap();
+        let Command::Score(args) = cli.command else { panic!("not score") };
+        assert_eq!(args.dp_median, Some(40.0));
+    }
+
+    #[rstest]
+    #[case::zero("0", "got 0.0")]
+    #[case::negative("-3", "got -3.0")]
+    #[case::below_one_read("0.5", "got 0.5")]
+    #[case::tiny("1e-300", "got 1e-300")]
+    #[case::nan("NaN", "got NaN")]
+    #[case::infinite("inf", "got inf")]
+    #[case::text("deep", "not a number: deep")]
+    fn dp_median_must_be_a_depth_of_at_least_one_read(#[case] value: &str, #[case] got: &str) {
+        let message = if got.starts_with("got") {
+            format!("the depth median must be a finite depth of at least 1, {got}")
+        } else {
+            got.to_string()
+        };
+        // `=` so that a negative value is not read as an option.
+        let option = format!("--dp-median={value}");
+        let extract = ["extract", "--vcf", "v", "-o", "o", &option];
+        let score = ["score", "--vcf", "v", "--models", "m", "-o", "o", &option];
+        for args in [&extract[..], &score[..]] {
+            let error = parse(args).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{args:?}");
+            assert!(error.to_string().contains(&message), "{error}");
+        }
+        let one = parse(&["score", "--vcf", "v", "--models", "m", "-o", "o", "--dp-median", "1"]);
+        let Command::Score(args) = one.unwrap().command else { panic!("not score") };
+        assert_eq!(args.dp_median, Some(1.0), "one read is the smallest depth");
+    }
+
+    /// `score` builds its feature table with the depth median of its command line.
+    #[test]
+    fn score_builds_its_table_with_the_given_depth_median() {
+        for (extra, expected) in [(&[][..], None), (&["--dp-median", "40"][..], Some(40.0))] {
+            let base = ["score", "--vcf", "v", "--models", "m", "-o", "o"];
+            let cli = parse(&[&base[..], extra].concat()).unwrap();
+            let Command::Score(args) = cli.command else { panic!("not score") };
+            assert_eq!(score_table_inputs(&args, &[], None, None).dp_median, expected);
+        }
     }
 
     /// The policy of a `score` command line with extra options, and `regions`.
