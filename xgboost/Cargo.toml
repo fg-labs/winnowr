@@ -19,6 +19,9 @@ include = [
     "/src/**",
     "/README.md",
     "/LICENSE-MIT",
+    # The integration tests, so that `cargo test` runs them from the published source too (any
+    # layout cargo finds, including helper modules in subdirectories).
+    "/tests/**",
     # winnowr's fixes and performance changes to the vendored sources, applied by build.rs to a
     # copy of them.
     "/patches/*.patch",
