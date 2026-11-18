@@ -1,0 +1,188 @@
+Build the histogram of the child with fewer rows in CPU hist.
+
+When a node splits, the CPU hist and approx tree methods build the histogram of one child and
+compute the other by subtracting it from the parent's. The child to build was the one with the
+smaller sum of Hessian, a stand-in for the one with fewer rows. With `multi:softprob`, whose
+Hessian is |p - y| since dmlc/xgboost#12537 and so near zero for well-classified rows, the child
+with less Hessian is often the larger one. Outside distributed training, the rows are already
+partitioned into the children when their histograms are built, so this counts them and builds the
+child with fewer rows. Distributed training keeps the Hessian rule. The histograms are the same up
+to floating-point rounding of the subtraction, so a near-tie split could in principle change; the
+models measured with and without it (winnowr's smoke tests, and upstream benchmarks at 1 to 30
+threads) were byte-identical.
+
+Source: nh13/xgboost commit b48c1186f (branch nh_hist-build-smaller-child, on dmlc master
+31abd0e3b, code-identical to 293cad1a8; draft https://github.com/nh13/xgboost/pull/1). The src/
+hunks are carried verbatim, including comment and copyright changes, so the patch stays the
+upstream commit's and can be dropped when it merges. Its C++ tests of the rule are upstream and
+are not run here (build.rs builds XGBoost's sources, not its tests).
+
+Applied by build.rs to a copy of the vendored sources (paths are relative to the XGBoost root),
+after patches 0001 to 0003.
+
+diff --git a/src/tree/hist/histogram.cc b/src/tree/hist/histogram.cc
+index 72807fa29..486125030 100644
+--- a/src/tree/hist/histogram.cc
++++ b/src/tree/hist/histogram.cc
+@@ -1,5 +1,5 @@
+ /**
+- * Copyright 2023-2025, XGBoost Contributors
++ * Copyright 2023-2026, XGBoost Contributors
+  */
+ #include "histogram.h"
+ 
+@@ -16,10 +16,23 @@
+ #include "xgboost/tree_model.h"               // for RegTree
+ 
+ namespace xgboost::tree {
++namespace {
++// Whether to build the right child of the i-th candidate rather than the left one.
++bool BuildRight(common::Span<bst_idx_t const> n_rows, std::size_t i, double left_hess,
++                double right_hess) {
++  if (!n_rows.empty()) {
++    return n_rows[2 * i + 1] < n_rows[2 * i];
++  }
++  return right_hess < left_hess;
++}
++}  // namespace
++
+ void AssignNodes(MultiTargetTreeView const &tree,
+                  std::vector<CPUExpandEntry> const &valid_candidates,
+-                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub) {
++                 common::Span<bst_idx_t const> n_rows, common::Span<bst_node_t> nodes_to_build,
++                 common::Span<bst_node_t> nodes_to_sub) {
+   CHECK_EQ(nodes_to_build.size(), valid_candidates.size());
++  CHECK(n_rows.empty() || n_rows.size() == valid_candidates.size() * 2);
+ 
+   std::size_t n_idx = 0;
+   for (auto const &c : valid_candidates) {
+@@ -34,8 +47,7 @@ void AssignNodes(MultiTargetTreeView const &tree,
+     auto rit =
+         common::MakeIndexTransformIter([&](auto i) { return c.split.right_sum[i].GetHess(); });
+     auto right_sum = std::accumulate(rit, rit + c.split.right_sum.size(), .0);
+-    auto fewer_right = right_sum < left_sum;
+-    if (fewer_right) {
++    if (BuildRight(n_rows, n_idx, left_sum, right_sum)) {
+       std::swap(build_nidx, subtract_nidx);
+     }
+     nodes_to_build[n_idx] = build_nidx;
+@@ -45,16 +57,19 @@ void AssignNodes(MultiTargetTreeView const &tree,
+ }
+ 
+ void AssignNodes(ScalarTreeView const &tree, std::vector<CPUExpandEntry> const &candidates,
+-                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub) {
++                 common::Span<bst_idx_t const> n_rows, common::Span<bst_node_t> nodes_to_build,
++                 common::Span<bst_node_t> nodes_to_sub) {
++  CHECK_EQ(nodes_to_build.size(), candidates.size());
++  CHECK(n_rows.empty() || n_rows.size() == candidates.size() * 2);
+   std::size_t n_idx = 0;
+   for (auto const &c : candidates) {
+     auto left_nidx = tree.LeftChild(c.nid);
+     auto right_nidx = tree.RightChild(c.nid);
+-    auto fewer_right = c.split.right_sum[0].GetHess() < c.split.left_sum[0].GetHess();
+ 
+     auto build_nidx = left_nidx;
+     auto subtract_nidx = right_nidx;
+-    if (fewer_right) {
++    if (BuildRight(n_rows, n_idx, c.split.left_sum[0].GetHess(),
++                   c.split.right_sum[0].GetHess())) {
+       std::swap(build_nidx, subtract_nidx);
+     }
+     nodes_to_build[n_idx] = build_nidx;
+diff --git a/src/tree/hist/histogram.h b/src/tree/hist/histogram.h
+index f8b9607c1..cca03065e 100644
+--- a/src/tree/hist/histogram.h
++++ b/src/tree/hist/histogram.h
+@@ -29,17 +29,53 @@
+ 
+ namespace xgboost::tree {
+ /**
+- * @brief Decide which node as the build node for multi-target trees.
++ * @brief Decide which child of each candidate gets its histogram built. The other child's
++ *        histogram is computed by subtracting it from the parent's.
++ *
++ * Builds the child with fewer rows, as the cost of building a histogram grows with the number of
++ * rows; ties build the left child. Without row counts, as in distributed training, where the
++ * rows are split between workers and the counts differ, builds the child with the smaller sum of
++ * Hessian, which every worker agrees on. The GPU tree method always uses the sums of Hessian.
++ *
++ * The child computed by subtraction inherits the rounding error of the parent's sums, about one
++ * ulp of the parent per bin. Choosing by rows can leave the child with little Hessian to be
++ * subtracted, where that error is large relative to its own sums, though still far below the
++ * usual `min_child_weight` and `lambda`.
++ *
++ * @param n_rows The number of rows in the left and the right child of each candidate, in that
++ *               order, or empty.
+  */
+ void AssignNodes(MultiTargetTreeView const &tree,
+                  std::vector<CPUExpandEntry> const &valid_candidates,
+-                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub);
++                 common::Span<bst_idx_t const> n_rows, common::Span<bst_node_t> nodes_to_build,
++                 common::Span<bst_node_t> nodes_to_sub);
+ 
+ /**
+- * @brief Decide which node as the build node.
++ * @brief AssignNodes for trees with scalar leaves, see the overload above.
+  */
+ void AssignNodes(ScalarTreeView const &tree, std::vector<CPUExpandEntry> const &candidates,
+-                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub);
++                 common::Span<bst_idx_t const> n_rows, common::Span<bst_node_t> nodes_to_build,
++                 common::Span<bst_node_t> nodes_to_sub);
++
++/**
++ * @brief The number of rows in the left and the right child of each candidate, in that order,
++ *        summed over the pages. The rows must already be partitioned into the children.
++ */
++template <typename Partitioner, typename ExpandEntry, typename TreeView>
++[[nodiscard]] std::vector<bst_idx_t> CountChildRows(TreeView const &tree,
++                                                    std::vector<Partitioner> const &partitioners,
++                                                    std::vector<ExpandEntry> const &candidates) {
++  std::vector<bst_idx_t> n_rows(candidates.size() * 2, 0);
++  for (auto const &partitioner : partitioners) {
++    auto const &partitions = partitioner.Partitions();
++    for (std::size_t i = 0; i < candidates.size(); ++i) {
++      auto nidx = candidates[i].nid;
++      n_rows[2 * i] += partitions[tree.LeftChild(nidx)].Size();
++      n_rows[2 * i + 1] += partitions[tree.RightChild(nidx)].Size();
++    }
++  }
++  return n_rows;
++}
+ 
+ class HistogramBuilder {
+   /*! \brief culmulative histogram of gradients. */
+@@ -56,8 +92,8 @@ class HistogramBuilder {
+    * @brief Reset the builder, should be called before growing a new tree.
+    *
+    * @param total_bins       Total number of bins across all features
+-   * @param is_distributed   Mostly used for testing to allow injecting parameters instead
+-   *                         of using global rabit variable.
++   * @param is_distributed   Whether training is distributed. A parameter rather than the global
++   *                         state, so that tests can inject it.
+    */
+   void Reset(Context const *ctx, bst_bin_t total_bins, BatchParam const &p, bool is_distributed,
+              HistMakerTrainParam const *param) {
+@@ -67,6 +103,7 @@ class HistogramBuilder {
+     buffer_.Init(total_bins);
+     is_distributed_ = is_distributed;
+   }
++  [[nodiscard]] bool IsDistributed() const { return is_distributed_; }
+ 
+   template <bool any_missing>
+   void BuildLocalHistograms(common::BlockedSpace2d const &space, GHistIndexMatrix const &gidx,
+@@ -391,9 +428,14 @@ class MultiHistogramBuilder {
+                           std::vector<ExpandEntry> const &valid_candidates,
+                           linalg::MatrixView<GradientPair const> gpair, BatchParam const &param,
+                           bool force_read_by_column = false) {
++    // Distributed training splits the rows between workers, whose counts then differ, so the
++    // choice falls back to the sums of Hessian there.
++    auto n_rows = target_builders_.front().IsDistributed()
++                      ? std::vector<bst_idx_t>{}
++                      : CountChildRows(tree, partitioners, valid_candidates);
+     std::vector<bst_node_t> nodes_to_build(valid_candidates.size());
+     std::vector<bst_node_t> nodes_to_sub(valid_candidates.size());
+-    AssignNodes(tree, valid_candidates, nodes_to_build, nodes_to_sub);
++    AssignNodes(tree, valid_candidates, n_rows, nodes_to_build, nodes_to_sub);
+ 
+     // use the first builder for getting number of valid nodes.
+     target_builders_.front().AddHistRows(tree, &nodes_to_build, &nodes_to_sub, true);

@@ -407,6 +407,21 @@ pub fn check_openmp_environment(
     OpenMpRuntime::LINKED.check_environment(threads, var).map_err(Error::from)
 }
 
+/// The variable, if any, that sets a thread limit of the linked OpenMP runtime that XGBoost does
+/// not read: libomp's `KMP_DEVICE_THREAD_LIMIT` or `KMP_ALL_THREADS` (macOS); libgomp has none.
+///
+/// The limit is process-wide. [`check_openmp_environment`] refuses one below the threads a fit
+/// requests, but building a multi-class model's trees at the same time (the gbtree parameter
+/// `parallel_target_trees`) runs several OpenMP teams at once, whose threads together can exceed a
+/// limit at or a little above the threads requested; the runtime then shrinks teams, and XGBoost's
+/// training loses rows. Do not set `parallel_target_trees` when this returns a variable.
+///
+/// `var` looks up an environment variable (`std::env::var` outside tests).
+#[must_use]
+pub fn hidden_thread_limit(var: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    OpenMpRuntime::LINKED.hidden_thread_limits().iter().copied().find(|&name| var(name).is_some())
+}
+
 /// Why the OpenMP environment cannot give XGBoost's training the threads requested (see
 /// [`check_openmp_environment`]).
 ///
@@ -1339,15 +1354,7 @@ impl Booster {
     ///
     /// Returns an error if XGBoost fails or its config has no class or target count.
     pub fn outputs_per_row(&self) -> Result<usize> {
-        let (mut len, mut data) = (0, ptr::null());
-        // SAFETY: the handle is live and the outputs point to a booster-owned buffer that is
-        // copied immediately.
-        check(unsafe { ffi::XGBoosterSaveJsonConfig(self.handle, &mut len, &mut data) })?;
-        let len = from_bst_len(len, "config size")?;
-        // SAFETY: on success `data` points to `len` bytes.
-        let config: serde_json::Value =
-            serde_json::from_slice(unsafe { borrowed_slice(data.cast::<u8>(), len) }?)
-                .map_err(|e| Error::new(format!("XGBoost returned an invalid config: {e}")))?;
+        let config = self.config()?;
         let parameter = |name: &str| -> Result<usize> {
             let value = &config["learner"]["learner_model_param"][name];
             value
@@ -1357,6 +1364,23 @@ impl Booster {
         };
         let classes = parameter("num_class")?;
         Ok(if classes > 0 { classes } else { parameter("num_target")?.max(1) })
+    }
+
+    /// The booster's configuration (its learner and training parameters), as XGBoost's JSON
+    /// config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if XGBoost fails or returns invalid JSON.
+    fn config(&self) -> Result<serde_json::Value> {
+        let (mut len, mut data) = (0, ptr::null());
+        // SAFETY: the handle is live and the outputs point to a booster-owned buffer that is
+        // copied immediately.
+        check(unsafe { ffi::XGBoosterSaveJsonConfig(self.handle, &mut len, &mut data) })?;
+        let len = from_bst_len(len, "config size")?;
+        // SAFETY: on success `data` points to `len` bytes.
+        serde_json::from_slice(unsafe { borrowed_slice(data.cast::<u8>(), len) }?)
+            .map_err(|e| Error::new(format!("XGBoost returned an invalid config: {e}")))
     }
 
     /// The model serialized as XGBoost JSON.
@@ -1768,6 +1792,108 @@ mod tests {
             booster.update(iteration, &train).unwrap();
         }
         (booster, train)
+    }
+
+    /// A noisy three-class training matrix of `rows` rows of 6 features: a linear congruential
+    /// sequence, labelled by a weighted sum of three features plus noise, so that XGBoost's
+    /// histogram sums are inexact and, at 200,000 rows, depend on the thread count.
+    fn noisy_matrix(rows: usize) -> DMatrix {
+        let cols = 6;
+        let mut state: u64 = 12_345;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as f32 / (1u64 << 31) as f32
+        };
+        let mut features = Vec::with_capacity(rows * cols);
+        let mut labels = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let row: Vec<f32> = (0..cols).map(|_| next()).collect();
+            let score = row[0] * 3.0 + row[1] * 2.0 - row[2] + next() * 1.5;
+            labels.push(if score < 1.5 {
+                0.0
+            } else if score < 3.0 {
+                1.0
+            } else {
+                2.0
+            });
+            features.extend(row);
+        }
+        let mut matrix = DMatrix::from_dense(&features, rows, cols, f32::NAN).unwrap();
+        matrix.set_labels(&labels).unwrap();
+        matrix
+    }
+
+    /// A three-class lossguide model of `train` with `threads` threads, building the classes'
+    /// trees one after another or at the same time, as XGBoost JSON, and the booster's config.
+    fn model_json(
+        train: &DMatrix,
+        threads: usize,
+        parallel_target_trees: bool,
+    ) -> (Vec<u8>, serde_json::Value) {
+        let mut booster = Booster::new(&[train], NonZeroUsize::new(threads).unwrap()).unwrap();
+        booster
+            .set_params(&[
+                ("objective", "multi:softprob"),
+                ("num_class", "3"),
+                ("tree_method", "hist"),
+                ("grow_policy", "lossguide"),
+                ("max_leaves", "64"),
+                ("eta", "0.5"),
+                ("seed", "1"),
+                ("parallel_target_trees", if parallel_target_trees { "true" } else { "false" }),
+            ])
+            .unwrap();
+        for iteration in 0..60 {
+            booster.update(iteration, train).unwrap();
+        }
+        (booster.to_json().unwrap(), booster.config().unwrap())
+    }
+
+    /// Patch 0003: building the 3 classes' trees at the same time with 9 threads builds each with
+    /// 3, so the model is the one 3 threads build in turn, not the one 9 threads do (whose
+    /// histogram sums differ), which shows the trees were built at once.
+    ///
+    /// XGBoost uses no more threads than the machine has, so with fewer than 9 CPUs the thread
+    /// counts cannot differ and only the parameter is checked.
+    #[test]
+    fn parallel_target_trees_builds_each_class_tree_with_its_share_of_the_threads() {
+        let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let rows = if cpus >= 9 { 200_000 } else { 3_000 };
+        let train = noisy_matrix(rows);
+        let (at_once, at_once_config) = model_json(&train, 9, true);
+        let (in_turn_3, in_turn_config) = model_json(&train, 3, false);
+        // The parameter is XGBoost's (patched in), not an unknown one it ignores.
+        let parameter = |config: &serde_json::Value| {
+            config["learner"]["gradient_booster"]["gbtree_train_param"]["parallel_target_trees"]
+                .clone()
+        };
+        assert_eq!(parameter(&at_once_config), "1", "{at_once_config}");
+        assert_eq!(parameter(&in_turn_config), "0", "{in_turn_config}");
+        if cpus < 9 {
+            eprintln!("only {cpus} CPUs: not checking which threads built the trees");
+            return;
+        }
+        let (in_turn_9, _) = model_json(&train, 9, false);
+        assert_ne!(in_turn_9, in_turn_3, "the data must make the model depend on the threads");
+        assert_eq!(at_once, in_turn_3);
+    }
+
+    #[test]
+    fn finds_a_hidden_thread_limit_of_the_linked_runtime() {
+        let unset = |_: &str| None;
+        assert_eq!(hidden_thread_limit(unset), None);
+        for name in ["KMP_DEVICE_THREAD_LIMIT", "KMP_ALL_THREADS"] {
+            let set = |variable: &str| (variable == name).then(|| "64".to_string());
+            let expected = cfg!(target_os = "macos").then_some(name);
+            assert_eq!(hidden_thread_limit(set), expected);
+        }
+        // OMP_THREAD_LIMIT is XGBoost's own, which it reads.
+        assert_eq!(
+            hidden_thread_limit(|v: &str| (v == "OMP_THREAD_LIMIT").then(String::new)),
+            None
+        );
     }
 
     #[rstest]

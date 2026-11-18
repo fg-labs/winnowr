@@ -1079,6 +1079,25 @@ mod tests {
             .unwrap()
     }
 
+    /// A fit with enough threads to build its 3 classes' trees at once (9: 3 each), with calls held
+    /// out for early stopping, is the fit 3 threads build in turn, and the same every time.
+    #[test]
+    fn a_fit_building_its_class_trees_at_once_is_that_of_its_share_of_the_threads() {
+        let samples: Vec<ToySample> = [("S1", 1, 300), ("S2", 2, 200), ("S3", 3, 100)]
+            .iter()
+            .map(|&(name, seed, rows)| ToySample::new(name, seed, rows))
+            .collect();
+        let features = vec!["a".to_string(), "b".to_string()];
+        let mut spec = toy_spec(&features, threads(9));
+        spec.params.validation_fraction = 0.3;
+        let fit_with = |n: usize| {
+            fit_final(&samples, &features, &spec.params, 3, threads(n)).unwrap().to_json().unwrap()
+        };
+        let at_once = fit_with(9);
+        assert_eq!(at_once, fit_with(9));
+        assert_eq!(at_once, fit_with(3));
+    }
+
     #[rstest]
     #[case::one_after_another(1, false)]
     #[case::at_once(8, false)]
