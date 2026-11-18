@@ -372,6 +372,7 @@ mod tests {
             pileup_settings: None,
             reference_contigs: None,
             dp_norm_divisor: None,
+            restricted_to: None,
         };
         let new = Some(StrlenOptions::default());
         let (a, b) = (info("A", true, new), info("B", true, new));
@@ -399,6 +400,7 @@ mod tests {
             pileup_settings: settings.map(|s| s.parse().unwrap()),
             reference_contigs: None,
             dp_norm_divisor: None,
+            restricted_to: None,
         };
         let (a, b) = (info("A", Some("default")), info("B", Some("default")));
         assert_eq!(shared_options::<PileupOptions>(&[&a, &b]).unwrap(), PileupOptions::default());
@@ -433,6 +435,7 @@ mod tests {
             pileup_settings: pileup.map(|s| s.parse().unwrap()),
             reference_contigs: None,
             dp_norm_divisor: None,
+            restricted_to: None,
         }
     }
 

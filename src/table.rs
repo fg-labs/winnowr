@@ -75,6 +75,21 @@ pub struct FeatureTableInfo {
     /// for tables not built from calls, and for tables written before it was recorded (unknown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dp_norm_divisor: Option<DpNormDivisor>,
+    /// The part of the genome the calls and truth FN counts are of, when `winnowr subset`
+    /// restricted them (see [`crate::subset::restrict_table`]); `None` for a table as extracted,
+    /// whose calls and FNs are of all of `contigs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restricted_to: Option<Restriction>,
+}
+
+/// The part of the genome a restricted table's calls and truth FN counts are of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restriction {
+    /// The contigs kept.
+    pub contigs: Vec<String>,
+    /// The BED whose regions were left out, if any (as given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<String>,
 }
 
 impl FeatureTableInfo {
@@ -741,6 +756,7 @@ mod tests {
             pileup_settings: None,
             reference_contigs: None,
             dp_norm_divisor: None,
+            restricted_to: None,
         };
         let table = FeatureTable::new(batch, info);
         let dir = TempDir::new().unwrap();
@@ -778,6 +794,7 @@ mod tests {
             pileup_settings: None,
             reference_contigs: None,
             dp_norm_divisor,
+            restricted_to: None,
         }
     }
 

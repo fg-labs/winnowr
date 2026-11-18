@@ -39,5 +39,11 @@ Options:
           The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
           with these. Only the not-difficult regions (notinalldifficultregions) are read; the
           models' region features come from the table
+      --contigs <CONTIGS>...
+          The contigs to evaluate: only their calls and truth FNs are counted (e.g. the chromosomes
+          held out from a model's training) [default: all the table's contigs]. Needs --happy, and a
+          table as extracted, not one from `subset`
+      --happy <HAPPY>
+          The hap.py output VCF the table was labelled from, to recount its truth FNs on --contigs
   -h, --help
           Print help

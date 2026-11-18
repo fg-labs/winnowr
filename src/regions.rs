@@ -166,6 +166,12 @@ impl RegionSet {
         self.contig(contig).is_some_and(|intervals| intervals.contains(start, end))
     }
 
+    /// Where the set came from, for messages: the BED file it was read from, or else its name.
+    #[must_use]
+    pub fn source(&self) -> String {
+        self.path.as_ref().map_or_else(|| self.name.clone(), |p| p.display().to_string())
+    }
+
     /// Checks that the region set has intervals on at least one of `contigs`.
     ///
     /// A set may lack some contigs, but one sharing none of them usually means the BED names its
@@ -183,8 +189,7 @@ impl RegionSet {
         bed_contigs.truncate(5);
         let bed_contigs =
             if bed_contigs.is_empty() { "none".into() } else { bed_contigs.join(", ") };
-        let source =
-            self.path.as_ref().map_or_else(|| self.name.clone(), |p| p.display().to_string());
+        let source = self.source();
         let contigs: Vec<&str> = contigs.iter().map(AsRef::as_ref).collect();
         bail!(
             "region BED {source} has no intervals on the extracted contigs ({}); its contigs \

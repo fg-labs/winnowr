@@ -183,6 +183,7 @@ pub fn call_table(rows: &[CallRow<'_>]) -> crate::table::FeatureTable {
         pileup_settings: None,
         reference_contigs: None,
         dp_norm_divisor: None,
+        restricted_to: None,
     };
     crate::table::FeatureTable::new(batch, info)
 }

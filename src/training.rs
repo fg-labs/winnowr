@@ -1005,6 +1005,7 @@ mod tests {
                 pileup_settings: None,
                 reference_contigs: None,
                 dp_norm_divisor: None,
+                restricted_to: None,
             };
             ToySample {
                 name: name.to_string(),

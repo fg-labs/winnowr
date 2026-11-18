@@ -19,6 +19,11 @@ features come from the table. `evaluate` also takes the options that change how 
 (`--keep-fallback`, `--outside-indel-t-drop` and the experimental ones; see
 [Scoring](scoring.md)).
 
+`--contigs` evaluates only the calls and truth FNs on some contigs, e.g. those held out from the
+models' training (see [Holding out half of a training sample](#holding-out-half-of-a-training-sample)).
+It needs the hap.py VCF the table was labelled from (`--happy`), to recount the truth FNs on those
+contigs, as `subset` does.
+
 The output is a TSV with one row per policy:
 
 | policy                    | what it is                                                          |
@@ -92,11 +97,19 @@ winnowr train --tables HG001.parquet HG005.parquet HG006.parquet HG007.parquet H
 winnowr stratify --models snp.winnowr.json --contigs chr1 chr3 chr5 chr7 chr9 chr11 chr13 chr15 chr17 chr19 chr21 \
   --truth-names v421 v5q --tables HG002.v421.parquet HG002.v5q.parquet \
   --truth-beds HG002.v421.bed HG002.v5q.bed --happy HG002.v421.happy.vcf.gz HG002.v5q.happy.vcf.gz -o HG002.odd.snp
+# Or report F1 on the odd chromosomes, with the full table
+winnowr evaluate --models snp.winnowr.json --table HG002.v421.parquet --happy HG002.v421.happy.vcf.gz \
+  --contigs chr1 chr3 chr5 chr7 chr9 chr11 chr13 chr15 chr17 chr19 chr21 -o HG002.odd.snp.tsv
 ```
 
 `subset` keeps a table's calls on `--contigs` whose REF span does not overlap `--exclude-bed`, and
 recounts the truth FNs from the hap.py VCF on the same terms, so that no label from elsewhere enters
 training or the threshold search. Since HG002 is then a training sample of the model, `stratify`
-warns that its metrics are in-sample and optimistic; that is expected here, as the reported
-chromosomes were held out. The features are kept as extracted: per-sample features (e.g.
+and `evaluate` warn that its metrics are in-sample and optimistic; that is expected here, as the
+reported chromosomes were held out. The features are kept as extracted: per-sample features (e.g.
 the depth normalization) still come from all of the sample's calls.
+
+`--contigs` (of `evaluate` and `stratify`) and `subset` restrict a table as extracted: a `subset`
+table records its restriction, and its truth FNs are no longer of all its contigs, so it cannot be
+restricted again (restrict the extracted table instead). It can be evaluated as it is, without
+`--contigs`.
