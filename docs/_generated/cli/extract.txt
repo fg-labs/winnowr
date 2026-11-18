@@ -24,6 +24,12 @@ Options:
       --pileup <PILEUP>...      Allele read count tables from `winnowr pileup` (e.g. one per shard),
                                 joined as pileup features of SNP and indel calls; needed to train or
                                 apply models that use them
+      --dp-median <DP_MEDIAN>   The depth that the depth feature (dp_norm) divides each call's
+                                RAW_MQandDP depth by, in place of the median depth of the calls on
+                                --contigs [default: that median]; at least 1. Use it for calls of
+                                only part of the genome (e.g. a target footprint), whose median
+                                depth is skewed, with the median RAW_MQandDP depth of the sample's
+                                genome-wide calls (which a whole-genome extract logs)
       --happy <HAPPY>           The hap.py output VCF for this sample (run with --engine vcfeval,
                                 preferably with --pass-only; see --happy-pass-only), which labels
                                 PASS calls; needed for training and evaluation tables

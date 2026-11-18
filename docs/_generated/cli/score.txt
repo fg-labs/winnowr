@@ -29,6 +29,14 @@ Options:
           The indexed gVCF the VCF was genotyped from; needed only when the VCF lacks the raw
           annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ)
 
+      --dp-median <DP_MEDIAN>
+          The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth by, in
+          place of the median depth of the calls on the models' contigs [default: that median]; at
+          least 1. Use it for calls of only part of the genome (e.g. a target footprint), whose
+          median depth is skewed, with the median RAW_MQandDP depth of the sample's genome-wide
+          calls (which a whole-genome extract or score logs), as the models' training tables were
+          normalized
+
       --regions <NAME=PATH>...
           Region BEDs as NAME=PATH, with the names the models were trained with, plus the
           not-difficult regions as notinalldifficultregions=PATH (GIAB's GRCh38 genome

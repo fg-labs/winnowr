@@ -67,6 +67,9 @@ pub struct TableInputs<'a> {
     pub pileup: Option<&'a PileupTables>,
     /// The truth inputs that label the table.
     pub truth: TruthInputs<'a>,
+    /// The depth `dp_norm` divides by, in place of the calls' median depth (see
+    /// [`derive_features`]); checked with [`crate::features::check_dp_median`].
+    pub dp_median: Option<f64>,
 }
 
 /// Extracts the features of every SNP and indel call of a sample and, given a hap.py VCF,
@@ -82,8 +85,9 @@ pub struct TableInputs<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error if the promote-label inputs are incomplete or a contig is repeated (checked
-/// before any input is read), a region set has no intervals on `contigs`, the calls cannot be read (see
+/// Returns an error if the promote-label inputs are incomplete, the given depth median is not a
+/// depth (see [`crate::features::check_dp_median`]) or a contig is repeated (checked before any
+/// input is read), a region set has no intervals on `contigs`, the calls cannot be read (see
 /// [`extract_raw_records`]), or most hap.py labels match no call.
 pub fn build_feature_table<S: AsRef<str> + Sync>(
     sample: &str,
@@ -93,6 +97,9 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
     inputs: &TableInputs<'_>,
 ) -> Result<FeatureTable> {
     inputs.truth.check()?;
+    if let Some(dp_median) = inputs.dp_median {
+        crate::features::check_dp_median(dp_median)?;
+    }
     crate::raw_records::check_unique_contigs(contigs)?;
     for region_set in inputs.regions {
         region_set.check_contigs(contigs)?;
@@ -104,7 +111,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
     if labels.is_some() {
         timer.lap("reading the hap.py labels");
     }
-    let derived = derive_features(&records, inputs.regions);
+    let derived = derive_features(&records, inputs.regions, inputs.dp_median);
     timer.lap("deriving features");
     let info = FeatureTableInfo {
         sample: sample.to_string(),
@@ -116,6 +123,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
         strlen_settings: None,
         pileup_settings: None,
         reference_contigs: Some(summary.lengths_of(contigs)),
+        dp_norm_divisor: Some(derived.dp_norm_divisor),
     };
     let mut table = FeatureTable::from_records(&records, derived, info)?;
     drop(records);
@@ -167,6 +175,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::features::DpNormDivisor;
     use crate::regions::{NamedBed, read_region_sets};
     use crate::testing::{CALL_FIELDS, RAW_FIELDS, vcf_header, write_indexed_vcf};
 
@@ -224,6 +233,8 @@ mod tests {
         // In the given order, not sorted.
         assert_eq!(lengths.keys().collect::<Vec<_>>(), ["chr1", "chr2"]);
         assert_eq!(lengths.get("chr1"), Some(&Some(100_000)));
+        // The calls' median depth (of 4, 2 and 1), not given.
+        assert_eq!(info.dp_norm_divisor, Some(DpNormDivisor { depth: Some(2.0), given: false }));
 
         let path = dir.path().join("table.parquet");
         table.write_parquet(&path).unwrap();
@@ -235,6 +246,22 @@ mod tests {
             let (a, b) = (read.batch().column_by_name(name), table.batch().column_by_name(name));
             assert_eq!(a.map(|c| c.to_data()), b.map(|c| c.to_data()), "{name}");
         }
+    }
+
+    #[test]
+    fn a_given_depth_median_normalizes_the_depth() {
+        let dir = TempDir::new().unwrap();
+        let vcf = write_vcf(&dir, &["S1"], &RECORDS);
+        let summary = VcfSummary::read(&vcf).unwrap();
+        let inputs = TableInputs { dp_median: Some(8.0), ..TableInputs::default() };
+        let table = build_feature_table("S1", &vcf, &["chr1", "chr2"], &summary, &inputs).unwrap();
+        // Depths 4, 2 and 1 over 8, not over their median of 2.
+        assert_eq!(*table.f64_column("dp_norm").unwrap(), [0.5, 0.25, 0.125]);
+        let recorded = Some(DpNormDivisor { depth: Some(8.0), given: true });
+        assert_eq!(table.info().dp_norm_divisor, recorded);
+        let path = dir.path().join("table.parquet");
+        table.write_parquet(&path).unwrap();
+        assert_eq!(FeatureTable::read_info(&path).unwrap().dp_norm_divisor, recorded);
     }
 
     #[test]
