@@ -284,7 +284,8 @@ pub(crate) struct ExtractArgs {
 #[derive(Debug, Args)]
 pub(crate) struct TrainArgs {
     /// Labelled feature tables (from `extract --happy`), one per training sample: at least two,
-    /// of distinct samples.
+    /// of distinct samples, on the same reference. They may cover different contigs: the model
+    /// records the contigs of all the tables, and `score` scores the calls on all of them.
     #[arg(long, required = true, num_args = 1..)]
     pub(crate) tables: Vec<PathBuf>,
 
@@ -1048,16 +1049,32 @@ fn extract(args: &ExtractArgs) -> Result<()> {
     Ok(())
 }
 
+/// The reference contigs a model records: each contig's length (`None` where unknown).
+type ReferenceContigs = indexmap::IndexMap<String, Option<u64>>;
+
+/// The training tables' metadata, as [`read_training_infos`] checks and merges it.
+struct TrainingInfos {
+    /// Each table's metadata, in the order of `--tables`.
+    infos: Vec<FeatureTableInfo>,
+    /// The region names the tables share.
+    regions: Vec<String>,
+    /// The contigs of any table (see [`merged_contigs`]).
+    contigs: Vec<String>,
+    /// The lengths of `contigs`, in their order (see [`merged_reference_contigs`]).
+    reference_contigs: Option<ReferenceContigs>,
+}
+
 /// Reads the training feature tables' metadata and checks that the tables can be trained on
-/// together, returning their shared region names and contigs.
+/// together, merging their contigs and reference contigs.
+///
+/// The tables may cover different contigs (e.g. half of one sample's chromosomes, with other
+/// samples' whole genomes); the model records the contigs of every table.
 ///
 /// # Errors
 ///
-/// Returns an error if there are fewer than two tables, a file is listed twice, or the tables
-/// were extracted with different regions or contigs.
-fn read_training_infos(
-    paths: &[PathBuf],
-) -> Result<(Vec<FeatureTableInfo>, Vec<String>, Vec<String>)> {
+/// Returns an error if there are fewer than two tables, a file is listed twice, the tables were
+/// extracted with different regions, or two tables record different lengths of a contig.
+fn read_training_infos(paths: &[PathBuf]) -> Result<TrainingInfos> {
     if paths.len() < 2 {
         bail!("--tables needs at least two feature tables (one per training sample)");
     }
@@ -1082,29 +1099,95 @@ fn read_training_infos(
                 info.region_names.join(", ")
             );
         }
-        if info.contigs != first.contigs {
-            bail!(
-                "--tables were extracted from different contigs: {} has [{}], {} has [{}]",
-                first.sample,
-                first.contigs.join(", "),
-                info.sample,
-                info.contigs.join(", ")
-            );
-        }
     }
-    let (regions, contigs) = (first.region_names.clone(), first.contigs.clone());
-    Ok((infos, regions, contigs))
+    let refs: Vec<&FeatureTableInfo> = infos.iter().collect();
+    let contigs = merged_contigs(&refs);
+    let partial: Vec<String> = infos
+        .iter()
+        .filter(|info| info.contigs.len() < contigs.len())
+        .map(|info| format!("{} ({} of them)", info.sample, info.contigs.len()))
+        .collect();
+    if !partial.is_empty() {
+        info!(
+            "--tables cover different contigs: the model records all {} of them, which these \
+             tables cover only some of: {}",
+            contigs.len(),
+            partial.join(", ")
+        );
+    }
+    for sample in tables_sharing_no_contig(&refs) {
+        log::warn!(
+            "the --tables of {sample} share no contig with the others, so train cannot check that \
+             they are of the same reference (their contig lengths are compared only where they \
+             share a contig); differently named contigs (e.g. 1 and chr1) mean different references"
+        );
+    }
+    let reference_contigs = merged_reference_contigs(&refs, &contigs)?;
+    let regions = first.region_names.clone();
+    Ok(TrainingInfos { infos, regions, contigs, reference_contigs })
 }
 
-/// The reference contigs the training tables share, to record in the model (`None`, with a
-/// warning, if a table does not record them).
+/// The contigs of any of the tables: those of the tables covering the most contigs first, ties
+/// broken by sample name, so that a whole-genome table sets the genome's order and the order does
+/// not depend on the order of `--tables`. Tables of the same contigs give those contigs, in their
+/// order.
+fn merged_contigs(infos: &[&FeatureTableInfo]) -> Vec<String> {
+    let mut sorted = infos.to_vec();
+    sorted.sort_by(|a, b| b.contigs.len().cmp(&a.contigs.len()).then(a.sample.cmp(&b.sample)));
+    let merged: indexmap::IndexSet<&String> =
+        sorted.into_iter().flat_map(|info| &info.contigs).collect();
+    merged.into_iter().cloned().collect()
+}
+
+/// The samples of the tables that share no contig with any other table, whose reference
+/// [`merged_reference_contigs`] therefore cannot check.
+fn tables_sharing_no_contig<'a>(infos: &[&'a FeatureTableInfo]) -> Vec<&'a str> {
+    infos
+        .iter()
+        .enumerate()
+        .filter(|&(i, info)| {
+            !infos.iter().enumerate().any(|(j, other)| {
+                i != j && info.contigs.iter().any(|contig| other.contigs.contains(contig))
+            })
+        })
+        .map(|(_, info)| info.sample.as_str())
+        .collect()
+}
+
+/// The reference contigs of the training tables, to record in the model: the length of each of
+/// `contigs` (the merged contigs, in their order) that the tables record, `None` where no table
+/// knows it. `None` in all, with a warning, if a table does not record its reference contigs; the
+/// lengths the other tables record are still checked against each other.
+///
+/// A length one table records and another does not know is not a conflict, as when `score` checks
+/// a model's reference.
 ///
 /// # Errors
 ///
-/// Returns an error if two tables record different contig lengths (different references).
-fn shared_reference_contigs(
+/// Returns an error if two tables record different lengths of a contig (different references).
+fn merged_reference_contigs(
     infos: &[&FeatureTableInfo],
-) -> Result<Option<indexmap::IndexMap<String, Option<u64>>>> {
+    contigs: &[String],
+) -> Result<Option<ReferenceContigs>> {
+    let mut merged = ReferenceContigs::new();
+    for contig in contigs {
+        // The first known length, and the sample whose table recorded it.
+        let mut known: Option<(u64, &str)> = None;
+        for info in infos {
+            let length = info.reference_contigs.as_ref().and_then(|lengths| lengths.get(contig));
+            let Some(&Some(length)) = length else { continue };
+            match known {
+                None => known = Some((length, &info.sample)),
+                Some((first, sample)) if first != length => bail!(
+                    "--tables come from different references: {sample} and {} record different \
+                     lengths of {contig} ({first} and {length})",
+                    info.sample
+                ),
+                Some(_) => {}
+            }
+        }
+        merged.insert(contig.clone(), known.map(|(length, _)| length));
+    }
     if infos.iter().any(|info| info.reference_contigs.is_none()) {
         log::warn!(
             "some --tables do not record their reference contigs; the model will not record them \
@@ -1112,18 +1195,7 @@ fn shared_reference_contigs(
         );
         return Ok(None);
     }
-    let first = infos[0];
-    for info in &infos[1..] {
-        if info.reference_contigs != first.reference_contigs {
-            bail!(
-                "--tables come from different references: {} and {} record different contig \
-                 lengths",
-                first.sample,
-                info.sample
-            );
-        }
-    }
-    Ok(first.reference_contigs.clone())
+    Ok(Some(merged))
 }
 
 /// The training parameters of a `train` command line.
@@ -1202,9 +1274,9 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
     };
     // Checked now rather than after hours of training.
     check_output_dir("--output", &output)?;
-    let (infos, regions, contigs) = read_training_infos(&args.tables)?;
+    let TrainingInfos { infos, regions, contigs, reference_contigs } =
+        read_training_infos(&args.tables)?;
     let info_refs: Vec<&FeatureTableInfo> = infos.iter().collect();
-    let reference_contigs = shared_reference_contigs(&info_refs)?;
     let groups: Vec<Vec<String>> =
         args.sample_groups.iter().map(|g| g.split(',').map(str::to_string).collect()).collect();
     let names: Vec<&str> = infos.iter().map(|info| info.sample.as_str()).collect();
@@ -1595,6 +1667,28 @@ fn score_table_inputs<'a>(
     }
 }
 
+/// Checks that the models (`paths`) were trained on the same contigs (`contigs`, each model's),
+/// in any order: a model's contig order is only the order its training merged them in.
+///
+/// # Errors
+///
+/// Returns an error naming each model's contigs if two models' contigs differ.
+fn check_same_contigs(paths: &[PathBuf], contigs: &[&[String]]) -> Result<()> {
+    let set = |contigs: &[String]| -> std::collections::BTreeSet<String> {
+        contigs.iter().cloned().collect()
+    };
+    let first = set(contigs[0]);
+    if contigs.iter().all(|model| set(model) == first) {
+        return Ok(());
+    }
+    let described: Vec<String> = paths
+        .iter()
+        .zip(contigs)
+        .map(|(path, contigs)| format!("{}: {}", path.display(), contigs.join(",")))
+        .collect();
+    bail!("--models were trained on different contigs: {}", described.join("; "))
+}
+
 /// Runs `winnowr stratify`.
 fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
     use crate::regions::RegionSet;
@@ -1805,16 +1899,11 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         }
         _ => None,
     };
+    let model_contigs: Vec<&[String]> = models.iter().map(|m| m.info.contigs.as_slice()).collect();
+    check_same_contigs(&args.models, &model_contigs)?;
+    // The models' contigs are the same, perhaps in different orders; the first model's order is
+    // the order the calls are extracted in.
     let contigs = &models[0].info.contigs;
-    if models.iter().any(|model| &model.info.contigs != contigs) {
-        let described: Vec<String> = args
-            .models
-            .iter()
-            .zip(&models)
-            .map(|(path, m)| format!("{}: {}", path.display(), m.info.contigs.join(",")))
-            .collect();
-        bail!("--models were trained on different contigs: {}", described.join("; "));
-    }
     let summary = VcfSummary::read(&args.vcf)?;
     let source = format!("VCF {}", args.vcf.display());
     for (path, model) in args.models.iter().zip(&models) {
@@ -2257,31 +2346,138 @@ mod tests {
 
         /// Writes the calls (`calls.vcf.gz`) and their hap.py output (`happy.vcf`) to `dir`.
         fn write_calls(dir: &Path) {
-            let (mut vcf, mut happy) = (HEADER.to_string(), HAPPY_HEADER.to_string());
-            for i in 0..CALLS {
-                let pos = 1000 + 200 * i;
-                let (qual, gq, ad, mq) =
-                    if is_true(i) { (60, 99, "10,10", 3600) } else { (5, 5, "18,2", 400) };
-                let (mq, dp) = (mq * 20, 20);
-                vcf.push_str(&format!(
-                    "chr1\t{pos}\t.\tA\tC\t{qual}\tPASS\tDP={dp};RAW_MQandDP={mq},{dp};QUALapprox={qual};VarDP={dp};AS_RAW_MQ={mq}|{mq}\tGT:GQ:AD\t0/1:{gq}:{ad}\n"
-                ));
-                let decision = if is_true(i) {
-                    "0/1:TP:gm:SNP\t0/1:TP:gm:SNP"
-                } else {
-                    ".:.:.:NOCALL\t0/1:FP:.:SNP"
-                };
-                happy.push_str(&format!(
-                    "chr1\t{pos}\t.\tA\tC\t.\t.\t.\tGT:BD:BK:BVT\t{decision}\n"
-                ));
-            }
-            for pos in [50_000, 50_100, 50_200] {
-                happy.push_str(&format!(
-                    "chr1\t{pos}\t.\tA\tG\t.\t.\t.\tGT:BD:BK:BVT\t0/1:FN:.:SNP\t.:.:.:NOCALL\n"
-                ));
+            write_calls_on(dir, &["chr1"]);
+        }
+
+        /// Writes the calls and their hap.py output, as [`write_calls`] does, with the same calls
+        /// and truth FNs on each of `contigs`.
+        fn write_calls_on(dir: &Path, contigs: &[&str]) {
+            let declare = |header: &str| {
+                let lines: String = contigs
+                    .iter()
+                    .map(|contig| format!("##contig=<ID={contig},length=100000>\n"))
+                    .collect();
+                header.replace("##contig=<ID=chr1,length=100000>\n", &lines)
+            };
+            let (mut vcf, mut happy) = (declare(HEADER), declare(HAPPY_HEADER));
+            for contig in contigs {
+                for i in 0..CALLS {
+                    let pos = 1000 + 200 * i;
+                    let (qual, gq, ad, mq) =
+                        if is_true(i) { (60, 99, "10,10", 3600) } else { (5, 5, "18,2", 400) };
+                    let (mq, dp) = (mq * 20, 20);
+                    vcf.push_str(&format!(
+                        "{contig}\t{pos}\t.\tA\tC\t{qual}\tPASS\tDP={dp};RAW_MQandDP={mq},{dp};QUALapprox={qual};VarDP={dp};AS_RAW_MQ={mq}|{mq}\tGT:GQ:AD\t0/1:{gq}:{ad}\n"
+                    ));
+                    let decision = if is_true(i) {
+                        "0/1:TP:gm:SNP\t0/1:TP:gm:SNP"
+                    } else {
+                        ".:.:.:NOCALL\t0/1:FP:.:SNP"
+                    };
+                    happy.push_str(&format!(
+                        "{contig}\t{pos}\t.\tA\tC\t.\t.\t.\tGT:BD:BK:BVT\t{decision}\n"
+                    ));
+                }
+                for pos in [50_000, 50_100, 50_200] {
+                    happy.push_str(&format!(
+                        "{contig}\t{pos}\t.\tA\tG\t.\t.\t.\tGT:BD:BK:BVT\t0/1:FN:.:SNP\t.:.:.:NOCALL\n"
+                    ));
+                }
             }
             write_bgzf_indexed(&dir.join("calls.vcf.gz"), &vcf);
             std::fs::write(dir.join("happy.vcf"), happy).unwrap();
+        }
+
+        /// Extracts tables of `write_calls_on` calls on chr1 and chr2 in a temporary directory and
+        /// trains snp models on them, with extra `train` options (`folds`).
+        struct MixedTables<'a> {
+            dir: tempfile::TempDir,
+            folds: &'a [&'a str],
+        }
+
+        impl<'a> MixedTables<'a> {
+            fn new(folds: &'a [&'a str]) -> Self {
+                let dir = tempfile::TempDir::new().unwrap();
+                write_calls_on(dir.path(), &["chr1", "chr2"]);
+                Self { dir, folds }
+            }
+
+            fn path(&self, name: &str) -> String {
+                self.dir.path().join(name).display().to_string()
+            }
+
+            /// Extracts the calls of `sample` on `contigs`, returning the table's path.
+            fn extract(&self, sample: &str, contigs: &[&str]) -> String {
+                let table = self.path(&format!("{sample}.parquet"));
+                let (vcf, happy) = (self.path("calls.vcf.gz"), self.path("happy.vcf"));
+                let base = ["extract", "--vcf", &vcf, "--happy", &happy, "--sample", sample];
+                run(&[&base[..], &["-o", &table, "--contigs"], contigs].concat());
+                table
+            }
+
+            /// Trains a snp model (`output`) on `tables` and loads it.
+            fn train(&self, tables: &[String], output: &str) -> WinnowrModel {
+                let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+                let model = self.path(output);
+                let base = ["train", "--variant-type", "snp", "--max-rounds", "10", "-o", &model];
+                run(&[&base[..], self.folds, &["--tables"], &tables].concat());
+                WinnowrModel::load(format!("{model}{MODEL_SUFFIX}"), NonZeroUsize::new(1).unwrap())
+                    .unwrap()
+            }
+        }
+
+        /// A model's reference contigs, in order.
+        fn reference_lengths(model: &WinnowrModel) -> Vec<(String, Option<u64>)> {
+            let recorded = model.info.reference_contigs.as_ref().unwrap();
+            recorded.iter().map(|(contig, length)| (contig.clone(), *length)).collect()
+        }
+
+        /// Tables of the same contigs give the model those contigs, in the tables' order.
+        #[test]
+        fn train_on_tables_of_the_same_contigs() {
+            let tables = MixedTables::new(&[]);
+            let same =
+                [tables.extract("S1", &["chr2", "chr1"]), tables.extract("S2", &["chr2", "chr1"])];
+            let model = tables.train(&same, "same");
+            assert_eq!(model.info.contigs, ["chr2", "chr1"]);
+            let expected =
+                vec![("chr2".to_string(), Some(100_000)), ("chr1".to_string(), Some(100_000))];
+            assert_eq!(reference_lengths(&model), expected);
+        }
+
+        /// `train` takes tables of different contigs: the model records all of them, in the order
+        /// of the table covering the most, and `score` scores the calls on all of them.
+        #[rstest]
+        #[case::samples(&[])]
+        #[case::chromosomes(&["--cv-folds", "chromosomes", "--chromosome-folds", "2"])]
+        fn train_on_tables_of_different_contigs(#[case] folds: &[&str]) {
+            let tables = MixedTables::new(folds);
+            // Half of one sample's contigs, listed first, with another sample's whole table.
+            let mixed = [tables.extract("S1", &["chr2"]), tables.extract("S2", &["chr1", "chr2"])];
+            let model = tables.train(&mixed, "mixed");
+            assert_eq!(model.info.training_samples, ["S1", "S2"]);
+            assert_eq!(model.info.contigs, ["chr1", "chr2"]);
+            let expected =
+                vec![("chr1".to_string(), Some(100_000)), ("chr2".to_string(), Some(100_000))];
+            assert_eq!(reference_lengths(&model), expected);
+
+            run(&[
+                "score",
+                "--vcf",
+                &tables.path("calls.vcf.gz"),
+                "--models",
+                &tables.path("mixed.winnowr.json"),
+                "-o",
+                &tables.path("scored.vcf.gz"),
+            ]);
+            let scored = read_gzip(Path::new(&tables.path("scored.vcf.gz")));
+            let scored: Vec<&str> = scored
+                .lines()
+                .filter(|line| !line.starts_with('#') && line.contains("WINNOWR_P="))
+                .map(|line| line.split('\t').next().unwrap())
+                .collect();
+            assert_eq!(scored.iter().filter(|chrom| **chrom == "chr1").count(), CALLS);
+            assert_eq!(scored.iter().filter(|chrom| **chrom == "chr2").count(), CALLS);
         }
 
         #[test]
@@ -2507,6 +2703,130 @@ mod tests {
                 StrlenTables { options, rows }
             );
         }
+    }
+
+    /// A training table's metadata: its sample, and its contigs with their lengths.
+    fn training_info(sample: &str, lengths: &[(&str, Option<u64>)]) -> FeatureTableInfo {
+        FeatureTableInfo {
+            sample: sample.to_string(),
+            contigs: lengths.iter().map(|(contig, _)| contig.to_string()).collect(),
+            reference_contigs: Some(
+                lengths.iter().map(|(contig, length)| (contig.to_string(), *length)).collect(),
+            ),
+            ..crate::testing::call_table(&[]).info().clone()
+        }
+    }
+
+    #[test]
+    fn merged_contigs_start_from_the_table_covering_the_most() {
+        let odd = training_info("S1", &[("chr1", Some(100)), ("chr3", Some(300))]);
+        let all =
+            training_info("S2", &[("chr1", Some(100)), ("chr2", Some(200)), ("chr3", Some(300))]);
+        for tables in [[&odd, &all], [&all, &odd]] {
+            assert_eq!(merged_contigs(&tables), ["chr1", "chr2", "chr3"]);
+        }
+    }
+
+    #[test]
+    fn merged_contigs_do_not_depend_on_the_order_of_the_tables() {
+        // Ties on the number of contigs are broken by sample name.
+        let first = training_info("S1", &[("chr2", None)]);
+        let second = training_info("S2", &[("chr1", None)]);
+        for tables in [[&first, &second], [&second, &first]] {
+            assert_eq!(merged_contigs(&tables), ["chr2", "chr1"]);
+        }
+        // Tables of the same contigs in different orders.
+        let a = training_info("A", &[("chr2", None), ("chr1", None)]);
+        let b = training_info("B", &[("chr1", None), ("chr2", None)]);
+        for tables in [[&a, &b], [&b, &a]] {
+            assert_eq!(merged_contigs(&tables), ["chr2", "chr1"]);
+        }
+    }
+
+    #[test]
+    fn finds_the_tables_sharing_no_contig_with_the_others() {
+        let odd = training_info("S1", &[("chr1", None), ("chr3", None)]);
+        let even = training_info("S2", &[("chr2", None)]);
+        let all = training_info("S3", &[("chr1", None), ("chr2", None), ("chr3", None)]);
+        let b37 = training_info("S4", &[("1", None), ("2", None)]);
+        assert!(tables_sharing_no_contig(&[&odd, &even, &all]).is_empty());
+        assert_eq!(tables_sharing_no_contig(&[&odd, &all, &b37]), ["S4"]);
+        assert_eq!(tables_sharing_no_contig(&[&odd, &even]), ["S1", "S2"]);
+    }
+
+    #[test]
+    fn merged_reference_contigs_follow_the_merged_contigs() {
+        let odd = training_info("S1", &[("chr1", Some(100)), ("chr3", Some(300))]);
+        let all =
+            training_info("S2", &[("chr1", Some(100)), ("chr2", Some(200)), ("chr3", Some(300))]);
+        let contigs = merged_contigs(&[&odd, &all]);
+        let merged = merged_reference_contigs(&[&odd, &all], &contigs).unwrap().unwrap();
+        let merged: Vec<(&str, Option<u64>)> =
+            merged.iter().map(|(contig, length)| (contig.as_str(), *length)).collect();
+        assert_eq!(merged, [("chr1", Some(100)), ("chr2", Some(200)), ("chr3", Some(300))]);
+    }
+
+    #[test]
+    fn an_unknown_length_does_not_conflict_with_a_known_one() {
+        let unknown = training_info("S1", &[("chr1", None), ("chr2", None)]);
+        let known = training_info("S2", &[("chr1", Some(100))]);
+        let contigs = merged_contigs(&[&unknown, &known]);
+        let merged = merged_reference_contigs(&[&unknown, &known], &contigs).unwrap().unwrap();
+        assert_eq!(merged.get("chr1"), Some(&Some(100)));
+        assert_eq!(merged.get("chr2"), Some(&None));
+    }
+
+    #[test]
+    fn different_lengths_of_a_contig_are_different_references() {
+        let all = training_info("S2", &[("chr1", Some(100)), ("chr2", Some(200))]);
+        let other = training_info("S3", &[("chr2", Some(250))]);
+        let contigs = merged_contigs(&[&all, &other]);
+        let message = merged_reference_contigs(&[&all, &other], &contigs).unwrap_err().to_string();
+        assert!(
+            message.contains("S2 and S3 record different lengths of chr2 (200 and 250)"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn no_reference_contigs_are_merged_when_a_table_records_none() {
+        let all = training_info("S2", &[("chr1", Some(100))]);
+        let mut unrecorded = training_info("S1", &[("chr1", Some(100))]);
+        unrecorded.reference_contigs = None;
+        let tables = [&unrecorded, &all];
+        assert_eq!(merged_reference_contigs(&tables, &merged_contigs(&tables)).unwrap(), None);
+    }
+
+    #[test]
+    fn different_lengths_are_different_references_when_a_table_records_none() {
+        let first = training_info("A", &[("chr1", Some(100))]);
+        let second = training_info("B", &[("chr1", Some(200)), ("chr2", Some(300))]);
+        let mut unrecorded = training_info("C", &[("chr2", None)]);
+        unrecorded.reference_contigs = None;
+        let tables = [&first, &second, &unrecorded];
+        let message =
+            merged_reference_contigs(&tables, &merged_contigs(&tables)).unwrap_err().to_string();
+        assert!(
+            message.contains("A and B record different lengths of chr1 (100 and 200)"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn models_of_the_same_contigs_in_any_order_score_together() {
+        let paths = [PathBuf::from("snp.winnowr.json"), PathBuf::from("indel.winnowr.json")];
+        let (ordered, reordered, other) = (
+            ["chr1".to_string(), "chr2".to_string()],
+            ["chr2".to_string(), "chr1".to_string()],
+            ["chr1".to_string()],
+        );
+        check_same_contigs(&paths, &[&ordered, &reordered]).unwrap();
+        let message = check_same_contigs(&paths, &[&ordered, &other]).unwrap_err().to_string();
+        assert_eq!(
+            message,
+            "--models were trained on different contigs: snp.winnowr.json: chr1,chr2; \
+             indel.winnowr.json: chr1"
+        );
     }
 
     #[test]

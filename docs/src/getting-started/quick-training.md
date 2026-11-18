@@ -36,8 +36,8 @@ Run `extract` the same way for every sample, the held-out one included. `train` 
 [scoring quick start](quick-scoring.md).
 
 `extract` reads the autosomes `chr1` to `chr22` by default (`--contigs`). The training tables must
-have been extracted from the same contigs, with the same region names, from calls on the same
-reference.
+have been extracted with the same region names, from calls on the same reference; they may cover
+different contigs (see [Training](../user-guide/training.md)).
 
 To train on only some contigs of a sample, e.g. to evaluate it on the others, `subset` keeps them
 and recounts the table's truth FNs on them (see
