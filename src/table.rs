@@ -30,6 +30,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::common::VariantType;
+use crate::feature_source::FeatureSource;
 use crate::features::{DerivedFeatures, DpNormDivisor, region_feature};
 use crate::neighbourhood::NEIGHBOURHOOD_FEATURES;
 use crate::pileup::PileupOptions;
@@ -44,6 +45,8 @@ const METADATA_KEY: &str = "winnowr";
 
 /// Metadata stored alongside a feature table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Default only for tests: a table's metadata always names its sample.
+#[cfg_attr(test, derive(Default))]
 pub struct FeatureTableInfo {
     /// The sample name.
     pub sample: String,
@@ -80,6 +83,11 @@ pub struct FeatureTableInfo {
     /// whose calls and FNs are of all of `contigs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restricted_to: Option<Restriction>,
+    /// Where the features of gVCF-mode annotations (`mq`, `dp_norm`, `qd`, `as_alt_frac`, `sor`,
+    /// `n_alt`) come from. Not written for the gVCF source, so that its tables are as before, and
+    /// tables that record none are of the gVCF source.
+    #[serde(default, skip_serializing_if = "FeatureSource::is_default")]
+    pub feature_source: FeatureSource,
 }
 
 /// The part of the genome a restricted table's calls and truth FN counts are of.
@@ -745,19 +753,7 @@ mod tests {
             Arc::new(Float64Array::from_iter_values((0..rows).map(|i| i as f64 / 2.0))),
         ];
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
-        let info = FeatureTableInfo {
-            sample: "S1".to_string(),
-            contigs: vec![],
-            region_names: vec![],
-            fn_counts: None,
-            promote_labelled: false,
-            strlen: false,
-            strlen_settings: None,
-            pileup_settings: None,
-            reference_contigs: None,
-            dp_norm_divisor: None,
-            restricted_to: None,
-        };
+        let info = FeatureTableInfo { sample: "S1".to_string(), ..FeatureTableInfo::default() };
         let table = FeatureTable::new(batch, info);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("t.parquet");
@@ -786,16 +782,26 @@ mod tests {
         FeatureTableInfo {
             sample: "S1".to_string(),
             contigs: vec!["chr1".to_string()],
-            region_names: vec![],
-            fn_counts: None,
-            promote_labelled: false,
-            strlen: false,
-            strlen_settings: None,
-            pileup_settings: None,
-            reference_contigs: None,
             dp_norm_divisor,
-            restricted_to: None,
+            ..FeatureTableInfo::default()
         }
+    }
+
+    /// A table of the gVCF source is written as before sources were recorded, and one written
+    /// before then reads as of the gVCF source; another source round trips.
+    #[test]
+    fn the_feature_source_is_recorded_unless_it_is_gvcf() {
+        let gvcf = info_with_divisor(None);
+        let json = serde_json::to_string(&gvcf).unwrap();
+        assert!(!json.contains("feature_source"), "{json}");
+        assert_eq!(serde_json::from_str::<FeatureTableInfo>(&json).unwrap(), gvcf);
+        let vcf = FeatureTableInfo { feature_source: FeatureSource::Vcf, ..gvcf };
+        let json = serde_json::to_string(&vcf).unwrap();
+        assert!(json.contains(r#""feature_source":"vcf""#), "{json}");
+        assert_eq!(serde_json::from_str::<FeatureTableInfo>(&json).unwrap(), vcf);
+        let unknown = json.replace(r#""feature_source":"vcf""#, r#""feature_source":"bam""#);
+        let error = serde_json::from_str::<FeatureTableInfo>(&unknown).unwrap_err().to_string();
+        assert!(error.contains("unknown feature source 'bam'"), "{error}");
     }
 
     #[test]

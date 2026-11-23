@@ -12,6 +12,7 @@
   - [Classes and labels](user-guide/classes-and-labels.md)
   - [Training](user-guide/training.md)
   - [Scoring](user-guide/scoring.md)
+  - [Feature sources](user-guide/feature-sources.md)
   - [Repeat-length features](user-guide/repeat-length.md)
   - [Pileup features](user-guide/pileup.md)
   - [Evaluating and stratifying](user-guide/evaluating.md)

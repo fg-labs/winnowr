@@ -9,6 +9,7 @@ use log::info;
 use winnowr_xgboost::Booster;
 
 use crate::common::{Task, VariantType};
+use crate::feature_source::FeatureSource;
 use crate::fitting::{fit_booster, validation_mask};
 use crate::model::{
     CvFolds, MODEL_FORMAT_VERSION, ModelInfo, TrainingParams, WinnowrModel, num_classes,
@@ -404,6 +405,8 @@ pub struct TrainingSpec<'a> {
     pub strlen_settings: Option<StrlenOptions>,
     /// The settings of the training tables' pileup evidence, if the model uses it.
     pub pileup_settings: Option<PileupOptions>,
+    /// The feature source of the training tables.
+    pub feature_source: FeatureSource,
 }
 
 /// What a cross-validation fold holds out.
@@ -817,6 +820,7 @@ fn model_info(
         regenotype,
         strlen_settings: spec.strlen_settings,
         pileup_settings: spec.pileup_settings,
+        feature_source: spec.feature_source,
         winnowr_version: VERSION.clone(),
         xgboost_version: XGBOOST_VERSION.clone(),
     }
@@ -994,19 +998,7 @@ mod tests {
                 Arc::new(Float64Array::from(b)),
             ];
             let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
-            let info = FeatureTableInfo {
-                sample: name.to_string(),
-                contigs: vec![],
-                region_names: vec![],
-                fn_counts: None,
-                promote_labelled: false,
-                strlen: false,
-                strlen_settings: None,
-                pileup_settings: None,
-                reference_contigs: None,
-                dp_norm_divisor: None,
-                restricted_to: None,
-            };
+            let info = FeatureTableInfo { sample: name.to_string(), ..FeatureTableInfo::default() };
             ToySample {
                 name: name.to_string(),
                 calls: FeatureTable::new(batch, info),
@@ -1061,6 +1053,7 @@ mod tests {
             threads,
             strlen_settings: None,
             pileup_settings: None,
+            feature_source: FeatureSource::Gvcf,
         }
     }
 
@@ -1149,6 +1142,7 @@ mod tests {
             contigs: &contigs,
             strlen_settings: strlen,
             pileup_settings: pileup,
+            feature_source: FeatureSource::Gvcf,
             ..toy_spec(&features, threads(1))
         };
         let thresholds =

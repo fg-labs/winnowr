@@ -363,16 +363,9 @@ mod tests {
     fn training_tables_must_share_their_strlen_settings() {
         let info = |sample: &str, strlen: bool, settings: Option<StrlenOptions>| FeatureTableInfo {
             sample: sample.to_string(),
-            contigs: vec![],
-            region_names: vec![],
-            fn_counts: None,
-            promote_labelled: false,
             strlen,
             strlen_settings: settings,
-            pileup_settings: None,
-            reference_contigs: None,
-            dp_norm_divisor: None,
-            restricted_to: None,
+            ..FeatureTableInfo::default()
         };
         let new = Some(StrlenOptions::default());
         let (a, b) = (info("A", true, new), info("B", true, new));
@@ -391,16 +384,8 @@ mod tests {
     fn training_tables_must_share_their_pileup_settings() {
         let info = |sample: &str, settings: Option<&str>| FeatureTableInfo {
             sample: sample.to_string(),
-            contigs: vec![],
-            region_names: vec![],
-            fn_counts: None,
-            promote_labelled: false,
-            strlen: false,
-            strlen_settings: None,
             pileup_settings: settings.map(|s| s.parse().unwrap()),
-            reference_contigs: None,
-            dp_norm_divisor: None,
-            restricted_to: None,
+            ..FeatureTableInfo::default()
         };
         let (a, b) = (info("A", Some("default")), info("B", Some("default")));
         assert_eq!(shared_options::<PileupOptions>(&[&a, &b]).unwrap(), PileupOptions::default());
@@ -426,16 +411,10 @@ mod tests {
     fn table_info(strlen: Option<StrlenOptions>, pileup: Option<&str>) -> FeatureTableInfo {
         FeatureTableInfo {
             sample: "S".to_string(),
-            contigs: vec![],
-            region_names: vec![],
-            fn_counts: None,
-            promote_labelled: false,
             strlen: strlen.is_some(),
             strlen_settings: strlen,
             pileup_settings: pileup.map(|s| s.parse().unwrap()),
-            reference_contigs: None,
-            dp_norm_divisor: None,
-            restricted_to: None,
+            ..FeatureTableInfo::default()
         }
     }
 

@@ -22,6 +22,12 @@ pub const RAW_ANNOTATION_INFO: [&str; 4] = ["RAW_MQandDP", "QUALapprox", "VarDP"
 /// The gVCF allele standing for any unobserved alternate allele.
 pub const NON_REF: &[u8] = b"<NON_REF>";
 
+/// True for an alternate allele other than [`NON_REF`]: one that is counted and annotated.
+#[must_use]
+pub fn is_concrete_alt<A: AsRef<[u8]>>(allele: A) -> bool {
+    allele.as_ref() != NON_REF
+}
+
 /// The raw annotations at one variant site, from the gVCF or the VCF. Missing values are NaN.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RawAnnotation {
@@ -39,6 +45,10 @@ pub struct RawAnnotation {
     pub as_mq_alt: f64,
     /// The number of alternate alleles (excluding `<NON_REF>`).
     pub n_alt: f64,
+    /// Not a gVCF annotation: the VCF feature source's INFO/SOR fallback, which the `sor` feature
+    /// takes when FORMAT/SB is missing (see [`crate::vcf_source::derive_annotation`]). Always NaN
+    /// for the gVCF source, whose `sor` comes from FORMAT/SB only, as its models were trained.
+    pub sor: f64,
 }
 
 impl RawAnnotation {
@@ -51,6 +61,7 @@ impl RawAnnotation {
         as_mq_ref: f64::NAN,
         as_mq_alt: f64::NAN,
         n_alt: f64::NAN,
+        sor: f64::NAN,
     };
 }
 
@@ -112,7 +123,16 @@ pub fn raw_annotation(
         Some(values) => split_as_raw_mq(values, alleles),
         None => (f64::NAN, f64::NAN, f64::NAN),
     };
-    Ok(Some(RawAnnotation { raw_mq, raw_dp, qual_approx, var_dp, as_mq_ref, as_mq_alt, n_alt }))
+    Ok(Some(RawAnnotation {
+        raw_mq,
+        raw_dp,
+        qual_approx,
+        var_dp,
+        as_mq_ref,
+        as_mq_alt,
+        n_alt,
+        sor: f64::NAN,
+    }))
 }
 
 /// Splits per-allele `AS_RAW_MQ` values into the reference share, the summed alternate share
@@ -128,7 +148,7 @@ pub fn split_as_raw_mq<S: AsRef<[u8]>>(values: &[f64], alleles: &[S]) -> (f64, f
     let alt_values: Vec<f64> = values[1..]
         .iter()
         .zip(&alleles[1..])
-        .filter(|(_, allele)| allele.as_ref() != NON_REF)
+        .filter(|(_, allele)| is_concrete_alt(allele))
         .map(|(&value, _)| value)
         .collect();
     let as_mq_alt = alt_values.iter().copied().map(or_zero).sum();
@@ -211,7 +231,8 @@ pub fn read_gvcf_sites(
         if let Some(annotation) = raw_annotation(&mut fields, &record, &alleles)? {
             let (reference, alts) =
                 alleles.split_first().map_or((&b""[..], &[][..]), |(r, a)| (*r, a));
-            let alts = alts.iter().filter(|&&alt| alt != NON_REF).map(|alt| alt.to_vec()).collect();
+            let alts =
+                alts.iter().filter(|&&alt| is_concrete_alt(alt)).map(|alt| alt.to_vec()).collect();
             sites.entry(pos).or_default().push(GvcfSite {
                 reference: reference.to_vec(),
                 alts,

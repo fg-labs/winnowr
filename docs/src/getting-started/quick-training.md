@@ -35,6 +35,11 @@ Run `extract` the same way for every sample, the held-out one included. `train` 
 `snp.winnowr.json` and `indel.winnowr.json`; score with them as in the
 [scoring quick start](quick-scoring.md).
 
+Without gVCFs, extract every table with `--feature-source vcf` (and no `--gvcf`), which derives
+the features of gVCF-mode annotations from the VCF's standard annotations; see
+[Feature sources](../user-guide/feature-sources.md). `train` takes tables of one feature source
+only.
+
 `extract` reads the autosomes `chr1` to `chr22` by default (`--contigs`). The training tables must
 have been extracted with the same region names, from calls on the same reference; they may cover
 different contigs (see [Training](../user-guide/training.md)).

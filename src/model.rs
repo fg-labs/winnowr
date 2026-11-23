@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use winnowr_xgboost::{Booster, DMatrix};
 
 use crate::common::{Task, VariantType};
+use crate::feature_source::FeatureSource;
 use crate::labels::{Label, PromoteLabel, UnfixableFlips};
 use crate::pileup::PileupOptions;
 use crate::pileup_features::PILEUP_FEATURES;
@@ -194,6 +195,12 @@ pub struct ModelInfo {
     /// The pileup evidence a model scores must be measured the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pileup_settings: Option<PileupOptions>,
+    /// Where the features of gVCF-mode annotations of the training tables came from (see
+    /// [`FeatureSource`]); `score` derives the calls' features from the same source. Not written
+    /// for the gVCF source, so that its models are as before, and models that record none are of
+    /// the gVCF source.
+    #[serde(default, skip_serializing_if = "FeatureSource::is_default")]
+    pub feature_source: FeatureSource,
     /// The winnowr version that trained the model.
     pub winnowr_version: String,
     /// The XGBoost version that trained the model.
@@ -705,19 +712,7 @@ mod tests {
             })
             .collect();
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
-        let info = FeatureTableInfo {
-            sample: "S".to_string(),
-            contigs: vec![],
-            region_names: vec![],
-            fn_counts: None,
-            promote_labelled: false,
-            strlen: false,
-            strlen_settings: None,
-            pileup_settings: None,
-            reference_contigs: None,
-            dp_norm_divisor: None,
-            restricted_to: None,
-        };
+        let info = FeatureTableInfo { sample: "S".to_string(), ..FeatureTableInfo::default() };
         FeatureTable::new(batch, info)
     }
 
@@ -758,6 +753,7 @@ mod tests {
             regenotype: false,
             strlen_settings: None,
             pileup_settings: None,
+            feature_source: FeatureSource::Gvcf,
             winnowr_version: crate::version::VERSION.clone(),
             xgboost_version: "3.4.2".to_string(),
         }
@@ -886,6 +882,30 @@ mod tests {
         let plain =
             WinnowrModel { booster: booster(&["a", "b"], 3), info: genotype_info(&["a", "b"]) };
         assert!(!plain.to_json().unwrap().contains("pileup_settings"));
+    }
+
+    /// A model of the gVCF feature source is written without the field, as before sources were
+    /// recorded, so a model written before then loads as of the gVCF source; another source round
+    /// trips.
+    #[test]
+    fn models_record_their_feature_source_unless_it_is_gvcf() {
+        let features = ["a", "b"];
+        let gvcf = WinnowrModel { booster: booster(&features, 3), info: genotype_info(&features) };
+        let text = gvcf.to_json().unwrap();
+        assert!(!text.contains("feature_source"), "{text}");
+        let loaded = WinnowrModel::from_json(&text, THREADS).unwrap();
+        assert_eq!(loaded.info.feature_source, FeatureSource::Gvcf);
+        assert_eq!(loaded.info, gvcf.info);
+
+        let mut info = genotype_info(&features);
+        info.feature_source = FeatureSource::Vcf;
+        let vcf = WinnowrModel { booster: booster(&features, 3), info };
+        let text = vcf.to_json().unwrap();
+        assert!(text.contains(r#""feature_source":"vcf""#), "{text}");
+        assert_eq!(WinnowrModel::from_json(&text, THREADS).unwrap().info, vcf.info);
+        let unknown = text.replace(r#""feature_source":"vcf""#, r#""feature_source":"bam""#);
+        let error = format!("{:#}", WinnowrModel::from_json(&unknown, THREADS).unwrap_err());
+        assert!(error.contains("unknown feature source 'bam'"), "{error}");
     }
 
     #[test]

@@ -3,43 +3,54 @@ Extract a feature table for a sample's calls, optionally labelled with truth
 Usage: winnowr extract [OPTIONS] --vcf <VCF> --output <OUTPUT>
 
 Options:
-  -t, --threads <THREADS>       The number of worker threads to use [default: OMP_NUM_THREADS when
-                                set, else 4]
-      --vcf <VCF>               The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g.
-                                --dragen-mode)
-  -o, --output <OUTPUT>         The feature table to write (Parquet)
-      --gvcf <GVCF>             The indexed gVCF the VCF was genotyped from. It supplies the raw
-                                annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) when the VCF
-                                lacks them, and is not read otherwise
-      --regions <NAME=PATH>...  Region BEDs to flag calls in, as NAME=PATH (e.g.
-                                segdups=segdups.bed.gz). The names must match those a model was
-                                trained with
-      --contigs <CONTIGS>...    The contigs to extract [default: chr1 chr2 chr3 chr4 chr5 chr6 chr7
-                                chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18
-                                chr19 chr20 chr21 chr22]
-      --sample <SAMPLE>         The sample name to record [default: the VCF's sample]
-      --strlen <STRLEN>...      Repeat-tract read-length tables from `winnowr strlen` (e.g. one per
-                                shard), joined as repeat-length features of indel calls; needed to
-                                train or apply models that use them
-      --pileup <PILEUP>...      Allele read count tables from `winnowr pileup` (e.g. one per shard),
-                                joined as pileup features of SNP and indel calls; needed to train or
-                                apply models that use them
-      --dp-median <DP_MEDIAN>   The depth that the depth feature (dp_norm) divides each call's
-                                RAW_MQandDP depth by, in place of the median depth of the calls on
-                                --contigs [default: that median]; at least 1. Use it for calls of
-                                only part of the genome (e.g. a target footprint), whose median
-                                depth is skewed, with the median RAW_MQandDP depth of the sample's
-                                genome-wide calls (which a whole-genome extract logs)
-      --happy <HAPPY>           The hap.py output VCF for this sample (run with --engine vcfeval,
-                                preferably with --pass-only; see --happy-pass-only), which labels
-                                PASS calls; needed for training and evaluation tables
-      --happy-pass-only <MODE>  Whether hap.py was run with --pass-only: yes, no, or auto to infer
-                                it from the labels. It decides whether a --happy label at a non-PASS
-                                call's position is that call's own or a PASS call's that hap.py
-                                represented there [default: auto] [possible values: auto, yes, no]
-      --truth-vcf <TRUTH_VCF>   The indexed truth VCF (e.g. a GIAB benchmark); with --truth-bed and
-                                --happy, labels non-PASS calls for training promote models
-      --truth-bed <TRUTH_BED>   The truth confident-regions BED
-      --reference <REFERENCE>   The indexed reference FASTA used to left-align indels when matching
-                                non-PASS calls to the truth; without it, alleles are only trimmed
-  -h, --help                    Print help
+  -t, --threads <THREADS>        The number of worker threads to use [default: OMP_NUM_THREADS when
+                                 set, else 4]
+      --vcf <VCF>                The indexed, single-sample VCF from HaplotypeCaller (gVCF mode,
+                                 e.g. --dragen-mode, or a standard VCF with --feature-source vcf)
+  -o, --output <OUTPUT>          The feature table to write (Parquet)
+      --gvcf <GVCF>              The indexed gVCF the VCF was genotyped from. It supplies the raw
+                                 annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) when the
+                                 VCF lacks them, and is not read otherwise. Not used with
+                                 --feature-source vcf
+      --feature-source <SOURCE>  Where the features of HaplotypeCaller's gVCF-mode annotations (mq,
+                                 dp_norm, qd, as_alt_frac, sor, n_alt) come from: gvcf (the raw
+                                 annotations of the VCF or of --gvcf), or vcf (derived from the
+                                 VCF's INFO/MQ, INFO/DP, FORMAT/AD, FORMAT/PL and FORMAT/SB or
+                                 INFO/SOR, with as_alt_frac missing; for a VCF without a gVCF). The
+                                 table records it: models train only on tables of one source, and
+                                 score calls with the features of theirs [default: gvcf] [possible
+                                 values: gvcf, vcf]
+      --regions <NAME=PATH>...   Region BEDs to flag calls in, as NAME=PATH (e.g.
+                                 segdups=segdups.bed.gz). The names must match those a model was
+                                 trained with
+      --contigs <CONTIGS>...     The contigs to extract [default: chr1 chr2 chr3 chr4 chr5 chr6 chr7
+                                 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18
+                                 chr19 chr20 chr21 chr22]
+      --sample <SAMPLE>          The sample name to record [default: the VCF's sample]
+      --strlen <STRLEN>...       Repeat-tract read-length tables from `winnowr strlen` (e.g. one per
+                                 shard), joined as repeat-length features of indel calls; needed to
+                                 train or apply models that use them
+      --pileup <PILEUP>...       Allele read count tables from `winnowr pileup` (e.g. one per
+                                 shard), joined as pileup features of SNP and indel calls; needed to
+                                 train or apply models that use them
+      --dp-median <DP_MEDIAN>    The depth that the depth feature (dp_norm) divides each call's
+                                 RAW_MQandDP depth (INFO/DP with --feature-source vcf) by, in place
+                                 of the median depth of the calls on --contigs [default: that
+                                 median]; at least 1. Use it for calls of only part of the genome
+                                 (e.g. a target footprint), whose median depth is skewed, with the
+                                 median depth of the sample's genome-wide calls (which a
+                                 whole-genome extract logs)
+      --happy <HAPPY>            The hap.py output VCF for this sample (run with --engine vcfeval,
+                                 preferably with --pass-only; see --happy-pass-only), which labels
+                                 PASS calls; needed for training and evaluation tables
+      --happy-pass-only <MODE>   Whether hap.py was run with --pass-only: yes, no, or auto to infer
+                                 it from the labels. It decides whether a --happy label at a
+                                 non-PASS call's position is that call's own or a PASS call's that
+                                 hap.py represented there [default: auto] [possible values: auto,
+                                 yes, no]
+      --truth-vcf <TRUTH_VCF>    The indexed truth VCF (e.g. a GIAB benchmark); with --truth-bed and
+                                 --happy, labels non-PASS calls for training promote models
+      --truth-bed <TRUTH_BED>    The truth confident-regions BED
+      --reference <REFERENCE>    The indexed reference FASTA used to left-align indels when matching
+                                 non-PASS calls to the truth; without it, alleles are only trimmed
+  -h, --help                     Print help

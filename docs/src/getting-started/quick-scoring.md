@@ -7,7 +7,8 @@ first. It also needs, for the sample:
   FORMAT tag of its records declared in its header (`extract` and `score` stop with an error naming
   the record otherwise),
 - the gVCF it was genotyped from, indexed, when the VCF lacks the raw annotations (RAW_MQandDP,
-  QUALapprox, VarDP, AS_RAW_MQ),
+  QUALapprox, VarDP, AS_RAW_MQ); not for models trained on features from the VCF
+  (`extract --feature-source vcf`: see [Feature sources](../user-guide/feature-sources.md)),
 - the region BEDs the models were trained with, under the same names, plus GIAB's GRCh38
   `notinalldifficultregions` BED from the
   [genome stratifications](https://github.com/usnistgov/giab-stratifications),
@@ -41,6 +42,16 @@ ones no model uses. In place of `--strlen` and `--pileup`, `score --alignments s
 winnowr score --vcf sample.vcf.gz --gvcf sample.g.vcf.gz --models snp.winnowr.json indel.winnowr.json \
   --regions segdups=segdups.bed.gz notinalldifficultregions=GRCh38_notinalldifficultregions.bed.gz \
   --alignments sample.cram --reference ref.fa -o sample.winnowr.vcf.gz
+```
+
+Models trained on features from the VCF (`extract --feature-source vcf`) take no `--gvcf`: `score`
+derives the features from the VCF, as the models record. `--regions` still needs a BED for every
+region the models were trained with (here `segdups`), under the same name.
+
+```console
+winnowr score --vcf sample.vcf.gz --models snp.winnowr.json indel.winnowr.json \
+  --regions segdups=segdups.bed.gz notinalldifficultregions=GRCh38_notinalldifficultregions.bed.gz \
+  -o sample.winnowr.vcf.gz
 ```
 
 `strlen` and `pileup` measure the autosomes `chr1` to `chr22` by default; `--regions` takes other

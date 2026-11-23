@@ -14,6 +14,7 @@ use log::info;
 use crate::common::{AUTOSOMES, PhaseTimer, Task, VariantType, repeated};
 use crate::evidence::read_tables;
 use crate::extraction::{TableInputs, TruthInputs, build_feature_table};
+use crate::feature_source::FeatureSource;
 use crate::features::feature_names;
 use crate::labels::{HappyPassOnly, UnfixableFlips};
 use crate::model::{CvFolds, MODEL_SUFFIX, TrainingParams, WinnowrModel, check_reference};
@@ -27,6 +28,7 @@ use crate::policy::{
     Abstention, DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP, NOT_DIFFICULT_REGIONS, Policy,
     decide_calls,
 };
+use crate::raw_records::AnnotationInputs;
 use crate::read_pass::ReadInputs;
 use crate::regions::{NamedBed, NamedPath, RegionSet, read_region_sets};
 use crate::repeat_features::STRLEN_FEATURES;
@@ -201,7 +203,8 @@ impl Command {
 /// The options of `winnowr extract`.
 #[derive(Debug, Args)]
 pub(crate) struct ExtractArgs {
-    /// The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode).
+    /// The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode, or a
+    /// standard VCF with --feature-source vcf).
     #[arg(long)]
     pub(crate) vcf: PathBuf,
 
@@ -211,9 +214,23 @@ pub(crate) struct ExtractArgs {
 
     /// The indexed gVCF the VCF was genotyped from. It supplies the raw annotations
     /// (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) when the VCF lacks them, and is not read
-    /// otherwise.
+    /// otherwise. Not used with --feature-source vcf.
     #[arg(long)]
     pub(crate) gvcf: Option<PathBuf>,
+
+    /// Where the features of HaplotypeCaller's gVCF-mode annotations (mq, dp_norm, qd,
+    /// as_alt_frac, sor, n_alt) come from: gvcf (the raw annotations of the VCF or of --gvcf), or
+    /// vcf (derived from the VCF's INFO/MQ, INFO/DP, FORMAT/AD, FORMAT/PL and FORMAT/SB or
+    /// INFO/SOR, with as_alt_frac missing; for a VCF without a gVCF). The table records it: models
+    /// train only on tables of one source, and score calls with the features of theirs.
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        default_value_t = FeatureSource::Gvcf,
+        ignore_case = true,
+        value_parser = feature_source_parser()
+    )]
+    pub(crate) feature_source: FeatureSource,
 
     /// Region BEDs to flag calls in, as NAME=PATH (e.g. segdups=segdups.bed.gz). The names must
     /// match those a model was trained with.
@@ -238,11 +255,11 @@ pub(crate) struct ExtractArgs {
     #[arg(long, num_args = 1..)]
     pub(crate) pileup: Vec<PathBuf>,
 
-    /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth by, in
-    /// place of the median depth of the calls on --contigs [default: that median]; at least 1. Use
-    /// it for calls of only part of the genome (e.g. a target footprint), whose median depth is
-    /// skewed, with the median RAW_MQandDP depth of the sample's genome-wide calls (which a
-    /// whole-genome extract logs).
+    /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth (INFO/DP
+    /// with --feature-source vcf) by, in place of the median depth of the calls on --contigs
+    /// [default: that median]; at least 1. Use it for calls of only part of the genome (e.g. a
+    /// target footprint), whose median depth is skewed, with the median depth of the sample's
+    /// genome-wide calls (which a whole-genome extract logs).
     #[arg(long, value_parser = parse_dp_median)]
     pub(crate) dp_median: Option<f64>,
 
@@ -808,7 +825,8 @@ pub(crate) struct SubsetArgs {
 /// The options of `winnowr score`.
 #[derive(Debug, Args)]
 pub(crate) struct ScoreArgs {
-    /// The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode).
+    /// The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode, or a
+    /// standard VCF for models trained on features from the VCF: see `extract --feature-source`).
     #[arg(long)]
     pub(crate) vcf: PathBuf,
 
@@ -823,15 +841,18 @@ pub(crate) struct ScoreArgs {
     pub(crate) output: PathBuf,
 
     /// The indexed gVCF the VCF was genotyped from; needed only when the VCF lacks the raw
-    /// annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ).
+    /// annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) and the models were trained on
+    /// features from the gVCF (feature source gvcf). Models trained on features from the VCF
+    /// (`extract --feature-source vcf`) derive them from the VCF, and ignore it.
     #[arg(long)]
     pub(crate) gvcf: Option<PathBuf>,
 
-    /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth by, in
-    /// place of the median depth of the calls on the models' contigs [default: that median]; at
-    /// least 1. Use it for calls of only part of the genome (e.g. a target footprint), whose median
-    /// depth is skewed, with the median RAW_MQandDP depth of the sample's genome-wide calls (which a
-    /// whole-genome extract or score logs), as the models' training tables were normalized.
+    /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth (INFO/DP
+    /// for models trained on features from the VCF) by, in place of the median depth of the calls
+    /// on the models' contigs [default: that median]; at least 1. Use it for calls of only part of
+    /// the genome (e.g. a target footprint), whose median depth is skewed, with the median depth
+    /// of the sample's genome-wide calls (which a whole-genome extract or score logs), as the
+    /// models' training tables were normalized.
     #[arg(long, value_parser = parse_dp_median)]
     pub(crate) dp_median: Option<f64>,
 
@@ -962,6 +983,13 @@ pub(crate) struct PileupArgs {
     pub(crate) settings: PileupOptions,
 }
 
+/// The parser of `extract --feature-source`: one of [`FeatureSource::ALL`], which `--help` lists.
+fn feature_source_parser() -> impl clap::builder::TypedValueParser<Value = FeatureSource> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::PossibleValuesParser::new(FeatureSource::ALL.map(|source| source.as_str()))
+        .map(|text| text.parse::<FeatureSource>().expect("a possible value is a feature source"))
+}
+
 /// Checks that the directory an output file of `option` goes in exists, so that a mistyped path
 /// fails before a long pass over the inputs rather than after it. Advisory: the writers still
 /// report a directory that goes missing.
@@ -1016,6 +1044,9 @@ fn strlen(args: &StrlenArgs) -> Result<()> {
 /// Runs `winnowr extract`.
 fn extract(args: &ExtractArgs) -> Result<()> {
     check_output_dir("--output", &args.output)?;
+    // Checked before any input is read.
+    let annotations =
+        annotation_inputs(args.feature_source, args.gvcf.as_deref(), UnreadGvcf::Error)?;
     let truth = TruthInputs {
         happy: args.happy.as_deref(),
         happy_pass_only: args.happy_pass_only,
@@ -1044,7 +1075,7 @@ fn extract(args: &ExtractArgs) -> Result<()> {
         info!("The pileup tables were measured with settings {}", pileup.options);
     }
     let inputs = TableInputs {
-        gvcf: args.gvcf.as_deref(),
+        annotations,
         regions: &regions,
         strlen: strlen.as_ref(),
         pileup: pileup.as_ref(),
@@ -1057,6 +1088,76 @@ fn extract(args: &ExtractArgs) -> Result<()> {
     timer.lap("writing the table");
     info!("Wrote {} calls for {sample} to {}", table.num_rows(), args.output.display());
     Ok(())
+}
+
+/// What [`annotation_inputs`] does with a --gvcf that the VCF feature source does not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadGvcf {
+    /// An error (`extract`, where --feature-source vcf and --gvcf contradict each other).
+    Error,
+    /// A warning, ignoring it (`score`, whose source comes from the models).
+    Warn,
+}
+
+/// Where the raw annotations come from: the feature source, with `gvcf` (--gvcf) for the gVCF
+/// source. The VCF source does not read a given `gvcf`: `unread` says what to do with it.
+///
+/// # Errors
+///
+/// Returns an error if `gvcf` is given with the VCF source and `unread` is
+/// [`UnreadGvcf::Error`].
+fn annotation_inputs(
+    source: FeatureSource,
+    gvcf: Option<&Path>,
+    unread: UnreadGvcf,
+) -> Result<AnnotationInputs<'_>> {
+    match (source, gvcf) {
+        (FeatureSource::Gvcf, gvcf) => Ok(AnnotationInputs::Gvcf(gvcf)),
+        (FeatureSource::Vcf, None) => Ok(AnnotationInputs::Vcf),
+        (FeatureSource::Vcf, Some(gvcf)) => match unread {
+            UnreadGvcf::Error => bail!(
+                "--feature-source vcf derives the features from the VCF alone, and does not read \
+                 --gvcf: leave out --gvcf, or use --feature-source gvcf"
+            ),
+            UnreadGvcf::Warn => {
+                log::warn!(
+                    "the models were trained on features from the VCF (feature source vcf), so \
+                     --gvcf {} is ignored",
+                    gvcf.display()
+                );
+                Ok(AnnotationInputs::Vcf)
+            }
+        },
+    }
+}
+
+/// The feature source every one of `items` has (by `source`), or `None` if there are none;
+/// logged when it is not the default, as that of `whose` features.
+///
+/// # Errors
+///
+/// Returns the error `differ` makes of the first item and the first with another source.
+fn shared_feature_source<T, I, F, E>(
+    items: I,
+    source: F,
+    differ: E,
+    whose: &str,
+) -> Result<Option<FeatureSource>>
+where
+    I: IntoIterator<Item = T>,
+    F: Fn(&T) -> FeatureSource,
+    E: FnOnce(&T, &T) -> anyhow::Error,
+{
+    let mut items = items.into_iter();
+    let Some(first) = items.next() else { return Ok(None) };
+    let shared = source(&first);
+    if let Some(other) = items.find(|item| source(item) != shared) {
+        return Err(differ(&first, &other));
+    }
+    if !shared.is_default() {
+        info!("{whose} features come from feature source {shared}");
+    }
+    Ok(Some(shared))
 }
 
 /// The reference contigs a model records: each contig's length (`None` where unknown).
@@ -1072,6 +1173,8 @@ struct TrainingInfos {
     contigs: Vec<String>,
     /// The lengths of `contigs`, in their order (see [`merged_reference_contigs`]).
     reference_contigs: Option<ReferenceContigs>,
+    /// The feature source the tables share.
+    feature_source: FeatureSource,
 }
 
 /// Reads the training feature tables' metadata and checks that the tables can be trained on
@@ -1083,7 +1186,8 @@ struct TrainingInfos {
 /// # Errors
 ///
 /// Returns an error if there are fewer than two tables, a file is listed twice, the tables were
-/// extracted with different regions, or two tables record different lengths of a contig.
+/// extracted with different regions or feature sources, or two tables record different lengths of
+/// a contig.
 fn read_training_infos(paths: &[PathBuf]) -> Result<TrainingInfos> {
     if paths.len() < 2 {
         bail!("--tables needs at least two feature tables (one per training sample)");
@@ -1110,6 +1214,22 @@ fn read_training_infos(paths: &[PathBuf]) -> Result<TrainingInfos> {
             );
         }
     }
+    let feature_source = shared_feature_source(
+        &infos,
+        |info| info.feature_source,
+        |first, other| {
+            anyhow::anyhow!(
+                "--tables hold features from different sources: {}'s from {}, {}'s from {}; \
+                 extract every training table with the same --feature-source",
+                first.sample,
+                first.feature_source,
+                other.sample,
+                other.feature_source
+            )
+        },
+        "The training tables'",
+    )?
+    .unwrap_or_default();
     let refs: Vec<&FeatureTableInfo> = infos.iter().collect();
     let contigs = merged_contigs(&refs);
     let partial: Vec<String> = infos
@@ -1134,7 +1254,7 @@ fn read_training_infos(paths: &[PathBuf]) -> Result<TrainingInfos> {
     }
     let reference_contigs = merged_reference_contigs(&refs, &contigs)?;
     let regions = first.region_names.clone();
-    Ok(TrainingInfos { infos, regions, contigs, reference_contigs })
+    Ok(TrainingInfos { infos, regions, contigs, reference_contigs, feature_source })
 }
 
 /// The contigs of any of the tables: those of the tables covering the most contigs first, ties
@@ -1284,7 +1404,7 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
     };
     // Checked now rather than after hours of training.
     check_output_dir("--output", &output)?;
-    let TrainingInfos { infos, regions, contigs, reference_contigs } =
+    let TrainingInfos { infos, regions, contigs, reference_contigs, feature_source } =
         read_training_infos(&args.tables)?;
     let info_refs: Vec<&FeatureTableInfo> = infos.iter().collect();
     let groups: Vec<Vec<String>> =
@@ -1330,6 +1450,7 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
         threads,
         strlen_settings: strlen_options,
         pileup_settings: pileup_options,
+        feature_source,
     };
     let mut timer = PhaseTimer::start();
     let model = if args.task == Task::Promote {
@@ -1601,7 +1722,8 @@ fn load_models(paths: &[PathBuf], threads: NonZeroUsize) -> Result<Vec<WinnowrMo
 ///
 /// # Errors
 ///
-/// Returns an error if the table is not on a model's reference or lacks evidence a model needs.
+/// Returns an error if the table is not on a model's reference, holds features from another
+/// source than a model was trained on, or lacks evidence a model needs.
 fn check_labelled_table(
     table: &Path,
     info: &FeatureTableInfo,
@@ -1609,6 +1731,7 @@ fn check_labelled_table(
     paths: &[PathBuf],
 ) -> Result<()> {
     check_table_reference(table, info, models, paths)?;
+    check_table_feature_source(table, info, models, paths)?;
     check_table::<StrlenOptions>(table, info, models, paths)?;
     check_table::<PileupOptions>(table, info, models, paths)?;
     let trained_on: Vec<String> = paths
@@ -1625,6 +1748,65 @@ fn check_labelled_table(
         );
     }
     Ok(())
+}
+
+/// Checks that a feature table's features come from the source each model was trained on.
+///
+/// # Errors
+///
+/// Returns an error naming the table, the model and both sources if they differ.
+fn check_table_feature_source(
+    table: &Path,
+    info: &FeatureTableInfo,
+    models: &[WinnowrModel],
+    paths: &[PathBuf],
+) -> Result<()> {
+    // The table first, then each model by its path.
+    let sources = std::iter::once((None, info.feature_source))
+        .chain(paths.iter().zip(models).map(|(path, m)| (Some(path), m.info.feature_source)));
+    shared_feature_source(
+        sources,
+        |&(_, source)| source,
+        |&(_, measured), &(path, trained)| {
+            let gvcf = if trained == FeatureSource::Gvcf {
+                " (with --gvcf if the VCF lacks the raw annotations)"
+            } else {
+                ""
+            };
+            anyhow::anyhow!(
+                "feature table {} holds features from `{measured}`, but model {} was trained on \
+                 features from `{trained}`: extract the table again with --feature-source \
+                 {trained}{gvcf}, or use a model trained on `{measured}` features",
+                table.display(),
+                path.expect("only the table has no path").display()
+            )
+        },
+        "The feature table's",
+    )?;
+    Ok(())
+}
+
+/// The feature source of the features the models were trained on, which `score` derives the
+/// calls' features from.
+///
+/// # Errors
+///
+/// Returns an error naming each model's source if two models' differ.
+fn models_feature_source(models: &[WinnowrModel], paths: &[PathBuf]) -> Result<FeatureSource> {
+    let differ = |_: &&WinnowrModel, _: &&WinnowrModel| {
+        let described: Vec<String> = paths
+            .iter()
+            .zip(models)
+            .map(|(path, m)| format!("{}: {}", path.display(), m.info.feature_source))
+            .collect();
+        anyhow::anyhow!(
+            "--models were trained on features from different sources ({}): score with models \
+             trained on tables of one --feature-source",
+            described.join("; ")
+        )
+    };
+    let shared = shared_feature_source(models, |m| m.info.feature_source, differ, "The models'")?;
+    Ok(shared.unwrap_or_default())
 }
 
 /// Checks a feature table's reference contigs against each model's, warning if the table does
@@ -1667,16 +1849,18 @@ fn warn_policy_only_regions(regions: &[NamedBed]) {
     }
 }
 
-/// The inputs of the feature table `score` builds: the gVCF, `regions`, the repeat-length and pileup
-/// evidence, and the depth median of the command line, with no truth labels.
+/// The inputs of the feature table `score` builds: the raw annotations' inputs of the models'
+/// feature source (see [`annotation_inputs`]), `regions`, the repeat-length and pileup evidence,
+/// and the depth median of the command line, with no truth labels.
 fn score_table_inputs<'a>(
     args: &'a ScoreArgs,
+    annotations: AnnotationInputs<'a>,
     regions: &'a [RegionSet],
     strlen: Option<&'a crate::strlen::StrlenTables>,
     pileup: Option<&'a crate::pileup::PileupTables>,
 ) -> TableInputs<'a> {
     TableInputs {
-        gvcf: args.gvcf.as_deref(),
+        annotations,
         regions,
         strlen,
         pileup,
@@ -1882,6 +2066,8 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         unused.sort_unstable();
         log::warn!("no model uses the --regions {}; they are ignored", unused.join(", "));
     }
+    let feature_source = models_feature_source(&models, &args.models)?;
+    let annotations = annotation_inputs(feature_source, args.gvcf.as_deref(), UnreadGvcf::Warn)?;
     let needs_strlen = models_using::<StrlenOptions>(&models, &args.models);
     let needs_pileup = models_using::<PileupOptions>(&models, &args.models);
     check_supplied::<StrlenOptions>(&needs_strlen, &args.strlen, args.alignments.is_some())?;
@@ -1935,7 +2121,7 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         .collect();
     let regions = read_region_sets(&used)?;
     let sample = summary.sample_name(&args.vcf);
-    let inputs = score_table_inputs(args, &regions, strlen.as_ref(), pileup.as_ref());
+    let inputs = score_table_inputs(args, annotations, &regions, strlen.as_ref(), pileup.as_ref());
     let table = build_feature_table(&sample, &args.vcf, contigs, &summary, &inputs)?;
     let mut timer = PhaseTimer::start();
     let policy =
@@ -2378,8 +2564,13 @@ mod tests {
         }
 
         fn run(args: &[&str]) {
+            try_run(args).unwrap();
+        }
+
+        /// Parses and runs a command line, returning its error.
+        fn try_run(args: &[&str]) -> Result<()> {
             let cli = parse(args).unwrap();
-            dispatch(&cli.command, NonZeroUsize::new(1).unwrap()).unwrap();
+            dispatch(&cli.command, NonZeroUsize::new(1).unwrap())
         }
 
         /// Writes the calls (`calls.vcf.gz`) and their hap.py output (`happy.vcf`) to `dir`.
@@ -2594,7 +2785,7 @@ mod tests {
             let both = ["--contigs", "chr1", "chr2", "--happy", &happy];
             assert_eq!(evaluate(&both, &path("both.tsv")), all);
 
-            let cli = parse(&[
+            let error = try_run(&[
                 "evaluate",
                 "--models",
                 &model,
@@ -2607,8 +2798,7 @@ mod tests {
                 "--happy",
                 &happy,
             ])
-            .unwrap();
-            let error = dispatch(&cli.command, NonZeroUsize::new(1).unwrap()).unwrap_err();
+            .unwrap_err();
             assert!(error.to_string().contains("not extracted from contigs chr3"), "{error}");
         }
 
@@ -2703,6 +2893,172 @@ mod tests {
             let n_dropped = records.iter().filter(|r| r[6] == "WinnowrDrop").count();
             let n_flipped = records.iter().filter(|r| r[7].contains("WINNOWR_FLIP")).count();
             assert_eq!((n_dropped, n_flipped), (dropped, flipped));
+        }
+
+        /// Writes the calls of [`write_calls`] (`calls.vcf.gz`, with the raw annotations) and
+        /// their hap.py output (`happy.vcf`), and the same calls as a VCF of HaplotypeCaller's
+        /// default mode (`default.vcf.gz`): INFO/MQ, INFO/SOR and FORMAT/PL in place of the raw
+        /// annotations, so that only the vcf feature source can read it.
+        fn write_default_mode_calls(dir: &Path) {
+            write_calls(dir);
+            let is_raw = |key: &str| crate::gvcf::RAW_ANNOTATION_INFO.contains(&key);
+            let fields = "##INFO=<ID=MQ,Number=1,Type=Float,Description=\"RMS MQ\">\n\
+                 ##INFO=<ID=SOR,Number=1,Type=Float,Description=\"SOR\">\n\
+                 ##FORMAT=<ID=PL,Number=G,Type=Integer,Description=\"PL\">\n";
+            let header: String = HEADER
+                .lines()
+                .filter(|line| {
+                    let id = line.strip_prefix("##INFO=<ID=").and_then(|r| r.split(',').next());
+                    !id.is_some_and(is_raw)
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            let mut vcf = header.replace("#CHROM", &format!("{fields}#CHROM"));
+            for line in read_gzip(&dir.join("calls.vcf.gz")).lines().filter(|l| !l.starts_with('#'))
+            {
+                let mut columns: Vec<String> = line.split('\t').map(str::to_string).collect();
+                // True calls have MQ 60 and false ones MQ 20 (see write_calls_on).
+                let mq = if columns[7].contains("RAW_MQandDP=72000") { 60 } else { 20 };
+                let qual: u32 = columns[5].parse().unwrap();
+                let info: Vec<&str> = columns[7]
+                    .split(';')
+                    .filter(|entry| !is_raw(entry.split('=').next().unwrap()))
+                    .collect();
+                columns[7] = format!("{};MQ={mq};SOR=0.7", info.join(";"));
+                columns[8] = format!("{}:PL", columns[8]);
+                columns[9] = format!("{}:{qual},0,{}", columns[9], 3 * qual);
+                vcf.push_str(&columns.join("\t"));
+                vcf.push('\n');
+            }
+            write_bgzf_indexed(&dir.join("default.vcf.gz"), &vcf);
+        }
+
+        /// The calls of [`write_default_mode_calls`] in a temporary directory, with a snp model
+        /// (`vcf.winnowr.json`) trained on tables of S1 and S2 extracted with the vcf feature
+        /// source.
+        struct VcfSourceModel {
+            dir: tempfile::TempDir,
+        }
+
+        impl VcfSourceModel {
+            fn new() -> Self {
+                let model = Self { dir: tempfile::TempDir::new().unwrap() };
+                write_default_mode_calls(model.dir.path());
+                let tables = [
+                    model.extract("S1", "default.vcf.gz", "vcf"),
+                    model.extract("S2", "default.vcf.gz", "vcf"),
+                ];
+                model.train(&tables, "vcf").unwrap();
+                model
+            }
+
+            fn path(&self, name: &str) -> String {
+                self.dir.path().join(name).display().to_string()
+            }
+
+            /// The model's path.
+            fn model(&self) -> String {
+                self.path("vcf.winnowr.json")
+            }
+
+            /// The table of `sample`'s calls in `vcf` extracted with the feature `source`.
+            fn extract(&self, sample: &str, vcf: &str, source: &str) -> String {
+                let table = self.path(&format!("{sample}.{source}.parquet"));
+                run(&[
+                    "extract",
+                    "--vcf",
+                    &self.path(vcf),
+                    "--happy",
+                    &self.path("happy.vcf"),
+                    "--contigs",
+                    "chr1",
+                    "--sample",
+                    sample,
+                    "--feature-source",
+                    source,
+                    "-o",
+                    &table,
+                ]);
+                table
+            }
+
+            /// Trains a snp model (`output`) on `tables`.
+            fn train<S: AsRef<str>>(&self, tables: &[S], output: &str) -> Result<()> {
+                let model = self.path(output);
+                let tables: Vec<&str> = tables.iter().map(AsRef::as_ref).collect();
+                let base = ["train", "--variant-type", "snp", "--max-rounds", "10", "-o", &model];
+                try_run(&[&base[..], &["--tables"], &tables].concat())
+            }
+        }
+
+        /// Features derived from a VCF (`--feature-source vcf`): the table and the model record
+        /// the source; the gVCF source cannot read the VCF, which lacks the raw annotations.
+        #[test]
+        fn the_vcf_feature_source_is_recorded_in_tables_and_models() {
+            let setup = VcfSourceModel::new();
+            let table = FeatureTable::read_parquet(setup.path("S1.vcf.parquet")).unwrap();
+            assert_eq!(table.info().feature_source, FeatureSource::Vcf);
+            assert!(table.f64_column("as_alt_frac").unwrap().iter().all(|v| v.is_nan()));
+            let mq = table.f64_column("mq").unwrap();
+            assert!(mq.iter().all(|&v| v == 60.0 || v == 20.0), "{mq:?}");
+            let model = WinnowrModel::load(setup.model(), NonZeroUsize::new(1).unwrap()).unwrap();
+            assert_eq!(model.info.feature_source, FeatureSource::Vcf);
+            let text = std::fs::read_to_string(setup.model()).unwrap();
+            assert!(text.contains(r#""feature_source":"vcf""#));
+
+            let gvcf = setup.path("gvcf.parquet");
+            let extract = ["extract", "--vcf", &setup.path("default.vcf.gz"), "--contigs", "chr1"];
+            let error = try_run(&[&extract[..], &["-o", &gvcf]].concat()).unwrap_err();
+            assert!(format!("{error:#}").contains("lacks the INFO annotations"), "{error:#}");
+        }
+
+        /// Tables of different feature sources do not train together.
+        #[test]
+        fn train_rejects_tables_of_different_feature_sources() {
+            let setup = VcfSourceModel::new();
+            let gvcf_table = setup.extract("S2", "calls.vcf.gz", "gvcf");
+            let tables = [setup.path("S1.vcf.parquet"), gvcf_table];
+            let error = setup.train(&tables, "mixed").unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "--tables hold features from different sources: S1's from vcf, S2's from gvcf"
+                ),
+                "{error}"
+            );
+        }
+
+        /// score derives a vcf-source model's features from the VCF, which only that source can
+        /// read; a --gvcf is ignored (so it need not exist).
+        #[test]
+        fn score_derives_the_features_of_vcf_source_models_from_the_vcf() {
+            let setup = VcfSourceModel::new();
+            for (output, extra) in
+                [("scored.vcf.gz", &[][..]), ("ignored.vcf.gz", &["--gvcf", "absent.g.vcf.gz"][..])]
+            {
+                let (vcf, model) = (setup.path("default.vcf.gz"), setup.model());
+                let base = ["score", "--vcf", &vcf, "--models", &model];
+                run(&[&base[..], &["-o", &setup.path(output)], extra].concat());
+                let scored = read_gzip(&setup.dir.path().join(output));
+                let records = scored.lines().filter(|line| !line.starts_with('#'));
+                assert_eq!(records.filter(|r| r.contains("WINNOWR_P=")).count(), CALLS);
+            }
+        }
+
+        /// evaluate rejects a table of another feature source than the model's.
+        #[test]
+        fn evaluate_rejects_a_table_of_another_feature_source() {
+            let setup = VcfSourceModel::new();
+            let (table, model) = (setup.extract("S2", "calls.vcf.gz", "gvcf"), setup.model());
+            let metrics = setup.path("metrics.tsv");
+            let error =
+                try_run(&["evaluate", "--models", &model, "--table", &table, "-o", &metrics])
+                    .unwrap_err();
+            let expected = format!(
+                "feature table {table} holds features from `gvcf`, but model {model} was \
+                 trained on features from `vcf`: extract the table again with --feature-source \
+                 vcf, or use a model trained on `gvcf` features"
+            );
+            assert_eq!(error.to_string(), expected);
         }
 
         /// A model trained on pileup features records the tables' pileup settings.
@@ -2938,6 +3294,27 @@ mod tests {
         );
     }
 
+    /// `score` takes the models' feature source, and rejects models of different sources.
+    #[test]
+    fn score_takes_the_feature_source_of_the_models() {
+        let model = |source: FeatureSource| {
+            let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+            model.info.feature_source = source;
+            model
+        };
+        let paths = [PathBuf::from("g.winnowr.json"), PathBuf::from("v.winnowr.json")];
+        let (gvcf, vcf) = (FeatureSource::Gvcf, FeatureSource::Vcf);
+        assert_eq!(models_feature_source(&[model(vcf), model(vcf)], &paths).unwrap(), vcf);
+        assert_eq!(models_feature_source(&[model(gvcf), model(gvcf)], &paths).unwrap(), gvcf);
+        let error =
+            models_feature_source(&[model(gvcf), model(vcf)], &paths).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "--models were trained on features from different sources (g.winnowr.json: gvcf; \
+             v.winnowr.json: vcf): score with models trained on tables of one --feature-source"
+        );
+    }
+
     #[test]
     fn models_of_the_same_contigs_in_any_order_score_together() {
         let paths = [PathBuf::from("snp.winnowr.json"), PathBuf::from("indel.winnowr.json")];
@@ -3014,6 +3391,68 @@ mod tests {
         assert_eq!(args.contigs, ["chr20", "chr21"]);
         assert_eq!(args.sample.as_deref(), Some("S"));
         assert_eq!(args.gvcf, Some(PathBuf::from("in.g.vcf.gz")));
+        assert_eq!(args.feature_source, FeatureSource::Gvcf);
+        assert_eq!(
+            annotation_inputs(args.feature_source, args.gvcf.as_deref(), UnreadGvcf::Error)
+                .unwrap(),
+            AnnotationInputs::Gvcf(args.gvcf.as_deref())
+        );
+    }
+
+    /// `extract --feature-source` takes gvcf (the default) or vcf, in any case; vcf does not read
+    /// --gvcf, so it cannot be given with it.
+    #[test]
+    fn extract_takes_a_feature_source() {
+        let base = ["extract", "--vcf", "in.vcf.gz", "-o", "t.parquet"];
+        let args = |extra: &[&str]| {
+            let Command::Extract(args) = parse(&[&base[..], extra].concat()).unwrap().command
+            else {
+                panic!("not extract")
+            };
+            args
+        };
+        assert_eq!(args(&[]).feature_source, FeatureSource::Gvcf);
+        let vcf = args(&["--feature-source", "VCF"]);
+        assert_eq!(vcf.feature_source, FeatureSource::Vcf);
+        assert_eq!(
+            annotation_inputs(vcf.feature_source, None, UnreadGvcf::Error).unwrap(),
+            AnnotationInputs::Vcf
+        );
+        let with_gvcf = args(&["--feature-source", "vcf", "--gvcf", "in.g.vcf.gz"]);
+        let error = annotation_inputs(
+            with_gvcf.feature_source,
+            with_gvcf.gvcf.as_deref(),
+            UnreadGvcf::Error,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not read --gvcf"), "{error}");
+        // score, whose source comes from the models, ignores it.
+        let ignored = annotation_inputs(FeatureSource::Vcf, Some(Path::new("g")), UnreadGvcf::Warn);
+        assert_eq!(ignored.unwrap(), AnnotationInputs::Vcf);
+        let error = parse(&[&base[..], &["--feature-source", "bam"]].concat()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("[possible values: gvcf, vcf]"), "{error}");
+    }
+
+    /// `evaluate` and `stratify` reject a table of another feature source than a model's, either
+    /// way round.
+    #[test]
+    fn a_table_of_another_feature_source_than_the_model_is_rejected() {
+        let model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+        let paths = [PathBuf::from("m.winnowr.json")];
+        let table = Path::new("t.parquet");
+        let mut info = crate::testing::call_table(&[]).info().clone();
+        check_table_feature_source(table, &info, std::slice::from_ref(&model), &paths).unwrap();
+        info.feature_source = FeatureSource::Vcf;
+        let error = check_table_feature_source(table, &info, &[model], &paths).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "feature table t.parquet holds features from `vcf`, but model m.winnowr.json was \
+             trained on features from `gvcf`: extract the table again with --feature-source gvcf \
+             (with --gvcf if the VCF lacks the raw annotations), or use a model trained on `vcf` \
+             features"
+        );
     }
 
     #[test]
@@ -3083,7 +3522,10 @@ mod tests {
             let base = ["score", "--vcf", "v", "--models", "m", "-o", "o"];
             let cli = parse(&[&base[..], extra].concat()).unwrap();
             let Command::Score(args) = cli.command else { panic!("not score") };
-            assert_eq!(score_table_inputs(&args, &[], None, None).dp_median, expected);
+            assert_eq!(
+                score_table_inputs(&args, AnnotationInputs::default(), &[], None, None).dp_median,
+                expected
+            );
         }
     }
 

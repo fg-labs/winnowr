@@ -24,6 +24,7 @@ information and, under `booster`, the XGBoost booster in XGBoost's JSON format. 
 | `regenotype`         | whether the model has the re-genotype class                                    |
 | `strlen_settings`    | the read settings of the repeat-length evidence it was trained on              |
 | `pileup_settings`    | the settings of the pileup evidence it was trained on                          |
+| `feature_source`     | `vcf` for a model trained on features derived from the VCF; absent for `gvcf`  |
 | `winnowr_version`    | the winnowr version that trained it                                            |
 | `xgboost_version`    | the XGBoost version that trained it                                            |
 
@@ -49,6 +50,9 @@ When it loads a model, winnowr checks:
   with its `strlen_settings`, and a model with pileup features only pileup evidence measured with
   its `pileup_settings`. Models that record no strlen settings are read as measured with
   any MAPQ and two flank bases (`strlen --reads legacy`).
+- **Feature source.** A model scores only features of its `feature_source` (absent for the
+  default, `gvcf`); older winnowr versions refuse a `vcf` model, but read a `vcf` feature table as
+  `gvcf`. See [Feature sources](feature-sources.md).
 - **Consistency.** The booster must have the model's features, in order, and its number of classes.
 
 The models given to one `score` run must be trained on the same contigs, with at most one genotype
