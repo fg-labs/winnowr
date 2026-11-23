@@ -16,7 +16,8 @@ Options:
 
       --vcf <VCF>
           The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode, or a
-          standard VCF for models trained on features from the VCF: see `extract --feature-source`)
+          standard VCF for models trained on features from the VCF, or from the VCF and the reads:
+          see `extract --feature-source`)
 
       --models <MODELS>...
           The model files (`<name>.winnowr.json`): at most one genotype and one promote model per
@@ -30,15 +31,17 @@ Options:
           The indexed gVCF the VCF was genotyped from; needed only when the VCF lacks the raw
           annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) and the models were trained on
           features from the gVCF (feature source gvcf). Models trained on features from the VCF
-          (`extract --feature-source vcf`) derive them from the VCF, and ignore it
+          (`extract --feature-source vcf`), or from the VCF and the reads (`extract --alignments`),
+          ignore it
 
       --dp-median <DP_MEDIAN>
           The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth (INFO/DP
-          for models trained on features from the VCF) by, in place of the median depth of the calls
-          on the models' contigs [default: that median]; at least 1. Use it for calls of only part
-          of the genome (e.g. a target footprint), whose median depth is skewed, with the median
-          depth of the sample's genome-wide calls (which a whole-genome extract or score logs), as
-          the models' training tables were normalized
+          for models trained on features from the VCF, the reads counted for models trained on
+          features measured from the reads) by, in place of the median depth of the calls on the
+          models' contigs [default: that median]; at least 1. Use it for calls of only part of the
+          genome (e.g. a target footprint), whose median depth is skewed, with the median depth of
+          the sample's genome-wide calls (which a whole-genome extract or score logs), as the
+          models' training tables were normalized
 
       --regions <NAME=PATH>...
           Region BEDs as NAME=PATH, with the names the models were trained with, plus the
@@ -98,8 +101,11 @@ Options:
           scoring, instead of reading tables: the repeat-length evidence of models with
           repeat-length features (as `winnowr strlen`), and the allele read counts of models with
           pileup features (as `winnowr pileup`), over the models' contigs, with the settings the
-          models were trained with. Needs --reference. The reads are measured while the models that
-          do not need them score, each with its own -t threads, so up to twice -t threads run
+          models were trained with. Models trained on features measured from the reads (`extract
+          --alignments`) need it: each call's mapping qualities and depth are measured from it
+          before any model scores. Needs --reference. Otherwise the reads are measured while the
+          models that do not need them score, each with its own -t threads, so up to twice -t
+          threads run
 
       --reference <REFERENCE>
           The indexed, uncompressed reference FASTA, for --alignments (also used to decode CRAM)

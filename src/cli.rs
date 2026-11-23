@@ -13,7 +13,7 @@ use log::info;
 
 use crate::common::{AUTOSOMES, PhaseTimer, Task, VariantType, repeated};
 use crate::evidence::read_tables;
-use crate::extraction::{TableInputs, TruthInputs, build_feature_table};
+use crate::extraction::{TableInputs, TruthInputs, build_feature_table, check_table_inputs};
 use crate::feature_source::FeatureSource;
 use crate::features::feature_names;
 use crate::labels::{HappyPassOnly, UnfixableFlips};
@@ -22,13 +22,17 @@ use crate::model_evidence::{
     Measuring, check_supplied, check_table, measure_and_decide, models_options, models_using,
     read_for_models, shared_options,
 };
-use crate::pileup::{PileupOptions, measure_pileup, write_pileup_table};
+use crate::pileup::{
+    MeasuredSite, PileupOptions, PileupTables, measure_annotations_and_pileup, measure_pileup,
+    write_pileup_table,
+};
 use crate::pileup_features::PILEUP_FEATURES;
 use crate::policy::{
     Abstention, DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP, NOT_DIFFICULT_REGIONS, Policy,
     decide_calls,
 };
 use crate::raw_records::AnnotationInputs;
+use crate::read_annotations::{ReadAnnotationOptions, summarise};
 use crate::read_pass::ReadInputs;
 use crate::regions::{NamedBed, NamedPath, RegionSet, read_region_sets};
 use crate::repeat_features::STRLEN_FEATURES;
@@ -204,7 +208,7 @@ impl Command {
 #[derive(Debug, Args)]
 pub(crate) struct ExtractArgs {
     /// The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode, or a
-    /// standard VCF with --feature-source vcf).
+    /// standard VCF with --alignments or --feature-source vcf).
     #[arg(long)]
     pub(crate) vcf: PathBuf,
 
@@ -214,23 +218,36 @@ pub(crate) struct ExtractArgs {
 
     /// The indexed gVCF the VCF was genotyped from. It supplies the raw annotations
     /// (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) when the VCF lacks them, and is not read
-    /// otherwise. Not used with --feature-source vcf.
-    #[arg(long)]
+    /// otherwise. Not used with --alignments or --feature-source vcf.
+    #[arg(long, conflicts_with = "alignments")]
     pub(crate) gvcf: Option<PathBuf>,
 
     /// Where the features of HaplotypeCaller's gVCF-mode annotations (mq, dp_norm, qd,
-    /// as_alt_frac, sor, n_alt) come from: gvcf (the raw annotations of the VCF or of --gvcf), or
-    /// vcf (derived from the VCF's INFO/MQ, INFO/DP, FORMAT/AD, FORMAT/PL and FORMAT/SB or
-    /// INFO/SOR, with as_alt_frac missing; for a VCF without a gVCF). The table records it: models
-    /// train only on tables of one source, and score calls with the features of theirs.
-    #[arg(
-        long,
-        value_name = "SOURCE",
-        default_value_t = FeatureSource::Gvcf,
-        ignore_case = true,
-        value_parser = feature_source_parser()
-    )]
-    pub(crate) feature_source: FeatureSource,
+    /// as_alt_frac, sor, n_alt) come from: gvcf (the raw annotations of the VCF or of --gvcf),
+    /// alignments (qd, sor and n_alt derived from the VCF's FORMAT/AD, FORMAT/PL and FORMAT/SB or
+    /// INFO/SOR, and mq, dp_norm and as_alt_frac measured from the reads of --alignments; for a
+    /// VCF without a gVCF), or vcf (as alignments, but with mq and dp_norm from the VCF's INFO/MQ
+    /// and INFO/DP and as_alt_frac missing; for a VCF without a gVCF or reads). The table records
+    /// it: models train only on tables of one source, and score calls with the features of
+    /// theirs [default: alignments with --alignments, else gvcf].
+    #[arg(long, value_name = "SOURCE", ignore_case = true, value_enum)]
+    pub(crate) feature_source: Option<ExtractSource>,
+
+    /// The indexed BAM or CRAM of the sample's reads, which the alignments feature source
+    /// measures each call's mapping qualities and depth from (see --feature-source and
+    /// --alignment-settings), on --contigs. Needs --reference.
+    #[arg(long, requires = "reference")]
+    pub(crate) alignments: Option<PathBuf>,
+
+    /// Which reads of --alignments are counted at a call, as comma-separated settings over the
+    /// defaults, each at most once: mapqN (only reads with MAPQ >= N: HaplotypeCaller's minimum,
+    /// 20, or 1 in DRAGEN mode; not the high bin, as in `pileup --settings`), flankN (reads within N bases of the call's REF, and the aligned flank bases an indel
+    /// read needs on each side of the repeat tract to be counted at an allele) and bqN (the
+    /// minimum base quality of a SNP base counted at an allele). The table records them as part of
+    /// its feature source: a model scores only calls measured as its training tables were
+    /// [default: mapq20,bq10,flank5].
+    #[arg(long, value_name = "SETTINGS", requires = "alignments")]
+    pub(crate) alignment_settings: Option<ReadAnnotationOptions>,
 
     /// Region BEDs to flag calls in, as NAME=PATH (e.g. segdups=segdups.bed.gz). The names must
     /// match those a model was trained with.
@@ -256,7 +273,8 @@ pub(crate) struct ExtractArgs {
     pub(crate) pileup: Vec<PathBuf>,
 
     /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth (INFO/DP
-    /// with --feature-source vcf) by, in place of the median depth of the calls on --contigs
+    /// with --feature-source vcf, the reads counted with --alignments) by, in place of the median
+    /// depth of the calls on --contigs
     /// [default: that median]; at least 1. Use it for calls of only part of the genome (e.g. a
     /// target footprint), whose median depth is skewed, with the median depth of the sample's
     /// genome-wide calls (which a whole-genome extract logs).
@@ -291,10 +309,37 @@ pub(crate) struct ExtractArgs {
     #[arg(long)]
     pub(crate) truth_bed: Option<PathBuf>,
 
-    /// The indexed reference FASTA used to left-align indels when matching non-PASS calls to the
-    /// truth; without it, alleles are only trimmed.
+    /// The indexed, uncompressed reference FASTA: needed by --alignments (also used to decode
+    /// CRAM), and used to left-align indels when matching non-PASS calls to the truth (without
+    /// it, alleles are only trimmed).
     #[arg(long)]
     pub(crate) reference: Option<PathBuf>,
+}
+
+/// A feature source as `extract --feature-source` names it. It exists so that the value carries no
+/// read settings: the alignments source takes them from --alignment-settings, where
+/// [`FeatureSource::VcfAlignments`] holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ExtractSource {
+    /// The raw annotations of the VCF, or of --gvcf ([`FeatureSource::Gvcf`]).
+    #[value(help = None::<&str>)]
+    Gvcf,
+    /// The VCF's standard annotations ([`FeatureSource::Vcf`]).
+    #[value(help = None::<&str>)]
+    Vcf,
+    /// The VCF's standard annotations and the reads of --alignments
+    /// ([`FeatureSource::VcfAlignments`]).
+    #[value(help = None::<&str>)]
+    Alignments,
+}
+
+impl std::fmt::Display for ExtractSource {
+    /// The source's name on the command line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use clap::ValueEnum as _;
+        let value = self.to_possible_value().expect("every source has a name");
+        f.write_str(value.get_name())
+    }
 }
 
 /// The options of `winnowr train`.
@@ -826,7 +871,8 @@ pub(crate) struct SubsetArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ScoreArgs {
     /// The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode, or a
-    /// standard VCF for models trained on features from the VCF: see `extract --feature-source`).
+    /// standard VCF for models trained on features from the VCF, or from the VCF and the reads:
+    /// see `extract --feature-source`).
     #[arg(long)]
     pub(crate) vcf: PathBuf,
 
@@ -843,12 +889,14 @@ pub(crate) struct ScoreArgs {
     /// The indexed gVCF the VCF was genotyped from; needed only when the VCF lacks the raw
     /// annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) and the models were trained on
     /// features from the gVCF (feature source gvcf). Models trained on features from the VCF
-    /// (`extract --feature-source vcf`) derive them from the VCF, and ignore it.
+    /// (`extract --feature-source vcf`), or from the VCF and the reads (`extract --alignments`),
+    /// ignore it.
     #[arg(long)]
     pub(crate) gvcf: Option<PathBuf>,
 
     /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth (INFO/DP
-    /// for models trained on features from the VCF) by, in place of the median depth of the calls
+    /// for models trained on features from the VCF, the reads counted for models trained on
+    /// features measured from the reads) by, in place of the median depth of the calls
     /// on the models' contigs [default: that median]; at least 1. Use it for calls of only part of
     /// the genome (e.g. a target footprint), whose median depth is skewed, with the median depth
     /// of the sample's genome-wide calls (which a whole-genome extract or score logs), as the
@@ -887,8 +935,11 @@ pub(crate) struct ScoreArgs {
     /// scoring, instead of reading tables: the repeat-length evidence of models with
     /// repeat-length features (as `winnowr strlen`), and the allele read counts of models with
     /// pileup features (as `winnowr pileup`), over the models' contigs, with the settings the
-    /// models were trained with. Needs --reference. The reads are measured while the models that
-    /// do not need them score, each with its own -t threads, so up to twice -t threads run.
+    /// models were trained with. Models trained on features measured from the reads (`extract
+    /// --alignments`) need it: each call's mapping qualities and depth are measured from it
+    /// before any model scores. Needs --reference. Otherwise the reads are measured while the
+    /// models that do not need them score, each with its own -t threads, so up to twice -t
+    /// threads run.
     #[arg(long, requires = "reference")]
     pub(crate) alignments: Option<PathBuf>,
 
@@ -983,13 +1034,6 @@ pub(crate) struct PileupArgs {
     pub(crate) settings: PileupOptions,
 }
 
-/// The parser of `extract --feature-source`: one of [`FeatureSource::ALL`], which `--help` lists.
-fn feature_source_parser() -> impl clap::builder::TypedValueParser<Value = FeatureSource> {
-    use clap::builder::TypedValueParser as _;
-    clap::builder::PossibleValuesParser::new(FeatureSource::ALL.map(|source| source.as_str()))
-        .map(|text| text.parse::<FeatureSource>().expect("a possible value is a feature source"))
-}
-
 /// Checks that the directory an output file of `option` goes in exists, so that a mistyped path
 /// fails before a long pass over the inputs rather than after it. Advisory: the writers still
 /// report a directory that goes missing.
@@ -1044,15 +1088,24 @@ fn strlen(args: &StrlenArgs) -> Result<()> {
 /// Runs `winnowr extract`.
 fn extract(args: &ExtractArgs) -> Result<()> {
     check_output_dir("--output", &args.output)?;
+    let inputs = [
+        ("VCF", Some(args.vcf.as_path()), InputIndexes::Vcf),
+        ("alignments", args.alignments.as_deref(), InputIndexes::Alignments),
+        ("reference", args.reference.as_deref(), InputIndexes::Reference),
+        ("hap.py VCF", args.happy.as_deref(), InputIndexes::Vcf),
+        ("truth VCF", args.truth_vcf.as_deref(), InputIndexes::Vcf),
+        ("truth BED", args.truth_bed.as_deref(), InputIndexes::None),
+    ];
+    check_output_not_inputs(&args.output, &inputs, &args.regions, &args.strlen, &args.pileup)?;
     // Checked before any input is read.
-    let annotations =
-        annotation_inputs(args.feature_source, args.gvcf.as_deref(), UnreadGvcf::Error)?;
+    let feature_source = extract_feature_source(args)?;
+    check_unread_gvcf(feature_source, args.gvcf.as_deref(), UnreadGvcf::Error)?;
     let truth = TruthInputs {
         happy: args.happy.as_deref(),
         happy_pass_only: args.happy_pass_only,
         truth_vcf: args.truth_vcf.as_deref(),
         truth_bed: args.truth_bed.as_deref(),
-        reference: args.reference.as_deref(),
+        reference: truth_reference(args),
     };
     truth.check()?;
     let regions = read_region_sets(&args.regions)?;
@@ -1074,8 +1127,18 @@ fn extract(args: &ExtractArgs) -> Result<()> {
     if let Some(pileup) = &pileup {
         info!("The pileup tables were measured with settings {}", pileup.options);
     }
+    let reads = read_inputs(&args.vcf, args.alignments.as_deref(), args.reference.as_deref());
+    let checks = TableChecks {
+        vcf: &args.vcf,
+        contigs: &args.contigs,
+        regions: &regions,
+        truth: &truth,
+        dp_median: args.dp_median,
+    };
+    let source = prepare_source(feature_source, args.gvcf.as_deref(), reads, None, &checks)?;
     let inputs = TableInputs {
-        annotations,
+        annotations: source.annotations(),
+        outputs: std::slice::from_ref(&args.output),
         regions: &regions,
         strlen: strlen.as_ref(),
         pileup: pileup.as_ref(),
@@ -1090,7 +1153,152 @@ fn extract(args: &ExtractArgs) -> Result<()> {
     Ok(())
 }
 
-/// What [`annotation_inputs`] does with a --gvcf that the VCF feature source does not read.
+/// The reference `extract` matches non-PASS calls to the truth with: --reference, unless it is
+/// there only for --alignments (the truth is not given).
+fn truth_reference(args: &ExtractArgs) -> Option<&Path> {
+    args.reference.as_deref().filter(|_| args.alignments.is_none() || args.truth_vcf.is_some())
+}
+
+/// The reads of `--alignments` and `--reference`, when both are given.
+fn read_inputs<'a>(
+    vcf: &'a Path,
+    alignments: Option<&'a Path>,
+    reference: Option<&'a Path>,
+) -> Option<ReadInputs<'a>> {
+    Some(ReadInputs { vcf, alignments: alignments?, reference: reference? })
+}
+
+/// The inputs of a feature source, with the reads of the alignments source measured.
+#[derive(Debug)]
+enum SourceInputs<'a> {
+    /// The gVCF source, with its gVCF (--gvcf).
+    Gvcf(Option<&'a Path>),
+    /// The VCF source.
+    Vcf,
+    /// The alignments source, its reads measured with `options`.
+    Reads {
+        /// The settings the reads were measured with.
+        options: ReadAnnotationOptions,
+        /// The sites of every SNP and indel record (see [`measure_annotations_and_pileup`]).
+        sites: Vec<MeasuredSite>,
+        /// The pileup evidence measured with them, if asked for.
+        pileup: Option<PileupTables>,
+    },
+}
+
+impl SourceInputs<'_> {
+    /// The inputs of the feature table's raw annotations.
+    fn annotations(&self) -> AnnotationInputs<'_> {
+        match self {
+            SourceInputs::Gvcf(gvcf) => AnnotationInputs::Gvcf(*gvcf),
+            SourceInputs::Vcf => AnnotationInputs::Vcf,
+            SourceInputs::Reads { options, sites, .. } => {
+                AnnotationInputs::VcfAlignments { sites, options: *options }
+            }
+        }
+    }
+
+    /// The pileup evidence measured with the reads.
+    fn pileup(&self) -> Option<&PileupTables> {
+        match self {
+            SourceInputs::Reads { pileup, .. } => pileup.as_ref(),
+            SourceInputs::Gvcf(_) | SourceInputs::Vcf => None,
+        }
+    }
+}
+
+/// What [`prepare_source`] checks of the feature table before a pass over the reads.
+struct TableChecks<'a> {
+    /// The VCF.
+    vcf: &'a Path,
+    /// The contigs the table is of.
+    contigs: &'a [String],
+    /// The region sets the table flags.
+    regions: &'a [RegionSet],
+    /// The truth inputs that label it.
+    truth: &'a TruthInputs<'a>,
+    /// The depth `dp_norm` divides by.
+    dp_median: Option<f64>,
+}
+
+/// The inputs of a feature source for `extract` and `score`: for the alignments source, the reads
+/// (and, with `pileup`, the pileup evidence of those settings) measured at every call (see
+/// [`measure_annotations_and_pileup`]) and summarised (see [`summarise`]). Before that pass, the
+/// table's inputs and the VCF are checked with the checks that building the table runs
+/// ([`check_table_inputs`], [`crate::raw_records::check_vcf`]), so that a mistake fails before
+/// the pass rather than after it.
+///
+/// # Errors
+///
+/// Returns an error if the alignments source is not given the reads, a check fails, the reads
+/// cannot be measured, or no read is counted at any call.
+fn prepare_source<'a>(
+    source: FeatureSource,
+    gvcf: Option<&'a Path>,
+    reads: Option<ReadInputs<'_>>,
+    pileup: Option<PileupOptions>,
+    checks: &TableChecks<'_>,
+) -> Result<SourceInputs<'a>> {
+    let options = match source {
+        FeatureSource::Gvcf => return Ok(SourceInputs::Gvcf(gvcf)),
+        FeatureSource::Vcf => return Ok(SourceInputs::Vcf),
+        FeatureSource::VcfAlignments(options) => options,
+    };
+    let Some(reads) = reads else {
+        bail!(
+            "the {source} feature source measures the calls' mapping qualities and depth from the \
+             reads: pass --alignments and --reference"
+        );
+    };
+    let TableChecks { vcf, contigs, regions, truth, dp_median } = *checks;
+    check_table_inputs(contigs, regions, truth, dp_median)?;
+    crate::raw_records::check_vcf(vcf, source, None, contigs)?;
+    info!(
+        "Measuring the calls' mapping qualities and depth from {} with alignment settings \
+         {options}",
+        reads.alignments.display()
+    );
+    if let Some(pileup) = pileup {
+        info!("Counting the pileup evidence with settings {pileup}");
+    }
+    let mut timer = PhaseTimer::start();
+    let (sites, pileup) = measure_annotations_and_pileup(&reads, contigs, &options, pileup)?;
+    timer.lap("measuring the reads");
+    let calls =
+        sites.iter().filter_map(|site| Some((site.row.chrom.as_str(), site.mapq.as_ref()?)));
+    summarise(calls, contigs, &options)?;
+    Ok(SourceInputs::Reads { options, sites, pileup })
+}
+
+/// The feature source of the table `extract` writes: its --feature-source (by default the
+/// alignments source with --alignments, and the gVCF source without), with the read settings of
+/// --alignment-settings for the alignments source.
+///
+/// # Errors
+///
+/// Returns an error if the alignments source is asked for without --alignments, or --alignments
+/// is given with another source.
+fn extract_feature_source(args: &ExtractArgs) -> Result<FeatureSource> {
+    let default =
+        if args.alignments.is_some() { ExtractSource::Alignments } else { ExtractSource::Gvcf };
+    match (args.feature_source.unwrap_or(default), &args.alignments) {
+        (ExtractSource::Alignments, Some(_)) => {
+            Ok(FeatureSource::VcfAlignments(args.alignment_settings.unwrap_or_default()))
+        }
+        (ExtractSource::Alignments, None) => bail!(
+            "--feature-source alignments measures the mapping qualities and depth from the reads: \
+             pass --alignments and --reference"
+        ),
+        (source, Some(_)) => bail!(
+            "--alignments is read only for the alignments feature source (the default with it), \
+             not --feature-source {source}: leave out one of them"
+        ),
+        (ExtractSource::Vcf, None) => Ok(FeatureSource::Vcf),
+        (ExtractSource::Gvcf, None) => Ok(FeatureSource::Gvcf),
+    }
+}
+
+/// What [`check_unread_gvcf`] does with a --gvcf that the feature source does not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnreadGvcf {
     /// An error (`extract`, where --feature-source vcf and --gvcf contradict each other).
@@ -1099,35 +1307,28 @@ enum UnreadGvcf {
     Warn,
 }
 
-/// Where the raw annotations come from: the feature source, with `gvcf` (--gvcf) for the gVCF
-/// source. The VCF source does not read a given `gvcf`: `unread` says what to do with it.
+/// Checks a given `gvcf` (--gvcf) against the feature source: only the gVCF source reads it, and
+/// for the others `unread` says what to do with it.
 ///
 /// # Errors
 ///
-/// Returns an error if `gvcf` is given with the VCF source and `unread` is
+/// Returns an error if `gvcf` is given with a source that does not read it and `unread` is
 /// [`UnreadGvcf::Error`].
-fn annotation_inputs(
-    source: FeatureSource,
-    gvcf: Option<&Path>,
-    unread: UnreadGvcf,
-) -> Result<AnnotationInputs<'_>> {
-    match (source, gvcf) {
-        (FeatureSource::Gvcf, gvcf) => Ok(AnnotationInputs::Gvcf(gvcf)),
-        (FeatureSource::Vcf, None) => Ok(AnnotationInputs::Vcf),
-        (FeatureSource::Vcf, Some(gvcf)) => match unread {
-            UnreadGvcf::Error => bail!(
-                "--feature-source vcf derives the features from the VCF alone, and does not read \
-                 --gvcf: leave out --gvcf, or use --feature-source gvcf"
-            ),
-            UnreadGvcf::Warn => {
-                log::warn!(
-                    "the models were trained on features from the VCF (feature source vcf), so \
-                     --gvcf {} is ignored",
-                    gvcf.display()
-                );
-                Ok(AnnotationInputs::Vcf)
-            }
-        },
+fn check_unread_gvcf(source: FeatureSource, gvcf: Option<&Path>, unread: UnreadGvcf) -> Result<()> {
+    match (source, gvcf, unread) {
+        (FeatureSource::Gvcf, _, _) | (_, None, _) => Ok(()),
+        (_, Some(_), UnreadGvcf::Error) => bail!(
+            "the {source} feature source derives the features from the VCF, and does not read \
+             --gvcf: leave out --gvcf, or use --feature-source gvcf"
+        ),
+        (_, Some(gvcf), UnreadGvcf::Warn) => {
+            log::warn!(
+                "the models were trained on features from feature source {source}, not from a \
+                 gVCF, so --gvcf {} is ignored",
+                gvcf.display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -1220,7 +1421,8 @@ fn read_training_infos(paths: &[PathBuf]) -> Result<TrainingInfos> {
         |first, other| {
             anyhow::anyhow!(
                 "--tables hold features from different sources: {}'s from {}, {}'s from {}; \
-                 extract every training table with the same --feature-source",
+                 extract every training table with the same --feature-source (and, with \
+                 --alignments, the same --alignment-settings)",
                 first.sample,
                 first.feature_source,
                 other.sample,
@@ -1768,15 +1970,20 @@ fn check_table_feature_source(
         sources,
         |&(_, source)| source,
         |&(_, measured), &(path, trained)| {
-            let gvcf = if trained == FeatureSource::Gvcf {
-                " (with --gvcf if the VCF lacks the raw annotations)"
-            } else {
-                ""
+            // The `extract` options that give a table of the model's source.
+            let options = match trained {
+                FeatureSource::Gvcf => "--feature-source gvcf (with --gvcf if the VCF lacks the \
+                                        raw annotations)"
+                    .to_string(),
+                FeatureSource::Vcf => "--feature-source vcf".to_string(),
+                FeatureSource::VcfAlignments(settings) => {
+                    format!("--alignments, --reference and --alignment-settings {settings}")
+                }
             };
             anyhow::anyhow!(
                 "feature table {} holds features from `{measured}`, but model {} was trained on \
-                 features from `{trained}`: extract the table again with --feature-source \
-                 {trained}{gvcf}, or use a model trained on `{measured}` features",
+                 features from `{trained}`: extract the table again with {options}, or use a \
+                 model trained on `{measured}` features",
                 table.display(),
                 path.expect("only the table has no path").display()
             )
@@ -1801,7 +2008,8 @@ fn models_feature_source(models: &[WinnowrModel], paths: &[PathBuf]) -> Result<F
             .collect();
         anyhow::anyhow!(
             "--models were trained on features from different sources ({}): score with models \
-             trained on tables of one --feature-source",
+             trained on tables of one --feature-source (and, with --alignments, the same \
+             --alignment-settings)",
             described.join("; ")
         )
     };
@@ -1849,15 +2057,35 @@ fn warn_policy_only_regions(regions: &[NamedBed]) {
     }
 }
 
+/// The read settings of the alignments feature source, if the models were trained on it.
+///
+/// # Errors
+///
+/// Returns an error, naming a model, if they were and `score` is not given the reads to measure.
+fn models_read_annotations(
+    feature_source: FeatureSource,
+    args: &ScoreArgs,
+) -> Result<Option<ReadAnnotationOptions>> {
+    let FeatureSource::VcfAlignments(options) = feature_source else { return Ok(None) };
+    if args.alignments.is_none() {
+        bail!(
+            "model {} was trained on features measured from the reads (feature source \
+             {feature_source}): pass --alignments and --reference",
+            args.models[0].display()
+        );
+    }
+    Ok(Some(options))
+}
+
 /// The inputs of the feature table `score` builds: the raw annotations' inputs of the models'
-/// feature source (see [`annotation_inputs`]), `regions`, the repeat-length and pileup evidence,
+/// feature source (see [`prepare_source`]), `regions`, the repeat-length and pileup evidence,
 /// and the depth median of the command line, with no truth labels.
 fn score_table_inputs<'a>(
     args: &'a ScoreArgs,
     annotations: AnnotationInputs<'a>,
     regions: &'a [RegionSet],
     strlen: Option<&'a crate::strlen::StrlenTables>,
-    pileup: Option<&'a crate::pileup::PileupTables>,
+    pileup: Option<&'a PileupTables>,
 ) -> TableInputs<'a> {
     TableInputs {
         annotations,
@@ -2030,9 +2258,99 @@ fn subset(args: &SubsetArgs) -> Result<()> {
     Ok(())
 }
 
+/// The index candidates for an input; variant files use the reader's format detection.
+#[derive(Clone, Copy)]
+enum InputIndexes {
+    None,
+    Vcf,
+    Alignments,
+    Reference,
+}
+
+impl InputIndexes {
+    fn paths(self, path: &Path) -> Vec<PathBuf> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Vcf => crate::vcf::index_candidates(path),
+            Self::Alignments => {
+                use std::io::Read as _;
+                let mut magic = [0; 4];
+                let cram = std::fs::File::open(path).ok().is_some_and(|mut file| {
+                    file.read_exact(&mut magic).is_ok() && &magic == b"CRAM"
+                });
+                if cram {
+                    crate::vcf::index_paths(path, &["crai"])
+                } else {
+                    crate::vcf::local_index_paths(path, &["csi", "bai"])
+                }
+            }
+            Self::Reference => crate::vcf::appended_index_paths(path, &["fai", "gzi"]),
+        }
+    }
+}
+
+/// Checks that a command's `output` is none of its input files: `inputs` (each with what it is,
+/// if given, and the kind of indexes read with it, which are checked too), the region
+/// BEDs, and the strlen and pileup tables. Checked before any input is read, so that a run that
+/// would overwrite one fails at once.
+///
+/// # Errors
+///
+/// Returns an error naming the input the output is.
+fn check_output_not_inputs(
+    output: &Path,
+    inputs: &[(&str, Option<&Path>, InputIndexes)],
+    regions: &[NamedBed],
+    strlen: &[PathBuf],
+    pileup: &[PathBuf],
+) -> Result<()> {
+    let given = inputs.iter().filter_map(|&(what, path, indexes)| Some((what, path?, indexes)));
+    crate::scoring::check_output_not_input(
+        output,
+        given.clone().map(|(what, path, _)| (what, path)),
+    )?;
+    for (what, path, kind) in given {
+        let indexes = kind.paths(path);
+        let what = format!("{what} index");
+        if matches!(kind, InputIndexes::Vcf | InputIndexes::Alignments) {
+            crate::scoring::check_output_not_indexes(output, &what, &indexes)?;
+        } else {
+            // FASTA sidecars are independent inputs, not alternatives in an index search.
+            crate::scoring::check_output_not_input(
+                output,
+                indexes.iter().map(|path| (what.as_str(), path.as_path())),
+            )?;
+        }
+    }
+    let beds = regions.iter().map(|bed| ("region BED", bed.path.as_path()));
+    let tables = strlen
+        .iter()
+        .map(|table| ("strlen table", table.as_path()))
+        .chain(pileup.iter().map(|table| ("pileup table", table.as_path())));
+    crate::scoring::check_output_not_input(output, beds.chain(tables))
+}
+
 /// Runs `winnowr score`.
 fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
     check_output_dir("--output", &args.output)?;
+    // Checked again (for the VCF) as it is written, but now too, before any pass over the reads.
+    // Optional inputs are checked once the models say whether they are read.
+    let inputs = [("VCF", Some(args.vcf.as_path()), InputIndexes::Vcf)];
+    // The index written beside the output must be none of them either.
+    let outputs: Vec<PathBuf> = std::iter::once(args.output.clone())
+        .chain(crate::scoring::scored_vcf_index(&args.output))
+        .collect();
+    for output in &outputs {
+        check_output_not_inputs(output, &inputs, &[], &[], &[])?;
+        let models = args.models.iter().map(|model| ("model", model.as_path()));
+        crate::scoring::check_output_not_input(output, models)?;
+    }
+    if let Some(output_index) = crate::scoring::scored_vcf_index(&args.output) {
+        crate::scoring::check_output_not_input(
+            &output_index,
+            [("scored VCF", args.output.as_path())],
+        )?;
+    }
     let models = load_models(&args.models, threads)?;
     let supplied: Vec<&str> = args.regions.iter().map(|r| r.name.as_str()).collect();
     for (path, model) in args.models.iter().zip(&models) {
@@ -2067,12 +2385,28 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         log::warn!("no model uses the --regions {}; they are ignored", unused.join(", "));
     }
     let feature_source = models_feature_source(&models, &args.models)?;
-    let annotations = annotation_inputs(feature_source, args.gvcf.as_deref(), UnreadGvcf::Warn)?;
+    check_unread_gvcf(feature_source, args.gvcf.as_deref(), UnreadGvcf::Warn)?;
+    let read_annotations = models_read_annotations(feature_source, args)?;
     let needs_strlen = models_using::<StrlenOptions>(&models, &args.models);
     let needs_pileup = models_using::<PileupOptions>(&models, &args.models);
+    let uses_reads =
+        read_annotations.is_some() || !needs_strlen.is_empty() || !needs_pileup.is_empty();
+    let inputs = [
+        ("alignments", args.alignments.as_deref().filter(|_| uses_reads), InputIndexes::Alignments),
+        ("reference", args.reference.as_deref().filter(|_| uses_reads), InputIndexes::Reference),
+    ];
+    for output in &outputs {
+        check_output_not_inputs(
+            output,
+            &inputs,
+            &[],
+            if needs_strlen.is_empty() { &[] } else { &args.strlen },
+            if needs_pileup.is_empty() { &[] } else { &args.pileup },
+        )?;
+    }
     check_supplied::<StrlenOptions>(&needs_strlen, &args.strlen, args.alignments.is_some())?;
     check_supplied::<PileupOptions>(&needs_pileup, &args.pileup, args.alignments.is_some())?;
-    if needs_strlen.is_empty() && needs_pileup.is_empty() && args.alignments.is_some() {
+    if !uses_reads && args.alignments.is_some() {
         log::warn!("no model uses repeat-length or pileup features; --alignments is ignored");
     }
     // The settings the models' evidence must be measured with.
@@ -2084,8 +2418,10 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
     // conflicts with --strlen and --pileup, so nothing is both read and measured).
     let measure = match (&args.alignments, &args.reference) {
         (Some(alignments), Some(reference)) => {
-            // Some exactly when a model uses the evidence.
-            let (strlen, pileup) = (strlen_options, pileup_options);
+            // Some exactly when a model uses the evidence. With the alignments feature source,
+            // the pileup is counted with the read annotations, before the table is built.
+            let strlen = strlen_options;
+            let pileup = pileup_options.filter(|_| read_annotations.is_none());
             if let Some(options) = strlen {
                 info!(
                     "Measuring the repeat-length evidence with the models' read settings {options}"
@@ -2120,12 +2456,41 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         .cloned()
         .collect();
     let regions = read_region_sets(&used)?;
-    let sample = summary.sample_name(&args.vcf);
-    let inputs = score_table_inputs(args, annotations, &regions, strlen.as_ref(), pileup.as_ref());
-    let table = build_feature_table(&sample, &args.vcf, contigs, &summary, &inputs)?;
-    let mut timer = PhaseTimer::start();
+    // The policy, and the BEDs only it reads, are checked before any pass over the reads.
     let policy =
         args.policy.policy(args.mode, contigs, &args.regions, has_indel_genotype(&models))?;
+    // Unused BED arguments are ignored, including ones naming an existing output on a rerun.
+    let policy_bed = args.regions.iter().find(|r| r.name == NOT_DIFFICULT_REGIONS);
+    let protected_beds = used.iter().chain(policy_bed.filter(|_| policy.abstain.is_some()));
+    for output in &outputs {
+        crate::scoring::check_output_not_input(
+            output,
+            protected_beds.clone().map(|bed| ("region BED", bed.path.as_path())),
+        )?;
+    }
+    let sample = summary.sample_name(&args.vcf);
+    // The alignments feature source's annotations are measured before the table is built, as
+    // dp_norm needs every call's depth; so is the pileup evidence, in the same pass when it
+    // reads alleles alike.
+    let reads = read_inputs(&args.vcf, args.alignments.as_deref(), args.reference.as_deref());
+    let truth = TruthInputs::default();
+    let checks = TableChecks {
+        vcf: &args.vcf,
+        contigs,
+        regions: &regions,
+        truth: &truth,
+        dp_median: args.dp_median,
+    };
+    let pileup_with_reads = pileup_options.filter(|_| read_annotations.is_some());
+    let source =
+        prepare_source(feature_source, args.gvcf.as_deref(), reads, pileup_with_reads, &checks)?;
+    // --pileup conflicts with --alignments, so the pileup is either read or measured.
+    let pileup = pileup.as_ref().or(source.pileup());
+    let mut inputs =
+        score_table_inputs(args, source.annotations(), &regions, strlen.as_ref(), pileup);
+    inputs.outputs = &outputs;
+    let table = build_feature_table(&sample, &args.vcf, contigs, &summary, &inputs)?;
+    let mut timer = PhaseTimer::start();
     let decisions = match measure {
         None => decide_calls(&table, &models, &policy)?,
         Some((measure, strlen, pileup)) => {
@@ -3027,14 +3392,57 @@ mod tests {
             );
         }
 
+        #[rstest]
+        #[case::gzip("scored.vcf.gz")]
+        #[case::bgzf("scored.vcf.bgz")]
+        #[case::bcf("scored.bcf")]
+        fn score_rejects_output_index_alias_before_loading_models(
+            #[case] name: &str,
+            #[values(false, true)] hard_link: bool,
+        ) {
+            let dir = tempfile::TempDir::new().unwrap();
+            write_calls(dir.path());
+            let vcf = dir.path().join("calls.vcf.gz");
+            let model = dir.path().join("missing.winnowr.json");
+            let output = dir.path().join(name);
+            let sidecar = crate::scoring::scored_vcf_index(&output).unwrap();
+            let before = b"preserve the existing scored output";
+            std::fs::write(&output, before).unwrap();
+            if hard_link {
+                std::fs::hard_link(&output, &sidecar).unwrap();
+            } else {
+                std::os::unix::fs::symlink(name, &sidecar).unwrap();
+            }
+            let error = format!(
+                "{:#}",
+                try_run(&[
+                    "score",
+                    "--vcf",
+                    vcf.to_str().unwrap(),
+                    "--models",
+                    model.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                ])
+                .unwrap_err()
+            );
+            assert!(error.ends_with("is the input scored VCF; write to another path"), "{error}");
+            assert_eq!(std::fs::read(&output).unwrap(), before);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+        }
+
         /// score derives a vcf-source model's features from the VCF, which only that source can
-        /// read; a --gvcf is ignored (so it need not exist).
+        /// read; a --gvcf is ignored (so it need not exist, and it may be the output, as on a
+        /// rerun).
         #[test]
         fn score_derives_the_features_of_vcf_source_models_from_the_vcf() {
             let setup = VcfSourceModel::new();
-            for (output, extra) in
-                [("scored.vcf.gz", &[][..]), ("ignored.vcf.gz", &["--gvcf", "absent.g.vcf.gz"][..])]
-            {
+            let rerun = setup.path("scored.vcf.gz");
+            for (output, extra) in [
+                ("scored.vcf.gz", &[][..]),
+                ("ignored.vcf.gz", &["--gvcf", "absent.g.vcf.gz"][..]),
+                ("scored.vcf.gz", &["--gvcf", rerun.as_str()][..]),
+            ] {
                 let (vcf, model) = (setup.path("default.vcf.gz"), setup.model());
                 let base = ["score", "--vcf", &vcf, "--models", &model];
                 run(&[&base[..], &["-o", &setup.path(output)], extra].concat());
@@ -3042,6 +3450,545 @@ mod tests {
                 let records = scored.lines().filter(|line| !line.starts_with('#'));
                 assert_eq!(records.filter(|r| r.contains("WINNOWR_P=")).count(), CALLS);
             }
+        }
+
+        #[rstest]
+        #[case::raw_present(true, true)]
+        #[case::header_missing(false, false)]
+        #[case::records_missing(true, false)]
+        fn gvcf_output_protection_follows_actual_consumption(
+            #[case] declared: bool,
+            #[case] present: bool,
+        ) {
+            let setup = VcfSourceModel::new();
+            let model_path = setup.model();
+            let mut model = WinnowrModel::load(&model_path, NonZeroUsize::new(1).unwrap()).unwrap();
+            model.info.feature_source = FeatureSource::Gvcf;
+            model.save(&model_path).unwrap();
+            let vcf = if !declared {
+                setup.path("default.vcf.gz")
+            } else if present {
+                setup.path("calls.vcf.gz")
+            } else {
+                let text = read_gzip(&setup.dir.path().join("calls.vcf.gz"));
+                let mut stripped = String::new();
+                for line in text.lines() {
+                    if line.starts_with('#') {
+                        stripped.push_str(line);
+                    } else {
+                        let mut columns: Vec<String> =
+                            line.split('\t').map(str::to_string).collect();
+                        columns[7] = columns[7]
+                            .split(';')
+                            .filter(|field| {
+                                !crate::gvcf::RAW_ANNOTATION_INFO
+                                    .contains(&field.split('=').next().unwrap())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(";");
+                        stripped.push_str(&columns.join("\t"));
+                    }
+                    stripped.push('\n');
+                }
+                let path = setup.path("declared.vcf.gz");
+                write_bgzf_indexed(Path::new(&path), &stripped);
+                path
+            };
+            for command in ["score", "extract"] {
+                for sidecar in [false, true] {
+                    if sidecar && command == "extract" {
+                        continue;
+                    }
+                    for index in [false, true] {
+                        let ext = if command == "score" { "vcf.gz" } else { "parquet" };
+                        let output = setup.path(&format!("{command}-{sidecar}-{index}.{ext}"));
+                        let target = format!("{output}{}", if sidecar { ".tbi" } else { "" });
+                        let gvcf = if index {
+                            let path = format!("{output}.g.vcf.gz");
+                            std::os::unix::fs::symlink(&target, format!("{path}.csi")).unwrap();
+                            path
+                        } else {
+                            target.clone()
+                        };
+                        let mut args = vec![command, "--vcf", &vcf, "--gvcf", &gvcf, "-o", &output];
+                        if command == "score" {
+                            args.extend(["--models", &model_path]);
+                        } else {
+                            args.extend(["--contigs", "chr1"]);
+                        }
+                        if present {
+                            for _ in 0..2 {
+                                try_run(&args).unwrap();
+                            }
+                            if command == "score" {
+                                assert!(read_gzip(Path::new(&output)).contains("WINNOWR_P="));
+                            } else {
+                                FeatureTable::read_parquet(&output).unwrap();
+                            }
+                        } else {
+                            std::fs::write(&target, b"preserve me").unwrap();
+                            let error = format!("{:#}", try_run(&args).unwrap_err());
+                            let what = if index { "gVCF index" } else { "gVCF" };
+                            assert!(
+                                error.ends_with(&format!(
+                                    "is the input {what}; write to another path"
+                                )),
+                                "{error}"
+                            );
+                            assert_eq!(std::fs::read(&target).unwrap(), b"preserve me");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[rstest]
+        #[case::score_vcf("score", false)]
+        #[case::extract_vcf("extract", false)]
+        #[case::score_gvcf("score", true)]
+        #[case::extract_gvcf("extract", true)]
+        fn new_outputs_cannot_mask_consumed_variant_indexes(
+            #[case] command: &str,
+            #[case] gvcf: bool,
+        ) {
+            let setup = VcfSourceModel::new();
+            let model_path = setup.model();
+            if gvcf {
+                let mut model =
+                    WinnowrModel::load(&model_path, NonZeroUsize::new(1).unwrap()).unwrap();
+                model.info.feature_source = FeatureSource::Gvcf;
+                model.save(&model_path).unwrap();
+            }
+            let vcf = setup.path("default.vcf.gz");
+            let source = if gvcf { setup.path("calls.vcf.gz") } else { vcf.clone() };
+            let candidate = format!("{source}.csi");
+            let tbi = format!("{source}.tbi");
+            let before = std::fs::read(&tbi).unwrap();
+            for sidecar in [false, true] {
+                if sidecar && command == "extract" {
+                    continue;
+                }
+                let output = if sidecar {
+                    let output = setup.path("output.vcf.gz");
+                    std::os::unix::fs::symlink(format!("{output}.tbi"), &candidate).unwrap();
+                    output
+                } else {
+                    candidate.clone()
+                };
+                let mut args = vec![command, "--vcf", &vcf, "-o", &output];
+                if command == "score" {
+                    args.extend(["--models", &model_path]);
+                } else {
+                    args.extend(["--contigs", "chr1"]);
+                    if !gvcf {
+                        args.extend(["--feature-source", "vcf"]);
+                    }
+                }
+                if gvcf {
+                    args.extend(["--gvcf", &source]);
+                }
+                let error = format!("{:#}", try_run(&args).unwrap_err());
+                let what = if gvcf { "gVCF" } else { "VCF" };
+                assert!(error.contains(&format!("would mask the input {what} index")), "{error}");
+                assert_eq!(std::fs::read(&tbi).unwrap(), before);
+                assert!(!Path::new(&candidate).exists());
+                assert!(!Path::new(&output).exists());
+            }
+        }
+
+        #[test]
+        fn new_outputs_cannot_mask_consumed_alignment_indexes() {
+            let setup = AlignmentsModel::new();
+            let candidate = setup.path("reads.bam.csi");
+            let bai = setup.path("reads.bam.bai");
+            let before = std::fs::read(&bai).unwrap();
+            let reads = setup.reads();
+            let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+            for sidecar in [false, true] {
+                let output = if sidecar { "output.vcf.gz" } else { "reads.bam.csi" };
+                if sidecar {
+                    std::os::unix::fs::symlink(format!("{}.tbi", setup.path(output)), &candidate)
+                        .unwrap();
+                }
+                let error = format!("{:#}", setup.score(output, &reads).unwrap_err());
+                assert!(error.contains("would mask the input alignments index"), "{error}");
+                assert_eq!(std::fs::read(&bai).unwrap(), before);
+                assert!(!Path::new(&candidate).exists());
+            }
+        }
+
+        #[rstest]
+        #[case::ordinary("calls.vcf.gz", "calls.vcf")]
+        #[case::dotted_parent("batch.v1/calls", "batch")]
+        fn local_variant_index_order_matches_htslib(#[case] data: &str, #[case] replacement: &str) {
+            let setup = VcfSourceModel::new();
+            let vcf = setup.dir.path().join(data);
+            std::fs::create_dir_all(vcf.parent().unwrap()).unwrap();
+            std::fs::copy(setup.path("default.vcf.gz"), &vcf).unwrap();
+            let appended_csi = format!("{}.csi", vcf.display());
+            rust_htslib::bcf::index::build(&vcf, None, 1, rust_htslib::bcf::index::Type::Csi(14))
+                .unwrap();
+            let csi = setup.path(&format!("{replacement}.csi"));
+            std::fs::rename(&appended_csi, &csi).unwrap();
+            std::fs::copy(setup.path("default.vcf.gz.tbi"), format!("{}.tbi", vcf.display()))
+                .unwrap();
+            assert_eq!(
+                crate::vcf::index_candidates(&vcf),
+                vec![
+                    PathBuf::from(&appended_csi),
+                    PathBuf::from(&csi),
+                    PathBuf::from(format!("{}.tbi", vcf.display())),
+                    PathBuf::from(setup.path(&format!("{replacement}.tbi")))
+                ]
+            );
+            crate::vcf::open_indexed(&vcf).unwrap();
+            let before = std::fs::read(&csi).unwrap();
+            for sidecar in [false, true] {
+                let output = if sidecar {
+                    let output = setup.path("sidecar.vcf.gz");
+                    std::os::unix::fs::symlink(&csi, format!("{output}.tbi")).unwrap();
+                    output
+                } else {
+                    csi.clone()
+                };
+                let error = format!(
+                    "{:#}",
+                    try_run(&[
+                        "score",
+                        "--vcf",
+                        vcf.to_str().unwrap(),
+                        "--models",
+                        &setup.model(),
+                        "-o",
+                        &output
+                    ])
+                    .unwrap_err()
+                );
+                assert!(
+                    error.ends_with("is the input VCF index; write to another path"),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read(&csi).unwrap(), before);
+            }
+            std::fs::write(&csi, b"not an index").unwrap();
+            let error = crate::vcf::open_indexed(&vcf).map(|_| ()).unwrap_err().to_string();
+            assert!(error.ends_with("is not a tabix or CSI index"), "{error}");
+            assert!(
+                !crate::vcf::has_index(&vcf),
+                "a later TBI cannot override the CSI htslib selects"
+            );
+            std::fs::remove_file(&csi).unwrap();
+            std::fs::create_dir(&csi).unwrap();
+            assert!(!crate::vcf::has_index(&vcf), "htslib also selects a CSI directory");
+            let error = crate::vcf::open_indexed(&vcf).map(|_| ()).unwrap_err().to_string();
+            assert!(error.ends_with("is not a tabix or CSI index"), "{error}");
+        }
+
+        #[test]
+        fn index_replacement_preserves_native_paths_and_loader_rules() {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let data =
+                PathBuf::from(std::ffi::OsString::from_vec(b"native\xff/batch.v1/calls".to_vec()));
+            let paths = crate::vcf::local_index_paths(&data, &["csi"]);
+            assert_eq!(paths[0].as_os_str().as_bytes(), b"native\xff/batch.v1/calls.csi");
+            assert_eq!(paths[1].as_os_str().as_bytes(), b"native\xff/batch.csi");
+            for (input, expected) in [
+                ("calls", vec!["calls.csi"]),
+                (".calls", vec![".calls.csi"]),
+                ("dir/.calls", vec!["dir/.calls.csi", "dir/.csi"]),
+                ("../calls", vec!["../calls.csi", "..csi"]),
+            ] {
+                assert_eq!(
+                    crate::vcf::local_index_paths(Path::new(input), &["csi"]),
+                    expected.iter().map(PathBuf::from).collect::<Vec<_>>()
+                );
+            }
+            let dir = tempfile::TempDir::new().unwrap();
+            let cram = dir.path().join("batch.v1/reads");
+            std::fs::create_dir_all(cram.parent().unwrap()).unwrap();
+            std::fs::write(&cram, b"CRAM").unwrap();
+            let crai = PathBuf::from(format!("{}.crai", cram.display()));
+            assert!(InputIndexes::Alignments.paths(&cram).iter().all(|path| path == &crai));
+            assert!(!InputIndexes::Reference.paths(&cram).contains(&dir.path().join("batch.fai")));
+            assert!(!InputIndexes::Reference.paths(&cram).contains(&dir.path().join("batch.gzi")));
+        }
+
+        #[rstest]
+        #[case::csi("csi")]
+        #[case::bai("bai")]
+        fn dotted_parent_alignment_indexes_are_protected(#[case] extension: &str) {
+            let setup = AlignmentsModel::new();
+            let bam = setup.path("batch.v1/reads");
+            std::fs::create_dir_all(Path::new(&bam).parent().unwrap()).unwrap();
+            std::fs::copy(setup.path("reads.bam"), &bam).unwrap();
+            let index = setup.path(&format!("batch.{extension}"));
+            let kind = if extension == "csi" {
+                rust_htslib::bam::index::Type::Csi(14)
+            } else {
+                rust_htslib::bam::index::Type::Bai
+            };
+            rust_htslib::bam::index::build(&bam, Some(&index), kind, 1).unwrap();
+            let before = std::fs::read(&index).unwrap();
+            for sidecar in [false, true] {
+                let output = if sidecar {
+                    "sidecar.vcf.gz".to_string()
+                } else {
+                    format!("batch.{extension}")
+                };
+                if sidecar {
+                    std::os::unix::fs::symlink(&index, format!("{}.tbi", setup.path(&output)))
+                        .unwrap();
+                }
+                let error = format!(
+                    "{:#}",
+                    setup
+                        .score(
+                            &output,
+                            &["--alignments", &bam, "--reference", &setup.path("ref.fa")]
+                        )
+                        .unwrap_err()
+                );
+                assert!(
+                    error.ends_with("is the input alignments index; write to another path"),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read(&index).unwrap(), before);
+            }
+        }
+
+        #[test]
+        fn hidden_cram_index_is_protected_before_opening_reads() {
+            let setup = AlignmentsModel::new();
+            let cram = setup.path(".reads");
+            let index = setup.path(".crai");
+            std::fs::write(&cram, b"CRAM").unwrap();
+            std::fs::write(&index, b"preserve the hidden CRAI").unwrap();
+            for output in [".crai", "hidden.vcf.gz"] {
+                if output.ends_with(".gz") {
+                    std::os::unix::fs::symlink(&index, format!("{}.tbi", setup.path(output)))
+                        .unwrap();
+                }
+                let error = format!(
+                    "{:#}",
+                    setup
+                        .score(
+                            output,
+                            &["--alignments", &cram, "--reference", &setup.path("ref.fa")]
+                        )
+                        .unwrap_err()
+                );
+                assert!(
+                    error.ends_with("is the input alignments index; write to another path"),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read(&index).unwrap(), b"preserve the hidden CRAI");
+            }
+        }
+
+        #[test]
+        fn unused_replaced_fasta_indexes_do_not_block_reruns() {
+            let setup = AlignmentsModel::new();
+            let fasta = setup.dir.path().join("ref.fa");
+            assert_eq!(
+                InputIndexes::Reference.paths(&fasta),
+                vec![setup.dir.path().join("ref.fa.fai"), setup.dir.path().join("ref.fa.gzi")]
+            );
+            let index = setup.path("ref.fa.fai");
+            let before = std::fs::read(&index).unwrap();
+            let reads = setup.reads();
+            let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+            for output in ["ref.fai", "ref.gzi"] {
+                for _ in 0..2 {
+                    setup.score(output, &reads).unwrap();
+                }
+                let scored = std::fs::read_to_string(setup.path(output)).unwrap();
+                assert_eq!(
+                    scored
+                        .lines()
+                        .filter(|line| !line.starts_with('#') && line.contains("WINNOWR_P="))
+                        .count(),
+                    CALLS
+                );
+            }
+            assert_eq!(std::fs::read(&index).unwrap(), before);
+        }
+
+        #[test]
+        fn bcf_tabix_names_are_not_protected_inputs() {
+            let setup = VcfSourceModel::new();
+            let (vcf, bcf, model) =
+                (setup.path("default.vcf.gz"), setup.path("calls.bcf"), setup.model());
+            crate::scoring::write_scored_vcf(
+                Path::new(&vcf),
+                Path::new(&bcf),
+                std::collections::HashMap::new(),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .unwrap();
+            let csi = format!("{bcf}.csi");
+            let before = std::fs::read(&csi).unwrap();
+            for name in ["calls.bcf.tbi", "calls.tbi"] {
+                let output = setup.path(name);
+                for _ in 0..2 {
+                    run(&["score", "--vcf", &bcf, "--models", &model, "-o", &output]);
+                    let scored = std::fs::read_to_string(&output).unwrap();
+                    assert_eq!(
+                        scored
+                            .lines()
+                            .filter(|r| !r.starts_with('#') && r.contains("WINNOWR_P="))
+                            .count(),
+                        CALLS
+                    );
+                }
+                run(&[
+                    "extract",
+                    "--vcf",
+                    &bcf,
+                    "--feature-source",
+                    "vcf",
+                    "--contigs",
+                    "chr1",
+                    "-o",
+                    &output,
+                ]);
+                FeatureTable::read_parquet(&output).unwrap();
+            }
+            let error = format!(
+                "{:#}",
+                try_run(&["score", "--vcf", &bcf, "--models", &model, "-o", &csi]).unwrap_err()
+            );
+            assert!(error.ends_with("is the input VCF index; write to another path"), "{error}");
+            assert_eq!(std::fs::read(&csi).unwrap(), before);
+        }
+
+        #[rstest]
+        #[case::bam("--alignments", "")]
+        #[case::bai("--alignments", ".bai")]
+        #[case::csi("--alignments", ".csi")]
+        #[case::crai("--alignments", ".crai")]
+        #[case::fasta("--reference", "")]
+        #[case::fai("--reference", ".fai")]
+        #[case::gzi("--reference", ".gzi")]
+        #[case::pileup("--pileup", "")]
+        #[case::strlen("--strlen", "")]
+        fn unused_evidence_does_not_prevent_scoring_again(
+            #[case] option: &str,
+            #[case] index: &str,
+        ) {
+            let setup = VcfSourceModel::new();
+            let (vcf, model) = (setup.path("default.vcf.gz"), setup.model());
+            for suffix in ["", ".tbi"] {
+                let output = setup.path(&format!("rerun{suffix}.vcf.gz"));
+                let alias = format!("{output}{suffix}");
+                let input = if index.is_empty() {
+                    alias
+                } else {
+                    let input = format!("{output}.ignored");
+                    std::os::unix::fs::symlink(alias, format!("{input}{index}")).unwrap();
+                    input
+                };
+                let mut args =
+                    vec!["score", "--vcf", &vcf, "--models", &model, "-o", &output, option, &input];
+                let missing = setup.path("missing");
+                match option {
+                    "--alignments" => args.extend(["--reference", &missing]),
+                    "--reference" => args.extend(["--alignments", &missing]),
+                    _ => {}
+                }
+                for _ in 0..2 {
+                    try_run(&args).unwrap();
+                    let scored = read_gzip(Path::new(&output));
+                    assert_eq!(
+                        scored
+                            .lines()
+                            .filter(|r| !r.starts_with('#') && r.contains("WINNOWR_P="))
+                            .count(),
+                        CALLS
+                    );
+                }
+            }
+        }
+
+        #[rstest]
+        #[case::pileup(false)]
+        #[case::strlen(true)]
+        fn consumed_evidence_is_protected_before_loading(#[case] strlen: bool) {
+            let (dir, model_path) = if strlen {
+                let setup = VcfSourceModel::new();
+                let model = setup.model();
+                (setup.dir, model)
+            } else {
+                let setup = AlignmentsModel::new();
+                let model = setup.path("reads.winnowr.json");
+                (setup.dir, model)
+            };
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            let mut model = WinnowrModel::load(&model_path, NonZeroUsize::new(1).unwrap()).unwrap();
+            model.info.feature_source = FeatureSource::Vcf;
+            let table_option = if strlen {
+                model.info.stutter = Some(crate::testing::fit_stutter_model(&[]));
+                "--strlen"
+            } else {
+                "--pileup"
+            };
+            model.save(&model_path).unwrap();
+            let (vcf, protected, bam, fasta) = (
+                path("default.vcf.gz"),
+                path("protected"),
+                path("missing.bam"),
+                path("missing.fa"),
+            );
+            std::fs::write(&protected, b"not a readable evidence input").unwrap();
+            std::os::unix::fs::symlink(&protected, format!("{bam}.bai")).unwrap();
+            std::os::unix::fs::symlink(&protected, format!("{fasta}.fai")).unwrap();
+            for what in ["table", "alignments", "reference", "alignments index", "reference index"]
+            {
+                for suffix in ["", ".tbi"] {
+                    let output = path(&format!("{}{}.vcf.gz", what.replace(' ', "_"), suffix));
+                    std::os::unix::fs::symlink(&protected, format!("{output}{suffix}")).unwrap();
+                    let mut args =
+                        vec!["score", "--vcf", &vcf, "--models", &model_path, "-o", &output];
+                    let expected = if what == "table" {
+                        args.extend([table_option, &protected]);
+                        format!("{} table", if strlen { "strlen" } else { "pileup" })
+                    } else {
+                        let reads = if what == "alignments" { &protected } else { &bam };
+                        let reference = if what == "reference" { &protected } else { &fasta };
+                        // Only the selected index aliases the protected file.
+                        if what == "reference index" {
+                            std::fs::remove_file(format!("{bam}.bai")).unwrap();
+                        }
+                        args.extend(["--alignments", reads, "--reference", reference]);
+                        what.to_string()
+                    };
+                    let error = format!("{:#}", try_run(&args).unwrap_err());
+                    assert!(
+                        error.ends_with(&format!("is the input {expected}; write to another path")),
+                        "{error}"
+                    );
+                    assert_eq!(
+                        std::fs::read(&protected).unwrap(),
+                        b"not a readable evidence input"
+                    );
+                    if what == "reference index" {
+                        std::os::unix::fs::symlink(&protected, format!("{bam}.bai")).unwrap();
+                    }
+                }
+            }
+        }
+
+        /// A --gvcf the gVCF source reads is checked against the output before it is read, and
+        /// is kept.
+        #[test]
+        fn a_gvcf_that_is_read_is_not_the_output() {
+            let setup = VcfSourceModel::new();
+            let (vcf, gvcf) = (setup.path("default.vcf.gz"), setup.path("S1.vcf.parquet"));
+            let before = std::fs::read(&gvcf).unwrap();
+            let extract = ["extract", "--vcf", &vcf, "--gvcf", &gvcf, "--contigs", "chr1"];
+            let error = try_run(&[&extract[..], &["-o", &gvcf]].concat()).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.ends_with("is the input gVCF; write to another path"), "{message}");
+            assert!(std::fs::read(&gvcf).unwrap() == before);
         }
 
         /// evaluate rejects a table of another feature source than the model's.
@@ -3058,6 +4005,339 @@ mod tests {
                  trained on features from `vcf`: extract the table again with --feature-source \
                  vcf, or use a model trained on `gvcf` features"
             );
+            assert_eq!(error.to_string(), expected);
+        }
+
+        /// The reads [`write_reads`] writes at call `i`: their number, how many of them have the
+        /// alternate allele, and their MAPQ. At a true call 10 of 20 reads have the alternate
+        /// allele, at MAPQ 60; at a false one 2 of 30, at MAPQ 30.
+        fn default_reads(i: usize) -> (usize, usize, u8) {
+            if is_true(i) { (20, 10, 60) } else { (30, 2, 30) }
+        }
+
+        /// Writes a reference of chr1 (`ref.fa`, all `A`) and reads over the calls of
+        /// [`write_calls`] (`reads.bam`), as `reads` says for each call (see [`default_reads`]).
+        fn write_reads(dir: &Path, reads: &dyn Fn(usize) -> (usize, usize, u8)) {
+            use crate::testing::TestRead;
+            let reference = "A".repeat(100_000);
+            crate::testing::write_fasta(dir, &[("chr1", &reference)]);
+            // A 50-base read with the alternate base at its 26th base.
+            let alt = format!("{}C{}", "A".repeat(25), "A".repeat(24));
+            let specs: Vec<(usize, String, bool, u8)> = (0..CALLS)
+                .flat_map(|i| {
+                    let (n_reads, n_alt, mapq) = reads(i);
+                    (0..n_reads).map(move |k| (i, format!("read{i}_{k}"), k < n_alt, mapq))
+                })
+                .collect();
+            let reads: Vec<TestRead<'_>> = specs
+                .iter()
+                .map(|(i, name, is_alt, mapq)| TestRead {
+                    name,
+                    // The call's POS is 1-based.
+                    pos: (1000 + 200 * i) as i64 - 26,
+                    cigar: "50M",
+                    flag: 0,
+                    mapq: *mapq,
+                    qual: 30,
+                    quals: None,
+                    bases: is_alt.then_some(alt.as_str()),
+                })
+                .collect();
+            crate::testing::write_bam(dir, "reads.bam", reference.len() as u64, &reads);
+        }
+
+        /// `extract --alignments` stops when no read is counted at any call: the reads are not
+        /// of the calls, or none passes the alignment settings.
+        #[rstest]
+        #[case::no_reads(&|_| (0, 0, 60))]
+        #[case::no_mapq(&|_| (20, 10, 255))]
+        #[case::below_the_minimum_mapq(&|_| (20, 10, 10))]
+        fn extract_needs_a_read_counted(#[case] reads: &dyn Fn(usize) -> (usize, usize, u8)) {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_default_mode_calls(dir.path());
+            write_reads(dir.path(), reads);
+            let error = try_run(&[
+                "extract",
+                "--vcf",
+                &path("default.vcf.gz"),
+                "--alignments",
+                &path("reads.bam"),
+                "--reference",
+                &path("ref.fa"),
+                "--contigs",
+                "chr1",
+                "-o",
+                &path("t.parquet"),
+            ])
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&format!(
+                    "no read was counted at any of the {CALLS} calls with alignment settings"
+                )),
+                "{error:#}"
+            );
+        }
+
+        /// The calls of [`write_default_mode_calls`] with the reads of [`write_reads`] and their
+        /// pileup table in a temporary directory, with tables of S1 and S2 measured from the reads
+        /// (`S1.parquet`, `S2.parquet`, with pileup features) and a snp model trained on them
+        /// (`reads.winnowr.json`).
+        struct AlignmentsModel {
+            dir: tempfile::TempDir,
+        }
+
+        impl AlignmentsModel {
+            fn new() -> Self {
+                let setup = Self { dir: tempfile::TempDir::new().unwrap() };
+                write_default_mode_calls(setup.dir.path());
+                write_reads(setup.dir.path(), &default_reads);
+                let (vcf, pileup) = (setup.path("default.vcf.gz"), setup.path("pileup.tsv.gz"));
+                let base = ["pileup", "--vcf", &vcf, "--regions", "chr1", "-o", &pileup];
+                let reads = setup.reads();
+                let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+                run(&[&base[..], &reads].concat());
+                let with_pileup = ["--pileup", pileup.as_str()];
+                let tables = [
+                    setup.extract("S1", "S1", &with_pileup),
+                    setup.extract("S2", "S2", &with_pileup),
+                ];
+                setup.train(&tables, "reads").unwrap();
+                setup
+            }
+
+            fn path(&self, name: &str) -> String {
+                self.dir.path().join(name).display().to_string()
+            }
+
+            /// The options giving the reads.
+            fn reads(&self) -> [String; 4] {
+                let (bam, fasta) = (self.path("reads.bam"), self.path("ref.fa"));
+                ["--alignments".to_string(), bam, "--reference".to_string(), fasta]
+            }
+
+            /// Extracts the calls of `sample` from the reads, with `extra` options, as `name`.
+            fn extract(&self, sample: &str, name: &str, extra: &[&str]) -> String {
+                let table = self.path(&format!("{name}.parquet"));
+                let (vcf, happy, reads) =
+                    (self.path("default.vcf.gz"), self.path("happy.vcf"), self.reads());
+                let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+                let base = ["extract", "--vcf", &vcf, "--happy", &happy];
+                let rest = ["--contigs", "chr1", "--sample", sample, "-o", &table];
+                run(&[&base[..], &rest, &reads, extra].concat());
+                table
+            }
+
+            /// Trains a snp model with pileup features on `tables`, as `output`.
+            fn train<S: AsRef<str>>(&self, tables: &[S], output: &str) -> Result<()> {
+                let output = self.path(output);
+                let tables: Vec<&str> = tables.iter().map(AsRef::as_ref).collect();
+                let base = ["train", "--variant-type", "snp", "--max-rounds", "10", "-o", &output];
+                try_run(&[&base[..], &["--pileup-features", "--tables"], &tables].concat())
+            }
+
+            /// Scores the calls with the model, with `extra` options, as `output`.
+            fn score(&self, output: &str, extra: &[&str]) -> Result<()> {
+                let (vcf, model, output) = (
+                    self.path("default.vcf.gz"),
+                    self.path("reads.winnowr.json"),
+                    self.path(output),
+                );
+                try_run(
+                    &[&["score", "--vcf", &vcf, "--models", &model, "-o", &output][..], extra]
+                        .concat(),
+                )
+            }
+        }
+
+        /// Features measured from the reads (`extract --alignments`) train a model that records
+        /// the alignments source and its read settings, which `score` measures from the reads
+        /// with no --gvcf, in one pass with the model's pileup evidence.
+        #[test]
+        fn the_alignments_feature_source_trains_and_scores_from_the_reads() {
+            let setup = AlignmentsModel::new();
+            let default = FeatureSource::VcfAlignments(ReadAnnotationOptions::default());
+            let table = FeatureTable::read_parquet(setup.path("S1.parquet")).unwrap();
+            assert_eq!(table.info().feature_source, default);
+            // The reads' mapping qualities, allele shares and depth, not the VCF's.
+            let column = |name: &str| table.f64_column(name).unwrap();
+            let expected = |of_true: f64, of_false: f64| -> Vec<f64> {
+                (0..CALLS).map(|i| if is_true(i) { of_true } else { of_false }).collect()
+            };
+            // The VCF's INFO/MQ is 60 and 20, and its INFO/DP 20 at every call.
+            assert_eq!(column("mq"), expected(60.0, 30.0));
+            assert_eq!(column("as_alt_frac"), expected(0.5, 2.0 / 30.0));
+            // The median of 20 and 30 reads is 25.
+            assert_eq!(column("dp_norm"), expected(0.8, 1.2));
+
+            let model_path = setup.path("reads.winnowr.json");
+            let model = WinnowrModel::load(&model_path, NonZeroUsize::new(1).unwrap()).unwrap();
+            assert_eq!(model.info.feature_source, default);
+            assert_eq!(model.info.pileup_settings, Some(PileupOptions::default()));
+            let json = std::fs::read_to_string(&model_path).unwrap();
+            let recorded = r#""feature_source":"alignments:mapq20,bq10,flank5""#;
+            assert!(json.contains(recorded), "{json}");
+
+            // score measures the reads, with no gVCF.
+            let reads = setup.reads();
+            let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+            setup.score("scored.vcf.gz", &reads).unwrap();
+            let scored = read_gzip(&setup.dir.path().join("scored.vcf.gz"));
+            let records: Vec<&str> = scored.lines().filter(|l| !l.starts_with('#')).collect();
+            assert_eq!(records.iter().filter(|r| r.contains("WINNOWR_P=")).count(), CALLS);
+            // Calls are dropped, and only false ones: the reads tell them apart.
+            let dropped: Vec<usize> = records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.split('\t').nth(6) == Some("WinnowrDrop"))
+                .map(|(i, _)| i)
+                .collect();
+            assert!(!dropped.is_empty(), "{scored}");
+            assert!(dropped.iter().all(|&i| !is_true(i)), "{dropped:?}");
+        }
+
+        /// An output that is an input of `score` or `extract` (the VCF, the reads, the
+        /// reference, ..., or the index of one), or whose index `score` would write over one,
+        /// fails the run before the reads are read, and the input is kept.
+        #[test]
+        fn the_output_is_checked_before_the_reads() {
+            let setup = AlignmentsModel::new();
+            let (vcf, model, happy) = (
+                setup.path("default.vcf.gz"),
+                setup.path("reads.winnowr.json"),
+                setup.path("happy.vcf"),
+            );
+            let (bam, missing, fasta) =
+                (setup.path("reads.bam"), setup.path("missing.bam"), setup.path("ref.fa"));
+            let score = |output: &str, bam: &str| {
+                let base = ["score", "--vcf", &vcf, "--models", &model, "-o", output];
+                try_run(&[&base[..], &["--alignments", bam, "--reference", &fasta]].concat())
+            };
+            let extract = |output: &str, bam: &str| {
+                let base = ["extract", "--vcf", &vcf, "--happy", &happy, "--contigs", "chr1"];
+                let rest = ["--sample", "S1", "-o", output, "--alignments", bam];
+                try_run(&[&base[..], &rest, &["--reference", &fasta]].concat())
+            };
+            let (tbi, bai, fai) =
+                (format!("{vcf}.tbi"), format!("{bam}.bai"), format!("{fasta}.fai"));
+            let read = |path: &str| std::fs::read(path).unwrap();
+            let all = [&vcf, &bam, &fasta, &tbi, &bai, &fai];
+            let before: Vec<Vec<u8>> = all.iter().map(|path| read(path)).collect();
+            // The index `score` writes beside its output is checked too.
+            let scored = setup.path("scored.vcf.gz");
+            std::os::unix::fs::symlink(&bai, format!("{scored}.tbi")).unwrap();
+            // The reads are missing, which the pass over them would fail on.
+            let cases = [
+                (score(&vcf, &missing), "VCF"),
+                (extract(&vcf, &missing), "VCF"),
+                (score(&bam, &bam), "alignments"),
+                (extract(&fasta, &bam), "reference"),
+                (extract(&tbi, &missing), "VCF index"),
+                (score(&tbi, &missing), "VCF index"),
+                (score(&bai, &bam), "alignments index"),
+                (extract(&fai, &bam), "reference index"),
+                (score(&scored, &bam), "alignments index"),
+            ];
+            for (result, what) in cases {
+                let message = format!("{:#}", result.unwrap_err());
+                let expected = format!("is the input {what}; write to another path");
+                assert!(message.ends_with(&expected), "{message}");
+            }
+            let after: Vec<Vec<u8>> = all.iter().map(|path| read(path)).collect();
+            assert!(after == before);
+        }
+
+        #[test]
+        fn unused_beds_do_not_prevent_scoring_again() {
+            let setup = AlignmentsModel::new();
+            let reads = setup.reads();
+            let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+            for name in ["unused", NOT_DIFFICULT_REGIONS] {
+                for suffix in ["", ".tbi"] {
+                    let region = format!("{name}={}{suffix}", setup.path("rerun.vcf.gz"));
+                    let options = [&reads[..], &["--regions", &region]].concat();
+                    setup.score("rerun.vcf.gz", &options).unwrap();
+                    setup.score("rerun.vcf.gz", &options).unwrap();
+                }
+            }
+        }
+
+        /// A BED only the policy reads is read before the reads are: a missing one fails the
+        /// run first, though the reads would fail the pass over them.
+        #[test]
+        fn a_policy_bed_is_read_before_the_reads() {
+            let setup = AlignmentsModel::new();
+            let (bam, fasta, bed) =
+                (setup.path("missing.bam"), setup.path("ref.fa"), setup.path("missing.bed"));
+            let regions = format!("{NOT_DIFFICULT_REGIONS}={bed}");
+            let options = [
+                "--alignments",
+                &bam,
+                "--reference",
+                &fasta,
+                "--abstain-actions",
+                "flip",
+                "--regions",
+                &regions,
+            ];
+            let error = setup.score("policy.vcf.gz", &options).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("missing.bed") && !message.contains("missing.bam"),
+                "{message}"
+            );
+        }
+
+        /// How a model of the alignments source is misused: `score` without the reads, or a table
+        /// measured with other read settings, given to `train` or `evaluate`.
+        #[derive(Debug, Clone, Copy)]
+        enum Misuse {
+            ScoreWithoutReads,
+            TrainOnOtherSettings,
+            EvaluateOtherSettings,
+        }
+
+        /// Each misuse of a model of the alignments source is rejected, saying what to do.
+        #[rstest]
+        #[case::score_without_reads(Misuse::ScoreWithoutReads)]
+        #[case::train_on_other_settings(Misuse::TrainOnOtherSettings)]
+        #[case::evaluate_other_settings(Misuse::EvaluateOtherSettings)]
+        fn misuses_of_the_alignments_source_are_rejected(#[case] misuse: Misuse) {
+            let setup = AlignmentsModel::new();
+            let model = setup.path("reads.winnowr.json");
+            let (error, expected) = match misuse {
+                Misuse::ScoreWithoutReads => (
+                    setup.score("no_reads.vcf.gz", &[]).unwrap_err(),
+                    format!(
+                        "model {model} was trained on features measured from the reads (feature \
+                         source alignments:mapq20,bq10,flank5): pass --alignments and --reference"
+                    ),
+                ),
+                Misuse::TrainOnOtherSettings => {
+                    let dragen = setup.extract("S2", "dragen", &["--alignment-settings", "mapq1"]);
+                    let tables = [setup.path("S1.parquet"), dragen];
+                    let error = setup.train(&tables, "mixed").unwrap_err();
+                    let expected = "--tables hold features from different sources: S1's from \
+                                    alignments:mapq20,bq10,flank5, S2's from \
+                                    alignments:mapq1,bq10,flank5; extract every training table \
+                                    with the same --feature-source (and, with --alignments, the \
+                                    same --alignment-settings)";
+                    (error, expected.to_string())
+                }
+                Misuse::EvaluateOtherSettings => {
+                    let dragen = setup.extract("S2", "dragen", &["--alignment-settings", "mapq1"]);
+                    let metrics = setup.path("metrics.tsv");
+                    let args = ["evaluate", "--models", &model, "--table", &dragen, "-o", &metrics];
+                    let expected = format!(
+                        "feature table {dragen} holds features from `alignments:mapq1,bq10,flank5`, \
+                         but model {model} was trained on features from \
+                         `alignments:mapq20,bq10,flank5`: extract the table again with \
+                         --alignments, --reference and --alignment-settings mapq20,bq10,flank5, or use a model \
+                         trained on `alignments:mapq1,bq10,flank5` features"
+                    );
+                    (try_run(&args).unwrap_err(), expected)
+                }
+            };
             assert_eq!(error.to_string(), expected);
         }
 
@@ -3312,7 +4592,8 @@ mod tests {
         assert_eq!(
             error,
             "--models were trained on features from different sources (g.winnowr.json: gvcf; \
-             v.winnowr.json: vcf): score with models trained on tables of one --feature-source"
+             v.winnowr.json: vcf): score with models trained on tables of one --feature-source \
+             (and, with --alignments, the same --alignment-settings)"
         );
     }
 
@@ -3392,48 +4673,182 @@ mod tests {
         assert_eq!(args.contigs, ["chr20", "chr21"]);
         assert_eq!(args.sample.as_deref(), Some("S"));
         assert_eq!(args.gvcf, Some(PathBuf::from("in.g.vcf.gz")));
-        assert_eq!(args.feature_source, FeatureSource::Gvcf);
-        assert_eq!(
-            annotation_inputs(args.feature_source, args.gvcf.as_deref(), UnreadGvcf::Error)
-                .unwrap(),
-            AnnotationInputs::Gvcf(args.gvcf.as_deref())
-        );
+        assert_eq!(args.feature_source, None);
+        let source = extract_feature_source(&args).unwrap();
+        assert_eq!(source, FeatureSource::Gvcf);
+        check_unread_gvcf(source, args.gvcf.as_deref(), UnreadGvcf::Error).unwrap();
+        let prepared = prepare(source, args.gvcf.as_deref(), None).unwrap();
+        assert_eq!(prepared.annotations(), AnnotationInputs::Gvcf(args.gvcf.as_deref()));
     }
 
-    /// `extract --feature-source` takes gvcf (the default) or vcf, in any case; vcf does not read
-    /// --gvcf, so it cannot be given with it.
+    /// [`prepare_source`] of a source, its gVCF and its reads, with no pileup, for a table of
+    /// chr1 with no regions, truth or depth median.
+    fn prepare<'a>(
+        source: FeatureSource,
+        gvcf: Option<&'a Path>,
+        reads: Option<ReadInputs<'_>>,
+    ) -> Result<SourceInputs<'a>> {
+        let (contigs, truth) = (["chr1".to_string()], TruthInputs::default());
+        let vcf = Path::new("in.vcf.gz");
+        let checks =
+            TableChecks { vcf, contigs: &contigs, regions: &[], truth: &truth, dp_median: None };
+        prepare_source(source, gvcf, reads, None, &checks)
+    }
+
+    /// The options of an `extract` command line with an input VCF and an output table, and
+    /// `extra` options.
+    fn extract_args(extra: &[&str]) -> ExtractArgs {
+        let base = ["extract", "--vcf", "in.vcf.gz", "-o", "t.parquet"];
+        let Command::Extract(args) = parse(&[&base[..], extra].concat()).unwrap().command else {
+            panic!("not extract")
+        };
+        args
+    }
+
+    /// `extract --feature-source` takes gvcf (the default), vcf or alignments, in any case; vcf
+    /// does not read --gvcf, so it cannot be given with it.
     #[test]
     fn extract_takes_a_feature_source() {
+        assert_eq!(extract_feature_source(&extract_args(&[])).unwrap(), FeatureSource::Gvcf);
+        let vcf = extract_args(&["--feature-source", "VCF"]);
+        assert_eq!(vcf.feature_source, Some(ExtractSource::Vcf));
+        assert_eq!(extract_feature_source(&vcf).unwrap(), FeatureSource::Vcf);
+        check_unread_gvcf(FeatureSource::Vcf, None, UnreadGvcf::Error).unwrap();
+        assert_eq!(
+            prepare(FeatureSource::Vcf, None, None).unwrap().annotations(),
+            AnnotationInputs::Vcf
+        );
+        let with_gvcf = extract_args(&["--feature-source", "vcf", "--gvcf", "in.g.vcf.gz"]);
+        let source = extract_feature_source(&with_gvcf).unwrap();
+        let error = check_unread_gvcf(source, with_gvcf.gvcf.as_deref(), UnreadGvcf::Error)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not read --gvcf"), "{error}");
+        // score, whose source comes from the models, ignores it.
+        check_unread_gvcf(FeatureSource::Vcf, Some(Path::new("g")), UnreadGvcf::Warn).unwrap();
         let base = ["extract", "--vcf", "in.vcf.gz", "-o", "t.parquet"];
-        let args = |extra: &[&str]| {
-            let Command::Extract(args) = parse(&[&base[..], extra].concat()).unwrap().command
-            else {
-                panic!("not extract")
+        let error = parse(&[&base[..], &["--feature-source", "bam"]].concat()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        let command = Cli::command();
+        let extract = command.find_subcommand("extract").unwrap();
+        let option = extract.get_arguments().find(|a| a.get_id() == "feature_source").unwrap();
+        let values: Vec<String> =
+            option.get_possible_values().iter().map(|v| v.get_name().to_string()).collect();
+        assert_eq!(values, ["gvcf", "vcf", "alignments"]);
+        assert_eq!(ExtractSource::Alignments.to_string(), "alignments");
+    }
+
+    /// `extract --alignments` selects the alignments source, with the read settings of
+    /// --alignment-settings (the defaults without it); the source needs the reads, and no other
+    /// source takes them.
+    #[test]
+    fn extract_alignments_select_the_alignments_source() {
+        let reads = ["--alignments", "in.cram", "--reference", "ref.fa"];
+        let source =
+            |extra: &[&str]| extract_feature_source(&extract_args(&[&reads[..], extra].concat()));
+        let default = FeatureSource::VcfAlignments(ReadAnnotationOptions::default());
+        assert_eq!(source(&[]).unwrap(), default);
+        assert_eq!(source(&["--feature-source", "alignments"]).unwrap(), default);
+        let dragen = source(&["--alignment-settings", "mapq1"]).unwrap();
+        assert_eq!(dragen.to_string(), "alignments:mapq1,bq10,flank5");
+        let measured = SourceInputs::Reads {
+            options: ReadAnnotationOptions::default(),
+            sites: Vec::new(),
+            pileup: None,
+        };
+        assert_eq!(measured.annotations().feature_source(), default);
+        // The source does not read a --gvcf: extract rejects it, and score ignores it.
+        assert!(check_unread_gvcf(default, Some(Path::new("g")), UnreadGvcf::Error).is_err());
+        check_unread_gvcf(default, Some(Path::new("g")), UnreadGvcf::Warn).unwrap();
+        // It needs the reads.
+        let error = prepare(default, None, None).unwrap_err().to_string();
+        assert!(error.ends_with("pass --alignments and --reference"), "{error}");
+        for other in ["gvcf", "vcf"] {
+            let error = source(&["--feature-source", other]).unwrap_err().to_string();
+            assert!(
+                error.starts_with("--alignments is read only for the alignments feature source"),
+                "{error}"
+            );
+        }
+        let args = extract_args(&["--feature-source", "alignments"]);
+        let error = extract_feature_source(&args).unwrap_err().to_string();
+        assert!(error.ends_with("pass --alignments and --reference"), "{error}");
+    }
+
+    #[rstest]
+    #[case::alignments_without_reference(
+        &["--alignments", "in.cram"],
+        ErrorKind::MissingRequiredArgument
+    )]
+    #[case::alignments_with_gvcf(
+        &["--alignments", "in.cram", "--reference", "ref.fa", "--gvcf", "in.g.vcf.gz"],
+        ErrorKind::ArgumentConflict
+    )]
+    #[case::settings_without_alignments(
+        &["--alignment-settings", "mapq1"],
+        ErrorKind::MissingRequiredArgument
+    )]
+    #[case::bad_settings(
+        &["--alignments", "in.cram", "--reference", "ref.fa", "--alignment-settings", "depth3"],
+        ErrorKind::ValueValidation
+    )]
+    fn extract_rejects_misused_alignment_options(#[case] extra: &[&str], #[case] kind: ErrorKind) {
+        let base = ["extract", "--vcf", "in.vcf.gz", "-o", "t.parquet"];
+        assert_eq!(parse(&[&base[..], extra].concat()).unwrap_err().kind(), kind);
+    }
+
+    /// A bad --alignment-settings value is reported through clap with what is expected (the
+    /// settings' errors are tested in [`crate::read_settings`]).
+    #[test]
+    fn bad_alignment_settings_say_what_is_expected() {
+        let reads = ["--alignments", "in.cram", "--reference", "ref.fa"];
+        let base = ["extract", "--vcf", "in.vcf.gz", "-o", "t.parquet"];
+        let args = [&base[..], &reads[..], &["--alignment-settings", "mapq256"]].concat();
+        let error = parse(&args).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        let expected = "bad MAPQ in mapq256: expected an integer from 0 to 255";
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    /// The reference reaches the truth matching unless it is there only for --alignments.
+    #[rstest]
+    #[case::without_alignments(&[], true)]
+    #[case::for_the_alignments_only(&["--alignments", "in.cram"], false)]
+    #[case::with_the_truth(
+        &["--alignments", "in.cram", "--truth-vcf", "t.vcf.gz", "--truth-bed", "t.bed"],
+        true
+    )]
+    fn the_reference_matches_the_truth_unless_only_the_reads_need_it(
+        #[case] extra: &[&str],
+        #[case] kept: bool,
+    ) {
+        let args = extract_args(&[&["--reference", "ref.fa"][..], extra].concat());
+        assert_eq!(truth_reference(&args).is_some(), kept);
+    }
+
+    /// A model trained on features measured from the reads needs them to score.
+    #[test]
+    fn score_needs_alignments_for_models_of_the_alignments_source() {
+        let score_args = |extra: &[&str]| {
+            let base = ["score", "--vcf", "v", "--models", "m.winnowr.json", "-o", "o"];
+            let Command::Score(args) = parse(&[&base[..], extra].concat()).unwrap().command else {
+                panic!("not score")
             };
             args
         };
-        assert_eq!(args(&[]).feature_source, FeatureSource::Gvcf);
-        let vcf = args(&["--feature-source", "VCF"]);
-        assert_eq!(vcf.feature_source, FeatureSource::Vcf);
+        let options: ReadAnnotationOptions = "mapq1".parse().unwrap();
+        let source = FeatureSource::VcfAlignments(options);
+        let error = models_read_annotations(source, &score_args(&[])).unwrap_err().to_string();
         assert_eq!(
-            annotation_inputs(vcf.feature_source, None, UnreadGvcf::Error).unwrap(),
-            AnnotationInputs::Vcf
+            error,
+            "model m.winnowr.json was trained on features measured from the reads (feature \
+             source alignments:mapq1,bq10,flank5): pass --alignments and --reference"
         );
-        let with_gvcf = args(&["--feature-source", "vcf", "--gvcf", "in.g.vcf.gz"]);
-        let error = annotation_inputs(
-            with_gvcf.feature_source,
-            with_gvcf.gvcf.as_deref(),
-            UnreadGvcf::Error,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("does not read --gvcf"), "{error}");
-        // score, whose source comes from the models, ignores it.
-        let ignored = annotation_inputs(FeatureSource::Vcf, Some(Path::new("g")), UnreadGvcf::Warn);
-        assert_eq!(ignored.unwrap(), AnnotationInputs::Vcf);
-        let error = parse(&[&base[..], &["--feature-source", "bam"]].concat()).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidValue);
-        assert!(error.to_string().contains("[possible values: gvcf, vcf]"), "{error}");
+        let with_reads = score_args(&["--alignments", "in.cram", "--reference", "ref.fa"]);
+        assert_eq!(models_read_annotations(source, &with_reads).unwrap(), Some(options));
+        for other in [FeatureSource::Gvcf, FeatureSource::Vcf] {
+            assert_eq!(models_read_annotations(other, &score_args(&[])).unwrap(), None);
+        }
     }
 
     /// `evaluate` and `stratify` reject a table of another feature source than a model's, either

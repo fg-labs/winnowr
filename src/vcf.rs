@@ -16,17 +16,21 @@ use rust_htslib::errors::Error as HtslibError;
 
 use crate::alleles::Genotype;
 
-/// The index file extensions htslib looks for next to a VCF or BCF.
-const INDEX_EXTENSIONS: [&str; 2] = ["tbi", "csi"];
+/// The index file extensions htslib looks for next to a VCF, in the order it tries them (for a
+/// BCF, only the first).
+pub const INDEX_EXTENSIONS: [&str; 2] = ["csi", "tbi"];
 
 /// The magic bytes that start a (decompressed) tabix or CSI index.
 const INDEX_MAGIC: [&[u8; 4]; 2] = [b"TBI\x01", b"CSI\x01"];
 
 /// Opens a local, bgzipped, indexed VCF or BCF.
 ///
-/// The index is found as htslib does: `<path>.tbi` or `<path>.csi`, or the same with the file's
-/// extension replaced (e.g. `calls.csi` for `calls.bcf`). An explicit `<path>##idx##<index>` is
-/// not supported, because rust-htslib requires the whole path to be an existing file.
+/// The index is found as htslib does: `<path>.csi`, or the same with the file's extension
+/// replaced from the last dot in the full path (e.g. `calls.csi` for `calls.bcf`, or `batch.csi`
+/// for `batch.v1/calls`), then, for a VCF, the corresponding TBI candidates. The first that
+/// exists is the one htslib loads, and the one checked. An
+/// explicit `<path>##idx##<index>` is not supported, because rust-htslib requires the whole path
+/// to be an existing file.
 ///
 /// rust-htslib's `IndexedReader` crashes, rather than failing, when htslib cannot open the file
 /// or its index, so this first checks that the file opens as a VCF/BCF, is bgzipped, and has an
@@ -53,9 +57,10 @@ pub fn open_indexed<P: AsRef<Path>>(path: P) -> Result<IndexedReader> {
     if !bgzipped {
         bail!("{} is not bgzipped: compress it with bgzip and index it", path.display());
     }
-    let Some(index) = index_candidates(path).into_iter().find(|index| index.is_file()) else {
+    let Some(index) = index_candidates(path).into_iter().find(|index| index.exists()) else {
+        let expected = if is_bcf(path) { ".csi" } else { ".csi or .tbi" };
         bail!(
-            "{} has no index ({}.tbi or .csi): it must be bgzipped and indexed (e.g. with \
+            "{} has no index ({}{expected}): it must be bgzipped and indexed (e.g. with \
              bcftools index)",
             path.display(),
             path.display()
@@ -73,19 +78,64 @@ pub fn has_index(path: &Path) -> bool {
     rust_htslib::bgzf::is_bgzip(path).unwrap_or(false)
         && index_candidates(path)
             .into_iter()
-            .any(|index| index.is_file() && starts_like_an_index(&index))
+            .find(|index| index.exists())
+            .is_some_and(|index| starts_like_an_index(&index))
 }
 
-/// The index paths htslib tries for a data file, in order.
-fn index_candidates(data: &Path) -> Vec<PathBuf> {
-    let appended = INDEX_EXTENSIONS.iter().map(|extension| {
-        let mut index = data.as_os_str().to_owned();
-        index.push(".");
-        index.push(extension);
-        PathBuf::from(index)
-    });
-    let replaced = INDEX_EXTENSIONS.iter().map(|extension| data.with_extension(extension));
-    appended.chain(replaced).collect()
+/// The index paths htslib tries for a VCF or BCF, in order: a BCF has only a CSI index.
+pub fn index_candidates(data: &Path) -> Vec<PathBuf> {
+    let extensions = if is_bcf(data) { &INDEX_EXTENSIONS[..1] } else { &INDEX_EXTENSIONS[..] };
+    local_index_paths(data, extensions)
+}
+
+/// True if a file decompresses to start with BCF's magic bytes.
+fn is_bcf(path: &Path) -> bool {
+    let mut magic = [0u8; 3];
+    rust_htslib::bgzf::Reader::from_path(path)
+        .ok()
+        .is_some_and(|mut reader| reader.read_exact(&mut magic).is_ok() && &magic == b"BCF")
+}
+
+/// The local CSI/TBI/BAI candidates used by htslib's `hts_idx_check_local`: append each
+/// extension, then replace from the last dot in the entire path (except a dot at byte zero).
+/// Unlike the CRAM and FASTA loaders, this can remove part of a dotted parent directory.
+pub fn local_index_paths(data: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    let bytes = data.as_os_str().as_encoded_bytes();
+    let dot = bytes.iter().rposition(|&b| b == b'.').filter(|&i| i > 0);
+    index_paths_at(data, extensions, dot)
+}
+
+/// Appended candidates and, when `dot` is given, a replacement starting at that byte.
+fn index_paths_at(data: &Path, extensions: &[&str], dot: Option<usize>) -> Vec<PathBuf> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let bytes = data.as_os_str().as_bytes();
+    extensions
+        .iter()
+        .flat_map(|extension| {
+            let mut appended = data.as_os_str().to_owned();
+            appended.push(format!(".{extension}"));
+            let replaced = dot.map(|at| {
+                let mut name = bytes[..at].to_vec();
+                name.extend_from_slice(format!(".{extension}").as_bytes());
+                PathBuf::from(std::ffi::OsString::from_vec(name))
+            });
+            std::iter::once(PathBuf::from(appended)).chain(replaced)
+        })
+        .collect()
+}
+
+/// CRAM's candidates: append, then replace the basename's last extension, including a leading
+/// dot. Unlike CSI/TBI/BAI local lookup, a dot in a parent directory is not a replacement point.
+pub fn index_paths(data: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    let bytes = data.as_os_str().as_encoded_bytes();
+    let first = bytes.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
+    let dot = bytes.iter().rposition(|&b| b == b'.').filter(|&i| i >= first);
+    index_paths_at(data, extensions, dot)
+}
+
+/// FASTA's loaders only append their index extensions; they never replace a suffix.
+pub fn appended_index_paths(data: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    index_paths_at(data, extensions, None)
 }
 
 /// True if a file decompresses to start with a tabix or CSI index's magic bytes.

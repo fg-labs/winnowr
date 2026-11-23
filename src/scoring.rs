@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
@@ -135,22 +135,21 @@ pub fn write_scored_vcf(
     decisions: HashMap<CallKey, Decision>,
     threads: NonZeroUsize,
 ) -> Result<()> {
-    if same_file(vcf, output) {
-        bail!("the output {} is the input VCF; write to another path", output.display());
+    check_output_not_input(output, [("VCF", vcf)])?;
+    let indexes = crate::vcf::index_candidates(vcf);
+    check_output_not_indexes(output, "VCF index", &indexes)?;
+    if let Some(output_index) = scored_vcf_index(output) {
+        check_output_not_input(&output_index, [("VCF", vcf)])?;
+        check_output_not_indexes(&output_index, "VCF index", &indexes)?;
+        check_output_not_input(&output_index, [("scored VCF", output)])?;
     }
-    let (format, uncompressed, index_type) = if has_suffix(output, ".bcf") {
-        (Format::Bcf, false, Some(IndexType::Csi(14)))
-    } else if is_bgzf_path(output) {
-        (Format::Vcf, false, Some(IndexType::Tbx))
-    } else {
-        if !has_suffix(output, ".vcf") {
-            warn!(
-                "{} does not end in .vcf, .vcf.gz, .vcf.bgz or .bcf: writing uncompressed VCF",
-                output.display()
-            );
-        }
-        (Format::Vcf, true, None)
-    };
+    let (format, uncompressed, index_type) = output_format(output);
+    if uncompressed && !has_suffix(output, ".vcf") {
+        warn!(
+            "{} does not end in .vcf, .vcf.gz, .vcf.bgz or .bcf: writing uncompressed VCF",
+            output.display()
+        );
+    }
     // Shards are read by region, which skips records at POS 0: inputs that have them, or may
     // have them, are written in one pass.
     let scan = if format == Format::Vcf && !uncompressed {
@@ -192,6 +191,10 @@ pub fn write_scored_vcf(
         );
     }
     if let Some(index_type) = index_type {
+        // A dangling sidecar symlink may resolve only after the output has been written.
+        if let Some(output_index) = scored_vcf_index(output) {
+            check_output_not_input(&output_index, [("scored VCF", output)])?;
+        }
         index::build(output, None, 1, index_type)
             .map_err(|e| anyhow::anyhow!("failed to index {}: {e}", output.display()))?;
     }
@@ -485,6 +488,141 @@ fn write_shard(
     }
     let wrote = writer.is_some();
     Ok((wrote, applied, applied_keys.len()))
+}
+
+/// How [`write_scored_vcf`] writes `output`, by its suffix: its format, whether it is
+/// uncompressed, and the index built beside it (CSI for BCF, tabix for bgzipped VCF, none for
+/// plain-text VCF).
+fn output_format(output: &Path) -> (Format, bool, Option<IndexType>) {
+    if has_suffix(output, ".bcf") {
+        (Format::Bcf, false, Some(IndexType::Csi(14)))
+    } else if is_bgzf_path(output) {
+        (Format::Vcf, false, Some(IndexType::Tbx))
+    } else {
+        (Format::Vcf, true, None)
+    }
+}
+
+/// The index [`write_scored_vcf`] writes beside `output`, named as htslib names it: `<output>.csi`
+/// for BCF, `<output>.tbi` for bgzipped VCF, or `None` for plain-text VCF, which is not indexed.
+#[must_use]
+pub fn scored_vcf_index(output: &Path) -> Option<PathBuf> {
+    let extension = match output_format(output).2? {
+        IndexType::Csi(_) => "csi",
+        IndexType::Tbx => "tbi",
+    };
+    let mut index = output.as_os_str().to_owned();
+    index.push(".");
+    index.push(extension);
+    Some(PathBuf::from(index))
+}
+
+/// Checks that `output` is none of the `inputs`, each with what it is (e.g. `VCF`): the same
+/// file, through a link too (see [`same_file`]), which writing would destroy.
+///
+/// # Errors
+///
+/// Returns an error naming the input the output is.
+pub fn check_output_not_input<'a>(
+    output: &Path,
+    inputs: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Result<()> {
+    for (what, input) in inputs {
+        if same_file(input, output) {
+            bail!("the output {} is the input {what}; write to another path", output.display());
+        }
+    }
+    Ok(())
+}
+
+/// Protects existing index files and absent candidates that precede the index currently selected
+/// by the reader. Creating a later candidate does not change selection and remains allowed.
+///
+/// # Errors
+///
+/// Returns an error if writing `output` would overwrite or mask an input index.
+pub fn check_output_not_indexes(output: &Path, what: &str, candidates: &[PathBuf]) -> Result<()> {
+    check_output_not_input(output, candidates.iter().map(|path| (what, path.as_path())))?;
+    let Some(selected) = candidates.iter().position(|path| path.exists()) else {
+        return Ok(());
+    };
+    let Some(destination) = future_destination(output) else {
+        return Ok(());
+    };
+    for candidate in &candidates[..selected] {
+        if let Some(candidate) = future_destination(candidate)
+            && same_future_destination(&destination, &candidate)?
+        {
+            bail!(
+                "the output {} would mask the input {what}; write to another path",
+                output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Compares absent leaf names using their filesystem's case and normalization rules. Ambiguous
+/// names are probed inside a unique temporary directory on the destination filesystem, never
+/// at either requested path. Ordinary distinct ASCII names need no probe.
+fn same_future_destination(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    if a == b {
+        return Ok(true);
+    }
+    if a.exists() || b.exists() {
+        return Ok(same_file(a, b));
+    }
+    let (Some(parent), Some(other_parent), Some(name), Some(other_name)) =
+        (a.parent(), b.parent(), a.file_name(), b.file_name())
+    else {
+        return Ok(false);
+    };
+    if !same_file(parent, other_parent) {
+        return Ok(false);
+    }
+    if name == other_name {
+        return Ok(true);
+    }
+    let (bytes, other_bytes) = (name.as_encoded_bytes(), other_name.as_encoded_bytes());
+    if bytes.is_ascii() && other_bytes.is_ascii() && !bytes.eq_ignore_ascii_case(other_bytes) {
+        return Ok(false);
+    }
+    let probe =
+        tempfile::Builder::new().prefix(".winnowr-path-check-").tempdir_in(parent).with_context(
+            || format!("failed to check output filename equivalence in {}", parent.display()),
+        )?;
+    let file = std::fs::File::create_new(probe.path().join(name))?;
+    let ours = file.metadata()?;
+    let equal = match std::fs::metadata(probe.path().join(other_name)) {
+        Ok(other) => ours.dev() == other.dev() && ours.ino() == other.ino(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("failed to compare output filename aliases"),
+    };
+    drop(file);
+    probe.close().context("failed to remove output filename comparison probe")?;
+    Ok(equal)
+}
+
+/// Resolves an output's physical parent and any final symlink, even when the final target does
+/// not exist. Missing parents and symlink loops cannot be written and have no prospective file.
+fn future_destination(path: &Path) -> Option<PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::read_link(&path) {
+            Ok(target) => {
+                path = if target.is_absolute() { target } else { path.parent()?.join(target) };
+            }
+            Err(_) => {
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                return Some(std::fs::canonicalize(parent).ok()?.join(path.file_name()?));
+            }
+        }
+    }
+    None
 }
 
 /// True if two paths name the same existing file (the same device and inode, so through a
@@ -1264,6 +1402,170 @@ mod tests {
         assert_eq!(value[0], b"caf\xe9");
     }
 
+    #[rstest::rstest]
+    #[case::appended("appended")]
+    #[case::replaced("replaced")]
+    #[case::symlink_parent("parent")]
+    #[case::dangling_output("output_link")]
+    #[case::dangling_candidate("candidate_link")]
+    #[case::generated_sidecar("sidecar")]
+    fn a_new_output_cannot_shadow_the_selected_index(#[case] kind: &str) {
+        let dir = TempDir::new().unwrap();
+        let vcf = input(&dir);
+        let csi = dir.path().join("in.vcf.gz.csi");
+        let tbi = dir.path().join("in.vcf.gz.tbi");
+        let original = std::fs::read(&vcf).unwrap();
+        let index = std::fs::read(&tbi).unwrap();
+        let output = match kind {
+            "appended" => csi.clone(),
+            "replaced" => dir.path().join("in.vcf.csi"),
+            "parent" => {
+                std::os::unix::fs::symlink(dir.path(), dir.path().join("alias")).unwrap();
+                std::fs::create_dir(dir.path().join("child")).unwrap();
+                dir.path().join("alias/child/../in.vcf.gz.csi")
+            }
+            "output_link" => {
+                let output = dir.path().join("output.vcf");
+                std::os::unix::fs::symlink("in.vcf.gz.csi", &output).unwrap();
+                output
+            }
+            "candidate_link" | "sidecar" => {
+                let output =
+                    dir.path().join(if kind == "sidecar" { "output.vcf.gz" } else { "output.vcf" });
+                let target = if kind == "sidecar" {
+                    scored_vcf_index(&output).unwrap()
+                } else {
+                    output.clone()
+                };
+                std::os::unix::fs::symlink(target, &csi).unwrap();
+                output
+            }
+            _ => unreachable!(),
+        };
+        let error =
+            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap_err().to_string();
+        assert!(error.contains("would mask the input VCF index"), "{error}");
+        assert_eq!(std::fs::read(&vcf).unwrap(), original);
+        assert_eq!(std::fs::read(&tbi).unwrap(), index);
+        assert!(!output.exists());
+        assert!(!csi.exists());
+    }
+
+    #[rstest::rstest]
+    #[case::tabix("in.vcf.gz.tbi", true)]
+    #[case::later_csi("in.vcf.csi", true)]
+    #[case::later_tabix_with_absent_csi("in.vcf.tbi", false)]
+    #[case::aliased_later_tabix("alias/in.vcf.tbi", false)]
+    fn absent_later_index_candidates_remain_usable_outputs(#[case] name: &str, #[case] csi: bool) {
+        let dir = TempDir::new().unwrap();
+        let vcf = input(&dir);
+        if csi {
+            index::build(&vcf, None, 1, IndexType::Csi(14)).unwrap();
+            std::fs::remove_file(dir.path().join("in.vcf.gz.tbi")).unwrap();
+        }
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("alias")).unwrap();
+        let selected = dir.path().join(if csi { "in.vcf.gz.csi" } else { "in.vcf.gz.tbi" });
+        let before = std::fs::read(&selected).unwrap();
+        write_scored_vcf(&vcf, &dir.path().join(name), HashMap::new(), THREADS).unwrap();
+        assert_eq!(std::fs::read(&selected).unwrap(), before);
+        let mut reader = crate::vcf::open_indexed(&vcf).unwrap();
+        reader.fetch(0, 0, None).unwrap();
+        assert_eq!(reader.records().count(), 5);
+    }
+
+    #[rstest::rstest]
+    #[case::direct(false)]
+    #[case::generated_sidecar(true)]
+    fn prospective_index_names_follow_filesystem_case_rules(#[case] sidecar: bool) {
+        let dir = TempDir::new().unwrap();
+        let probe = dir.path().join("case-probe");
+        std::fs::write(&probe, b"probe").unwrap();
+        let insensitive = same_file(&probe, &dir.path().join("CASE-PROBE"));
+        std::fs::remove_file(probe).unwrap();
+        eprintln!("case_insensitive={insensitive} root={}", dir.path().display());
+        let vcf = input(&dir);
+        let tbi = dir.path().join("in.vcf.gz.tbi");
+        let before = std::fs::read(&tbi).unwrap();
+        let output = if sidecar {
+            std::os::unix::fs::symlink("OUTPUT.VCF.GZ.TBI", dir.path().join("in.vcf.gz.csi"))
+                .unwrap();
+            dir.path().join("output.vcf.gz")
+        } else {
+            dir.path().join("in.vcf.gz.CSI")
+        };
+        let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS);
+        if insensitive {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("would mask the input VCF index"), "{error}");
+            assert!(!output.exists());
+        } else {
+            result.unwrap();
+            let mut reader = crate::vcf::open_indexed(&vcf).unwrap();
+            reader.fetch(0, 0, None).unwrap();
+            assert_eq!(reader.records().count(), 5);
+        }
+        assert_eq!(std::fs::read(&tbi).unwrap(), before);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".winnowr-path-check-")
+        }));
+    }
+
+    #[test]
+    fn an_existing_output_needs_no_parent_write_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let vcf = input(&dir);
+        let output = dir.path().join("r\u{e9}sultat.vcf");
+        std::fs::write(&output, b"replace this writable file").unwrap();
+        let permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.path().join("permission-check");
+        match std::fs::File::create_new(&probe) {
+            Ok(file) => {
+                drop(file);
+                std::fs::set_permissions(dir.path(), permissions).unwrap();
+                eprintln!("privileged permission bypass; parent-write regression not exercised");
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => {
+                std::fs::set_permissions(dir.path(), permissions).unwrap();
+                panic!("unexpected permission probe error: {error}");
+            }
+        }
+        let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS);
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
+        result.unwrap();
+        assert_eq!(VcfReader::from_path(&output).unwrap().records().count(), 5);
+    }
+
+    #[test]
+    fn symlink_parents_are_resolved_before_dotdot() {
+        let dir = TempDir::new().unwrap();
+        let vcf = input(&dir);
+        std::fs::create_dir_all(dir.path().join("one/two")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("one/two"), dir.path().join("alias")).unwrap();
+        let output = dir.path().join("alias/../in.vcf.gz.csi");
+        let tbi = dir.path().join("in.vcf.gz.tbi");
+        let before = std::fs::read(&tbi).unwrap();
+        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+        assert!(dir.path().join("one/in.vcf.gz.csi").exists());
+        assert!(!dir.path().join("in.vcf.gz.csi").exists());
+        assert_eq!(std::fs::read(&tbi).unwrap(), before);
+    }
+
+    #[test]
+    fn an_unindexed_plain_input_does_not_reserve_index_names() {
+        let dir = TempDir::new().unwrap();
+        let indexed = input(&dir);
+        let plain = dir.path().join("plain.vcf");
+        write_scored_vcf(&indexed, &plain, HashMap::new(), THREADS).unwrap();
+        let before = std::fs::read(&plain).unwrap();
+        write_scored_vcf(&plain, &dir.path().join("plain.vcf.csi"), HashMap::new(), THREADS)
+            .unwrap();
+        assert_eq!(std::fs::read(&plain).unwrap(), before);
+    }
+
     #[test]
     fn refuses_to_overwrite_the_input() {
         let dir = TempDir::new().unwrap();
@@ -1284,5 +1586,98 @@ mod tests {
         let bcf = dir.path().join("out.bcf");
         write_scored_vcf(&vcf, &bcf, HashMap::new(), THREADS).unwrap();
         assert!(dir.path().join("out.bcf.csi").exists());
+        // Nor is the index written beside the output the input's index (a .tbi beside bgzipped
+        // VCF, a .csi beside BCF), through a link to it.
+        let index = dir.path().join("in.vcf.gz.tbi");
+        let before = std::fs::read(&index).unwrap();
+        for (output, sidecar) in [("s.vcf.gz", "s.vcf.gz.tbi"), ("s.bcf", "s.bcf.csi")] {
+            std::os::unix::fs::symlink(&index, dir.path().join(sidecar)).unwrap();
+            let output = dir.path().join(output);
+            let message =
+                write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap_err().to_string();
+            assert!(
+                message.ends_with("is the input VCF index; write to another path"),
+                "{message}"
+            );
+        }
+        assert!(std::fs::read(&index).unwrap() == before);
+    }
+
+    #[test]
+    fn output_sidecars_may_use_tabix_names_beside_bcf() {
+        let dir = TempDir::new().unwrap();
+        let vcf = input(&dir);
+        let bcf = dir.path().join("input.bcf");
+        write_scored_vcf(&vcf, &bcf, HashMap::new(), THREADS).unwrap();
+        let csi = dir.path().join("input.bcf.csi");
+        let before = std::fs::read(&csi).unwrap();
+        for name in ["input.bcf.tbi", "input.tbi"] {
+            let unused = dir.path().join(name);
+            std::fs::write(&unused, b"unused tabix path").unwrap();
+            let output = dir.path().join(format!("{name}.vcf.gz"));
+            let sidecar = scored_vcf_index(&output).unwrap();
+            std::os::unix::fs::symlink(&unused, sidecar).unwrap();
+            write_scored_vcf(&bcf, &output, HashMap::new(), THREADS).unwrap();
+            assert!(crate::vcf::has_index(&output));
+        }
+        let output = dir.path().join("protected.vcf.gz");
+        std::os::unix::fs::symlink(&csi, scored_vcf_index(&output).unwrap()).unwrap();
+        let error =
+            write_scored_vcf(&bcf, &output, HashMap::new(), THREADS).unwrap_err().to_string();
+        assert!(error.ends_with("is the input VCF index; write to another path"), "{error}");
+        assert_eq!(std::fs::read(&csi).unwrap(), before);
+    }
+
+    #[rstest]
+    #[case::gzip("scored.vcf.gz")]
+    #[case::bgzf("scored.vcf.bgz")]
+    #[case::bcf("scored.bcf")]
+    fn an_index_alias_cannot_replace_an_existing_scored_output(
+        #[case] name: &str,
+        #[values(false, true)] hard_link: bool,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let vcf = input(&dir);
+        let output = dir.path().join(name);
+        let sidecar = scored_vcf_index(&output).unwrap();
+        let before = b"preserve the existing scored output";
+        std::fs::write(&output, before).unwrap();
+        if hard_link {
+            std::fs::hard_link(&output, &sidecar).unwrap();
+        } else {
+            std::os::unix::fs::symlink(name, &sidecar).unwrap();
+        }
+        let error =
+            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap_err().to_string();
+        assert!(error.ends_with("is the input scored VCF; write to another path"), "{error}");
+        assert_eq!(std::fs::read(&output).unwrap(), before);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+    }
+
+    #[test]
+    fn a_dangling_index_link_cannot_overwrite_the_scored_output() {
+        let dir = TempDir::new().unwrap();
+        let vcf = input(&dir);
+        for name in ["scored.vcf.gz", "scored.vcf.bgz", "scored.bcf"] {
+            let output = dir.path().join(name);
+            let sidecar = scored_vcf_index(&output).unwrap();
+            std::os::unix::fs::symlink(name, &sidecar).unwrap();
+            let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS);
+            assert!(result.is_err(), "index overwrote {name}");
+            let mut reader = rust_htslib::bcf::Reader::from_path(&output).unwrap();
+            assert!(reader.records().next().unwrap().is_ok());
+            std::fs::remove_file(sidecar).unwrap();
+            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+            assert!(scored_vcf_index(&output).unwrap().exists());
+        }
+    }
+
+    #[test]
+    fn names_the_index_written_beside_the_output() {
+        let index = |output: &str| scored_vcf_index(Path::new(output));
+        assert_eq!(index("out.BCF"), Some("out.BCF.csi".into()));
+        assert_eq!(index("out.vcf.gz"), Some("out.vcf.gz.tbi".into()));
+        assert_eq!(index("out.vcf.bgz"), Some("out.vcf.bgz.tbi".into()));
+        assert_eq!(index("out.vcf"), None);
     }
 }

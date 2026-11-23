@@ -7,8 +7,9 @@ first. It also needs, for the sample:
   FORMAT tag of its records declared in its header (`extract` and `score` stop with an error naming
   the record otherwise),
 - the gVCF it was genotyped from, indexed, when the VCF lacks the raw annotations (RAW_MQandDP,
-  QUALapprox, VarDP, AS_RAW_MQ); not for models trained on features from the VCF
-  (`extract --feature-source vcf`: see [Feature sources](../user-guide/feature-sources.md)),
+  QUALapprox, VarDP, AS_RAW_MQ); not for models trained on features from the VCF and the reads
+  (`extract --alignments`, which need the sample's BAM or CRAM instead) or from the VCF alone
+  (`extract --feature-source vcf`): see [Feature sources](../user-guide/feature-sources.md),
 - the region BEDs the models were trained with, under the same names, plus GIAB's GRCh38
   `notinalldifficultregions` BED from the
   [genome stratifications](https://github.com/usnistgov/giab-stratifications),
@@ -44,9 +45,12 @@ winnowr score --vcf sample.vcf.gz --gvcf sample.g.vcf.gz --models snp.winnowr.js
   --alignments sample.cram --reference ref.fa -o sample.winnowr.vcf.gz
 ```
 
-Models trained on features from the VCF (`extract --feature-source vcf`) take no `--gvcf`: `score`
-derives the features from the VCF, as the models record. `--regions` still needs a BED for every
-region the models were trained with (here `segdups`), under the same name.
+Models trained on features from the VCF and the reads (`extract --alignments`) take
+`--alignments` and `--reference` and no `--gvcf`: `score` measures the features from the reads,
+with the settings the models record (see [Feature sources](../user-guide/feature-sources.md)).
+
+Models trained on features from the VCF alone (`extract --feature-source vcf`) take no `--gvcf`
+either: `score` derives the features from the VCF, as the models record.
 
 ```console
 winnowr score --vcf sample.vcf.gz --models snp.winnowr.json indel.winnowr.json \
