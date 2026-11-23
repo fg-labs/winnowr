@@ -521,6 +521,7 @@ mod tests {
             flag: 0,
             mapq: 60,
             qual: 30,
+            quals: None,
             bases: Some(bases),
         };
         let reads = [read("both", &both), read("one", &one)];

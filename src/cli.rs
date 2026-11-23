@@ -3139,6 +3139,7 @@ mod tests {
                 flag: 0,
                 mapq,
                 qual: 30,
+                quals: None,
                 bases: None,
             };
             let reads = [

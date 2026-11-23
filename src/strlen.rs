@@ -619,6 +619,8 @@ struct Measuring {
 }
 
 impl SweepSites for Measuring {
+    type ReadCache = Option<rust_htslib::bam::record::CigarStringView>;
+
     fn is_full(&self, i: usize) -> bool {
         self.accumulators[i].is_full()
     }
@@ -628,6 +630,7 @@ impl SweepSites for Measuring {
         &mut self,
         i: usize,
         record: &rust_htslib::bam::Record,
+        _alignment: (i64, i64),
         cigar: &mut Option<rust_htslib::bam::record::CigarStringView>,
     ) {
         self.accumulators[i].add(record, cigar);
@@ -1086,7 +1089,16 @@ mod tests {
     }
 
     fn read<'a>(name: &'a str, pos: i64, cigar: &'a str) -> crate::testing::TestRead<'a> {
-        crate::testing::TestRead { name, pos, cigar, flag: 0, mapq: 60, qual: 30, bases: None }
+        crate::testing::TestRead {
+            name,
+            pos,
+            cigar,
+            flag: 0,
+            mapq: 60,
+            qual: 30,
+            quals: None,
+            bases: None,
+        }
     }
 
     #[test]
@@ -1185,6 +1197,7 @@ mod tests {
                 flag: *flag,
                 mapq: *mapq,
                 qual: *qual,
+                quals: None,
                 bases: None,
             })
             .collect();

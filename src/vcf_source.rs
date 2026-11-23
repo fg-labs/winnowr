@@ -98,6 +98,14 @@ fn is_variant(called: CalledAlts) -> bool {
     called[0].is_some()
 }
 
+/// True if the alternate allele of 1-based `index` is one ReblockGVCF keeps (with its FORMAT/AD
+/// and `AS_RAW_MQ`): an allele a variant genotype calls, or any allele of a genotype that is not a
+/// variant. `n_alt` counts these alleles, and the alignments source's allele sums are of them.
+#[must_use]
+pub fn counts_allele(called: CalledAlts, index: u32) -> bool {
+    !is_variant(called) || called.contains(&Some(index))
+}
+
 /// The FORMAT/AD of the reference and the called alternate alleles, summed, with missing depths
 /// left out (`None` if every one is missing), as ReblockGVCF keeps them: it drops the alternate
 /// alleles the genotype does not call, with their depths.

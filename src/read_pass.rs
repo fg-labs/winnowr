@@ -91,16 +91,21 @@ pub const CLUSTER_GAP: i64 = 10_000;
 
 /// The sites of one contig that [`sweep_clusters`] adds reads to, with the state they accumulate.
 pub trait SweepSites {
+    /// Lazily computed read data shared across sites; reset before each read.
+    type ReadCache: Default;
+
     /// True once site `i` takes no more reads.
     fn is_full(&self, i: usize) -> bool;
 
-    /// Adds a read that overlaps site `i`'s span. `cigar` caches the read's decoded CIGAR across
-    /// the sites it is added to: it is decoded the first time a site needs it.
+    /// Adds a read that overlaps site `i`'s span. `alignment` is the read's 0-based, half-open
+    /// span on the reference (its start, and its [`alignment_end`]), computed once per read.
+    /// `cache` holds any read data decoded by a previous site, so later sites can reuse it.
     fn add(
         &mut self,
         i: usize,
         record: &rust_htslib::bam::Record,
-        cigar: &mut Option<rust_htslib::bam::record::CigarStringView>,
+        alignment: (i64, i64),
+        cache: &mut Self::ReadCache,
     );
 }
 
@@ -153,12 +158,12 @@ pub fn sweep_clusters<S: SweepSites>(
             if open.is_empty() && next == cluster.len() {
                 break;
             }
-            // The CIGAR is decoded once per read, only if a site needs it.
-            let mut cigar = None;
+            // Decoded data are shared across sites, but never across reads.
+            let mut cache = S::ReadCache::default();
             for &i in &open {
                 let (beg, site_end) = spans[i];
                 if start < site_end && end > beg {
-                    sites.add(i, &record, &mut cigar);
+                    sites.add(i, &record, (start, end), &mut cache);
                 }
             }
         }
@@ -254,8 +259,8 @@ fn plan_shards<S: AsRef<str>>(
         let region = Region::parse(region.as_ref(), &contigs)?;
         if !contigs.contains(&region.chrom.as_str()) {
             bail!(
-                "contig {} of region {} is not in the VCF header; choose the regions with \
-                 --regions (default chr1-chr22)",
+                "contig {} of region {} is not in the VCF header: measure only contigs the VCF \
+                 has (`strlen` and `pileup` take them from --regions, by default chr1-chr22)",
                 region.chrom,
                 region.as_ref_str()
             );
