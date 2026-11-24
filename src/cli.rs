@@ -1558,7 +1558,7 @@ fn prepare_source<'a>(
     }
     let mut timer = PhaseTimer::start();
     let (sites, pileup) = measure_annotations_and_pileup(&reads, contigs, &options, pileup)?;
-    timer.lap("measuring the reads");
+    timer.lap_total("measuring the reads");
     let calls =
         sites.iter().filter_map(|site| Some((site.row.chrom.as_str(), site.mapq.as_ref()?)));
     summarise(calls, contigs, &options)?;
@@ -3058,6 +3058,7 @@ fn score_with<F: FnOnce()>(
     threads: NonZeroUsize,
     before_output_check: F,
 ) -> Result<()> {
+    let mut timer = PhaseTimer::start();
     args.policy.validate()?;
     check_policy_region_names(&args.regions)?;
     check_output_dir("--output", &args.output)?;
@@ -3098,6 +3099,7 @@ fn score_with<F: FnOnce()>(
         .zip(&texts)
         .map(|(path, text)| ModelInfo::from_model_json(text).with_context(|| load_error(path)))
         .collect::<Result<_>>()?;
+    timer.lap("reading the models");
     let summary = VcfSummary::read(&args.vcf)?;
     let infos: Vec<&ModelInfo> = parts.iter().map(|(info, _)| info).collect();
     // Protect feature inputs before provenance inspection can open the same paths.
@@ -3152,6 +3154,7 @@ fn score_with<F: FnOnce()>(
             &checked_tables,
         );
     let reads = &checked_reads;
+    timer.lap("reading the VCF summary and the reads' alignment provenance");
     // Every problem of the model set is reported at once (see `winnowr check-models`). The
     // region BEDs are read later, those a model uses only.
     let set_inputs = SetInputs {
@@ -3200,6 +3203,7 @@ fn score_with<F: FnOnce()>(
     }
     let protected_beds: Vec<PathBuf> = plan.paths().map(Path::to_path_buf).collect();
     let prospective_beds: Vec<PathBuf> = plan.prospective_paths().map(Path::to_path_buf).collect();
+    timer.lap("checking the model set");
     for output in &outputs {
         crate::scoring::check_output_not_input(
             output,
@@ -3220,6 +3224,7 @@ fn score_with<F: FnOnce()>(
         .collect::<Result<_>>()?;
     // The model files' text (each with its serialized booster) is not needed past here.
     drop(texts);
+    timer.lap("loading the boosters");
     let infos: Vec<&ModelInfo> = models.iter().map(|model| &model.info).collect();
     let feature_source = models_feature_source(&infos).unwrap_or_default();
     if !feature_source.is_default() {
@@ -3256,6 +3261,7 @@ fn score_with<F: FnOnce()>(
         evidence_tags,
         check,
     )?;
+    timer.lap("reading the repeat-length and pileup tables");
     // The region BEDs are read after the evidence, as one producer may feed an evidence stream
     // before a BED stream: reading the BEDs first would wait on it forever.
     // The features' regions, and the not-difficult regions when the policy reads them: by
@@ -3283,6 +3289,7 @@ fn score_with<F: FnOnce()>(
     // reads. Without them the outside indel threshold alone is not applied, with a warning.
     args.policy
         .require_not_difficult(not_difficult.is_some() || not_difficult_feature.is_some())?;
+    timer.lap("reading the region BEDs");
     let scored_reads = if checks_provenance {
         loaded_score_alignment(
             args,
@@ -3322,6 +3329,7 @@ fn score_with<F: FnOnce()>(
         &alignment_problems,
         uses_reads && args.alignments.is_some(),
     );
+    timer.lap("checking the reads' alignment");
     // Evidence measured from the reads while scoring, as the models need it (--alignments
     // conflicts with --strlen and --pileup, so nothing is both read and measured).
     let measure = match (&args.alignments, &args.reference) {
@@ -3375,24 +3383,26 @@ fn score_with<F: FnOnce()>(
     let pileup_with_reads = pileup_options.filter(|_| read_annotations.is_some());
     let source =
         prepare_source(feature_source, args.gvcf.as_deref(), reads, pileup_with_reads, &checks)?;
+    timer.lap_total("preparing the source");
     // --pileup conflicts with --alignments, so the pileup is either read or measured.
     let pileup = pileup.as_ref().or(source.pileup());
     let mut inputs =
         score_table_inputs(args, source.annotations(), &regions, strlen.as_ref(), pileup);
     inputs.outputs = &outputs;
     let table = build_feature_table(&sample, &args.vcf, &contigs, &summary, &inputs)?;
+    timer.lap_total("building the feature table");
     let not_difficult =
         not_difficult.or_else(|| not_difficult_feature.map(|index| regions.swap_remove(index)));
-    let mut timer = PhaseTimer::start();
     let policy = args.policy.policy(args.mode, &contigs, not_difficult, indel_genotype)?;
+    timer.lap("building the policy");
     let decisions = match measure {
         None => decide_calls(&table, &models, &policy)?,
         Some((measure, strlen, pileup)) => {
             let measuring = Measuring { inputs: &measure, strlen, pileup, contigs: &contigs };
-            measure_and_decide(table, &mut models, &policy, &measuring, &mut timer)?
+            measure_and_decide(table, &mut models, &policy, &measuring)?
         }
     };
-    timer.lap("scoring");
+    timer.lap_total("scoring");
     before_output_check();
     // Recheck the retained provenance inputs just before writing: output symlinks may have changed
     // since preflight. Skipped streams were never inputs and remain excluded.
@@ -3428,7 +3438,7 @@ fn score_with<F: FnOnce()>(
         check_output_not_bed_identities(output, &bed_identities)?;
     }
     write_scored_vcf(&args.vcf, &args.output, decisions, threads, &bed_identities)?;
-    timer.lap("writing the VCF");
+    timer.lap_total("writing the VCF");
     Ok(())
 }
 

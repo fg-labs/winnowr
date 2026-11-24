@@ -146,7 +146,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
         timer.lap("reading the hap.py labels");
     }
     let derived = derive_features(&records, inputs.regions, inputs.dp_median);
-    timer.lap("deriving features");
+    timer.lap_total("deriving features");
     let info = FeatureTableInfo {
         sample: sample.to_string(),
         contigs: contigs.iter().map(|contig| contig.as_ref().to_string()).collect(),
@@ -168,11 +168,12 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
             .collect::<Result<_>>()?,
     };
     let mut table = FeatureTable::from_records(&records, derived, info)?;
+    timer.lap_total("building the table");
     drop(records);
-    timer.lap("building the table");
+    timer.lap("dropping the records");
     if let Some(strlen) = inputs.strlen {
         table = add_strlen_features(table, strlen)?;
-        timer.lap("joining the repeat-length features");
+        timer.lap_total("joining the repeat-length features");
     }
     if let Some(pileup) = inputs.pileup {
         table = add_pileup_features(table, pileup)?;
@@ -197,6 +198,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
             timer.lap("reading the truth variants at FNs");
             let confident = RegionSet::from_bed("confident", truth_bed)?;
             confident.check_contigs(contigs)?;
+            timer.lap("reading the confident regions");
             table = attach_promote_labels(
                 table,
                 &truth,

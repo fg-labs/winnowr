@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 
 use crate::alignment_provenance::AlignmentProvenance;
 use crate::alleles::{Genotype, length_change, trim_alleles, variant_type_of};
-use crate::common::VariantType;
+use crate::common::{PhaseTimer, VariantType};
 use crate::evidence::{Evidence, EvidenceTables, write_table};
 use crate::read_annotations::{MapqSums, ReadAnnotationOptions, UNAVAILABLE_MAPQ};
 use crate::read_pass::{
@@ -1471,7 +1471,11 @@ pub fn measure_pileup<S: AsRef<str>>(
     options: &PileupOptions,
 ) -> Result<Vec<PileupRow>> {
     // Without read annotations, every site measured is counted.
-    Ok(measure_sites(inputs, regions, options, None)?.into_iter().map(|site| site.row).collect())
+    let sites = measure_sites(inputs, regions, options, None, "counting the pileup")?;
+    let mut timer = PhaseTimer::start();
+    let rows = sites.into_iter().map(|site| site.row).collect();
+    timer.lap_in("counting the pileup", "building the rows");
+    Ok(rows)
 }
 
 /// Measures the read annotations (see [`MapqSums`]) of every SNP and indel record (any FILTER)
@@ -1492,7 +1496,7 @@ pub fn measure_annotations<S: AsRef<str>>(
     annotations: &ReadAnnotationOptions,
 ) -> Result<Vec<MeasuredSite>> {
     let options = PileupOptions::reading_alleles_as(annotations);
-    measure_sites(inputs, regions, &options, Some(annotations))
+    measure_sites(inputs, regions, &options, Some(annotations), "measuring the read annotations")
 }
 
 /// Measures the read annotations of every SNP and indel record in the regions (see
@@ -1516,7 +1520,8 @@ pub fn measure_annotations_and_pileup<S: AsRef<str>>(
         return Ok((measure_annotations(inputs, regions, annotations)?, None));
     };
     if options.reads_alleles_as(annotations) {
-        let sites = measure_sites(inputs, regions, &options, Some(annotations))?;
+        let what = "measuring the read annotations and the pileup";
+        let sites = measure_sites(inputs, regions, &options, Some(annotations), what)?;
         let rows = sites.iter().filter(|site| site.counted).map(|site| site.row.clone()).collect();
         return Ok((sites, Some(PileupTables::new(options, rows))));
     }
@@ -1541,17 +1546,21 @@ pub fn measure_annotations_and_pileup<S: AsRef<str>>(
 ///
 /// `annotations` must read alleles as `options` do (the callers in this module see to it): the
 /// reads' alleles are read with `options`.
+///
+/// The pass is timed at debug level as `what` (what the caller measures with it).
 fn measure_sites<S: AsRef<str>>(
     inputs: &ReadInputs<'_>,
     regions: &[S],
     options: &PileupOptions,
     annotations: Option<&ReadAnnotationOptions>,
+    what: &str,
 ) -> Result<Vec<MeasuredSite>> {
     use rust_htslib::bcf::Read as _;
     debug_assert!(
         annotations.is_none_or(|annotations| options.reads_alleles_as(annotations)),
         "the alignment settings {annotations:?} do not read alleles as {options} does"
     );
+    let mut timer = PhaseTimer::start();
     let per_shard = run_shards(inputs, regions, CRAM_REQUIRED_FIELDS, |shard| {
         let mut pending: Vec<(PileupRow, Target)> = Vec::new();
         if !shard.fetch_records(inputs.vcf)? {
@@ -1622,7 +1631,10 @@ fn measure_sites<S: AsRef<str>>(
             })
             .collect())
     })?;
-    Ok(per_shard.into_iter().flatten().collect())
+    timer.lap_in(what, "the shards");
+    let sites = per_shard.into_iter().flatten().collect();
+    timer.lap_in(what, "collecting the sites");
+    Ok(sites)
 }
 
 #[cfg(test)]
@@ -2190,8 +2202,8 @@ mod tests {
             ..read(name, *pos, cigar, *mapq)
         }));
         let fixture = fixture(dir.path(), &RECORDS, &reads);
-        let sites =
-            measure_sites(&fixture.inputs(), &["chr1"], options, Some(annotations)).unwrap();
+        let sites = measure_sites(&fixture.inputs(), &["chr1"], options, Some(annotations), "test")
+            .unwrap();
         let rows = measure_pileup(&fixture.inputs(), &["chr1"], options).unwrap();
         (sites, rows)
     }
@@ -2277,7 +2289,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let fixture = fixture(dir.path(), &RECORDS, &[read("r", 90, "70M", 60)]);
         let options = PileupOptions::default();
-        let sites = measure_sites(&fixture.inputs(), &["chr1"], &options, None).unwrap();
+        let sites = measure_sites(&fixture.inputs(), &["chr1"], &options, None, "test").unwrap();
         let summary: Vec<(u64, bool, Option<MapqSums>)> =
             sites.iter().map(|site| (site.row.pos, site.counted, site.mapq)).collect();
         assert_eq!(summary, [(80, true, None), (123, true, None)]);
@@ -3554,7 +3566,8 @@ mod tests {
         let fixture = fixture(dir.path(), &RECORDS[2..], &reads);
         let (options, annotations) = (PileupOptions::default(), ReadAnnotationOptions::default());
         let mut sites =
-            measure_sites(&fixture.inputs(), &["chr1"], &options, Some(&annotations)).unwrap();
+            measure_sites(&fixture.inputs(), &["chr1"], &options, Some(&annotations), "test")
+                .unwrap();
         let mut rows = measure_pileup(&fixture.inputs(), &["chr1"], &options).unwrap();
         assert_eq!((sites.len(), rows.len()), (1, 1));
         (sites.remove(0), rows.remove(0))

@@ -202,11 +202,15 @@ pub fn decide_calls(
     policy: &Policy,
 ) -> Result<HashMap<CallKey, Decision>> {
     check_model_kinds(models.iter().map(|model| &model.info))?;
+    let mut timer = PhaseTimer::start();
     let per_model = models
         .iter()
         .map(|model| decide_model_calls(table, model, policy, Predicting::Whole))
         .collect::<Result<Vec<_>>>()?;
-    Ok(merge_decisions(per_model))
+    timer.lap_total("scoring the models");
+    let decisions = merge_decisions(per_model);
+    timer.lap("merging the decisions");
+    Ok(decisions)
 }
 
 /// Checks that there is at most one model per task and variant type.
@@ -288,17 +292,27 @@ pub fn decide_model_rows(
     predicting: Predicting,
     timer: &mut PhaseTimer,
 ) -> Result<ModelRowDecisions> {
+    let what = format!("{} {}", model.info.task, model.info.variant_type);
     let mask = scored_mask(table, model)?;
     let rows: Vec<usize> = (0..mask.len()).filter(|&row| mask[row]).collect();
+    timer.lap_in(&what, "choosing the calls it scores");
     let calls = table.filter(&mask)?;
+    timer.lap_in(&what, "filtering the table");
     let calls = match &model.info.stutter {
         None => without_regenotype(calls)?,
-        Some(stutter) => with_regenotype_columns(add_length_call_features(calls, stutter)?)?,
+        Some(stutter) => {
+            let calls = add_length_call_features(calls, stutter)?;
+            timer.lap_in(&what, "the length-call features");
+            with_regenotype_columns(calls)?
+        }
     };
-    let what = format!("{} {}", model.info.task, model.info.variant_type);
-    timer.lap(&format!("{what}: selecting the calls"));
+    let columns = match model.info.stutter {
+        None => "the all-false re-genotype columns",
+        Some(_) => "the re-genotype columns",
+    };
+    timer.lap_in(&what, columns);
     let probabilities = model.predict_with(&calls, predicting)?;
-    timer.lap(&format!("{what}: predicting"));
+    timer.lap_total(format_args!("{what}: predicting"));
     let n = calls.num_rows();
     let flippable = calls.bool_column("flippable")?;
     let vt = model.info.variant_type;
@@ -334,6 +348,7 @@ pub fn decide_model_rows(
             (actions.drop, vec![false; n], actions.flip, actions.regenotype)
         }
     };
+    timer.lap_in(&what, "deciding the actions");
     Ok(ModelRowDecisions { rows, calls, probabilities, drop, promote, flip, regenotype })
 }
 
@@ -364,13 +379,16 @@ pub fn decide_model_calls(
     let n = calls.num_rows();
     let targets: Vec<Option<RegenotypeTarget>> =
         if regenotype.contains(&true) { regenotype_targets(&calls)? } else { vec![None; n] };
+    timer.lap_in(&what, "the re-genotype targets");
     let keys = call_keys(&calls)?;
+    timer.lap_in(&what, "the call keys");
     // The first call with a key gets the decision; the rest are dropped. Keys are built and
     // decisions made in parallel; only the first-wins pass is serial.
     let first: Vec<bool> = {
         let mut seen: HashSet<&CallKey> = HashSet::with_capacity(n);
         keys.iter().map(|key| seen.insert(key)).collect()
     };
+    timer.lap_in(&what, "the first-wins pass");
     let targets = &targets;
     let probabilities = &probabilities;
     let task = model.info.task;
@@ -390,12 +408,13 @@ pub fn decide_model_calls(
             (key, decision)
         })
         .collect();
+    timer.lap_in(&what, "building the decisions");
     // Counted from the decisions, so a call repeating an earlier call's key is not counted.
     let count = |action: fn(&Decision) -> bool| decisions.iter().filter(|(_, d)| action(d)).count();
     let (n_drop, n_promote) = (count(|d| d.drop), count(|d| d.promote));
     let (n_flip, n_regenotype) = (count(|d| d.flip), count(|d| d.regenotype.is_some()));
     let n_decided = decisions.len();
-    timer.lap(&format!("{what}: deciding"));
+    timer.lap_in(&what, "counting the actions");
     info!(
         "{} {}: scored {n_decided} calls, drop {n_drop}, promote {n_promote}, flip {n_flip}, \
          re-genotype {n_regenotype}",

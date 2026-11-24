@@ -32,7 +32,7 @@ use rust_htslib::bcf::record::{GenotypeAllele, Numeric, Record};
 use rust_htslib::bcf::{Format, Header, IndexedReader, Read, Reader, Writer};
 
 use crate::alleles::Genotype;
-use crate::common::{PASS, Task, has_suffix, is_bgzf_path};
+use crate::common::{PASS, PhaseTimer, Task, has_suffix, is_bgzf_path};
 use crate::labels::Label;
 use crate::policy::{CallKey, Decision};
 use crate::shards::{ReaderPool, contig_shards};
@@ -142,6 +142,7 @@ pub fn write_scored_vcf(
     threads: NonZeroUsize,
     protected_beds: &[crate::io::FileIdentity],
 ) -> Result<()> {
+    let mut timer = PhaseTimer::start();
     check_output_not_input(output, [("VCF", vcf)])?;
     let indexes = crate::vcf::index_candidates(vcf);
     check_output_not_indexes(output, "VCF index", &indexes)?;
@@ -184,10 +185,17 @@ pub fn write_scored_vcf(
             None
         }
     });
+    timer.lap_in("writing the VCF", "scanning the input");
     let index = DecisionIndex::new(&decisions);
+    timer.lap_in("writing the VCF", "indexing the decisions");
     let (applied, n_applied) = match sharded {
-        Some(contigs) => write_sharded(vcf, output, &index, &contigs, protected_beds)?,
-        None => write_serial(vcf, output, &index, threads, format, uncompressed, protected_beds)?,
+        Some(contigs) => write_sharded(vcf, output, &index, &contigs, protected_beds, &mut timer)?,
+        None => {
+            let written =
+                write_serial(vcf, output, &index, threads, format, uncompressed, protected_beds)?;
+            timer.lap_in("writing the VCF", "writing it in one pass");
+            written
+        }
     };
     let unmatched = decisions.len() - n_applied;
     if unmatched > 0 {
@@ -211,6 +219,7 @@ pub fn write_scored_vcf(
         let workers = u32::try_from(threads.get() - 1).unwrap_or(u32::MAX);
         index::build(output, None, workers, index_type)
             .map_err(|e| anyhow::anyhow!("failed to index {}: {e}", output.display()))?;
+        timer.lap_in("writing the VCF", "indexing the VCF");
     }
     if applied.duplicates > 0 {
         warn!(
@@ -230,6 +239,10 @@ pub fn write_scored_vcf(
         applied.flip,
         applied.regenotype
     );
+    // Dropped here rather than on return, to time it: freeing millions of decisions is not free.
+    drop(index);
+    drop(decisions);
+    timer.lap_in("writing the VCF", "dropping the decisions");
     Ok(())
 }
 
@@ -393,13 +406,14 @@ struct ShardReaders {
 /// pool, each to its own bgzipped VCF, then concatenates their BGZF blocks after the header's.
 /// htslib writes (and flushes) a VCF header as its own blocks, so every shard file starts with
 /// the same header blocks, which are dropped. Returns the counts and the number of decisions
-/// applied.
+/// applied. The writing and the concatenating are timed with `timer`.
 fn write_sharded(
     vcf: &Path,
     output: &Path,
     decisions: &DecisionIndex<'_>,
     contigs: &[String],
     protected_beds: &[crate::io::FileIdentity],
+    timer: &mut PhaseTimer,
 ) -> Result<(Applied, usize)> {
     use std::io::Write as _;
 
@@ -426,6 +440,7 @@ fn write_sharded(
     // A contig's last shard is open-ended, so a record past its declared length is still
     // written.
     let shards = contig_shards(&summary, contigs, WRITE_SHARD_SPAN);
+    timer.lap_in("writing the VCF", "preparing the shards");
     let pool: ReaderPool<ShardReaders> = ReaderPool::new();
     let written: Vec<(Option<std::path::PathBuf>, Applied, usize)> = shards
         .par_iter()
@@ -453,6 +468,7 @@ fn write_sharded(
             result.map(|(wrote, applied, n_applied)| (wrote.then_some(path), applied, n_applied))
         })
         .collect::<Result<_>>()?;
+    timer.lap_in("writing the VCF", "writing the shards");
 
     let mut out = std::io::BufWriter::new(crate::io::create_output(output, protected_beds)?);
     out.write_all(header_blocks)
@@ -471,6 +487,7 @@ fn write_sharded(
     out.write_all(&crate::io::BGZF_EOF)
         .and_then(|()| out.flush())
         .with_context(|| format!("failed to write {}", output.display()))?;
+    timer.lap_in("writing the VCF", "concatenating the shards");
     Ok((applied, n_applied))
 }
 

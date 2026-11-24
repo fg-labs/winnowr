@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::alignment_provenance::AlignmentProvenance;
+use crate::common::PhaseTimer;
 use crate::evidence::{Evidence, EvidenceTables, write_table};
 use crate::read_pass::{
     MAX_READS, ReadInputs, Shard, SweepSites, anchored_length, run_shards, sweep_clusters,
@@ -712,14 +713,18 @@ pub fn measure_regions<S: AsRef<str>>(
 ) -> Result<Vec<StrlenSite>> {
     // Ignored for BAM; for CRAM, skips decoding the fields the tract pass does not read.
     let names = if options.collapse_mates { CRAM_READ_NAME } else { 0 };
+    let mut timer = PhaseTimer::start();
     let per_shard = run_shards(inputs, regions, CRAM_REQUIRED_FIELDS | names, |shard| {
         measure_shard(shard, inputs, options)
     })?;
+    timer.lap_in("measuring the repeat lengths", "the shards");
     let skipped: usize = per_shard.iter().map(|(_, skipped)| skipped).sum();
     if skipped > 0 {
         log::info!("Skipped {skipped} indel records without a pure insertion or deletion allele");
     }
-    Ok(per_shard.into_iter().flat_map(|(sites, _)| sites).collect())
+    let sites = per_shard.into_iter().flat_map(|(sites, _)| sites).collect();
+    timer.lap_in("measuring the repeat lengths", "collecting the sites");
+    Ok(sites)
 }
 
 /// The htslib CRAM fields the tract pass reads (FLAG, RNAME, POS, MAPQ, CIGAR and QUAL), so CRAM

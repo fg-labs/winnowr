@@ -1032,6 +1032,7 @@ pub fn stratify(
                 promote.insert(vt, index);
             }
         }
+        timer.lap_in(format_args!("{} {vt}", model.info.task), "tallying the actions");
     }
     let variant_types: Vec<VariantType> = {
         let mut types: Vec<VariantType> = models.iter().map(|m| m.info.variant_type).collect();
