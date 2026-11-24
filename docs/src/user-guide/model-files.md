@@ -25,6 +25,7 @@ information and, under `booster`, the XGBoost booster in XGBoost's JSON format. 
 | `strlen_settings`    | the read settings of the repeat-length evidence it was trained on              |
 | `pileup_settings`    | the settings of the pileup evidence it was trained on                          |
 | `feature_source`     | `vcf` for a model trained on features derived from the VCF, `alignments:` and the read settings for one trained on features measured from the reads too (see [Feature sources](feature-sources.md)); absent for `gvcf` |
+| `alignment`          | how the training reads were aligned: an object of tags (e.g. `{"aligner": "bwa-mem3", "alt-project": "primary", ...}`, see [Alignment provenance](alignment-provenance.md)); absent when unknown |
 | `winnowr_version`    | the winnowr version that trained it                                            |
 | `xgboost_version`    | the XGBoost version that trained it                                            |
 
@@ -55,6 +56,10 @@ set of models, without scoring, and reports every problem. When it loads a model
   default, `gvcf`), read settings included for a `alignments` source; older winnowr versions
   refuse a model of another source, but read its feature tables as `gvcf`. See
   [Feature sources](feature-sources.md).
+- **Alignment provenance.** `score` compares the model's `alignment` with how the reads were
+  aligned, and warns where they differ (an error with `--strict-provenance`). A model that records
+  none (as models of older winnowr versions) is not checked; older winnowr versions refuse a model
+  that records one. See [Alignment provenance](alignment-provenance.md).
 - **Consistency.** The booster must have the model's features, in order, and its number of classes.
 
 The models given to one `score` run must be trained on the same contigs, with at most one genotype

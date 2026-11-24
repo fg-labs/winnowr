@@ -27,6 +27,11 @@ The table records the depth it divided by, and whether it was given, in its meta
 (`dp_norm_divisor`), for provenance: nothing checks it. Tables written by older winnowr versions
 record none.
 
+The table records how the sample's reads were aligned (`alignment`), from the `--strlen` and
+`--pileup` tables and the header of `--alignments`, with `--alignment-tags` applied over each,
+which must then agree; without any of them, from `--alignment-tags` alone. See
+[Alignment provenance](../user-guide/alignment-provenance.md).
+
 ## Usage
 
 ```console

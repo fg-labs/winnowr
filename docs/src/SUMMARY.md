@@ -15,6 +15,7 @@
   - [Feature sources](user-guide/feature-sources.md)
   - [Repeat-length features](user-guide/repeat-length.md)
   - [Pileup features](user-guide/pileup.md)
+  - [Alignment provenance](user-guide/alignment-provenance.md)
   - [Evaluating and stratifying](user-guide/evaluating.md)
   - [Model files](user-guide/model-files.md)
   - [Performance tuning](user-guide/performance.md)

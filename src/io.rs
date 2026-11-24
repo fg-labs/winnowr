@@ -72,17 +72,20 @@ pub fn open_text<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened, or is BGZF-compressed without the end-of-file
-/// block.
+/// Returns an error if the file cannot be opened, changes from regular to nonregular during
+/// the EOF check, or is BGZF-compressed without the end-of-file block.
 pub fn open_table<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
-    let path = path.as_ref();
+    open_table_with(path.as_ref(), || {})
+}
+
+/// [`open_table`], calling `before_eof_open` just before the EOF check opens its input.
+fn open_table_with<F: FnOnce()>(path: &Path, before_eof_open: F) -> Result<Box<dyn BufRead>> {
     // Only a regular file can be checked: reading the start of a pipe (e.g. process substitution)
     // would consume it.
-    let regular = std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
-    if regular
+    if is_regular_file(path)
         && rust_htslib::bgzf::is_bgzip(path)
             .with_context(|| format!("failed to open {}", path.display()))?
-        && lacks_bgzf_eof(path)
+        && lacks_bgzf_eof_with(path, before_eof_open)?
     {
         anyhow::bail!(
             "{} is truncated (no BGZF end-of-file block): write it again",
@@ -92,15 +95,152 @@ pub fn open_table<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
     open_text(path)
 }
 
-/// True if a regular file does not end with the BGZF end-of-file block. Files that cannot be
-/// checked (e.g. pipes) are assumed complete.
-pub fn lacks_bgzf_eof(path: &Path) -> bool {
-    let check = || -> std::io::Result<bool> {
-        let mut file = File::open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Ok(false);
+/// Opens a table for metadata-only inspection (e.g. its provenance prelude) if, and only if, it
+/// is a regular file; `None` for anything else (e.g. a pipe, which reading would consume).
+///
+/// The regular-file decision is made on the opened handle, and every byte returned is read from
+/// that same handle. If a regular path becomes nonregular before opening, inspection fails
+/// instead of continuing to a second open for rows. The nonblocking open can still release a
+/// FIFO producer on that failed run; it does not preserve the stream for a retry.
+///
+/// Prelude inspection needs only the first lines, so decompression here uses flate2; tables are
+/// still read in full with [`open_table`] (htslib).
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, changes from regular to nonregular while being
+/// opened, or is BGZF-compressed without the end-of-file block.
+pub fn open_regular_table(path: &Path) -> Result<Option<Box<dyn BufRead>>> {
+    open_regular_table_with(path, || {})
+}
+
+/// [`open_regular_table`], calling `before_open` between classifying the path and opening it (so
+/// tests can replace the path in between).
+fn open_regular_table_with<F: FnOnce()>(
+    path: &Path,
+    before_open: F,
+) -> Result<Option<Box<dyn BufRead>>> {
+    // Skip known streams. A raced FIFO may still release its producer, so detecting one on the
+    // opened handle must fail the run rather than retrying the stream for rows.
+    if !is_regular_file(path) {
+        return Ok(None);
+    }
+    before_open();
+    let context = || format!("failed to open {}", path.display());
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The path can become a FIFO after the check above; never wait for its producer.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).with_context(context)?;
+    if !file.metadata().with_context(context)?.is_file() {
+        anyhow::bail!(
+            "{} changed type while being opened: expected a regular file",
+            path.display()
+        );
+    }
+    decompressing_reader(file, path).map(Some)
+}
+
+/// A buffered reader of an opened regular file, decompressing it if it is gzip- or
+/// BGZF-compressed (whatever its extension). A BGZF file must end with the end-of-file block,
+/// which is checked by seeking on `file` itself. `path` only names the file in errors.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, or is BGZF-compressed without the end-of-file
+/// block.
+fn decompressing_reader(mut file: File, path: &Path) -> Result<Box<dyn BufRead>> {
+    let context = || format!("failed to read {}", path.display());
+    let length = file.metadata().with_context(context)?.len();
+    // Gzip's extra fields may precede BC; walk each subfield within XLEN (SAM/BAM spec 4.1).
+    let mut prefix = [0u8; 12];
+    let prefix_length = usize::try_from(length.min(prefix.len() as u64))?;
+    file.read_exact(&mut prefix[..prefix_length]).with_context(context)?;
+    let gzip = prefix[..2] == [0x1f, 0x8b];
+    let mut bgzf = false;
+    if prefix_length == prefix.len() && gzip && prefix[2] == 8 && prefix[3] & 4 != 0 {
+        let mut extra = vec![0; usize::from(u16::from_le_bytes([prefix[10], prefix[11]]))];
+        file.read_exact(&mut extra).with_context(context)?;
+        let mut rest = extra.as_slice();
+        while rest.len() >= 4 {
+            let size = usize::from(u16::from_le_bytes([rest[2], rest[3]]));
+            if size > rest.len() - 4 {
+                anyhow::bail!("{} has a malformed gzip extra field", path.display());
+            }
+            bgzf |= rest[..2] == *b"BC" && size == 2;
+            rest = &rest[4 + size..];
         }
+        if !rest.is_empty() {
+            anyhow::bail!("{} has a malformed gzip extra field", path.display());
+        }
+    }
+    if bgzf {
+        let eof_length = BGZF_EOF.len() as u64;
+        let mut tail = [0u8; BGZF_EOF.len()];
+        let complete = length >= eof_length && {
+            file.seek(SeekFrom::Start(length - eof_length)).with_context(context)?;
+            file.read_exact(&mut tail).with_context(context)?;
+            tail == BGZF_EOF
+        };
+        if !complete {
+            anyhow::bail!(
+                "{} is truncated (no BGZF end-of-file block): write it again",
+                path.display()
+            );
+        }
+    }
+    file.rewind().with_context(context)?;
+    Ok(if gzip {
+        // BGZF is a series of gzip members, as is concatenated gzip.
+        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    })
+}
+
+/// True if `path` is a regular file: not, e.g., a pipe (process substitution), which reading
+/// would consume, or a missing file.
+pub fn is_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// True if a regular file does not end with the BGZF end-of-file block. Files that cannot be
+/// checked (e.g. pipes, missing files, or unreadable files) are assumed complete.
+///
+/// # Errors
+///
+/// Returns an error if a path classified as regular is nonregular when opened. A raced FIFO
+/// may have released its producer, so callers must not continue by reopening it for rows.
+pub fn lacks_bgzf_eof(path: &Path) -> Result<bool> {
+    lacks_bgzf_eof_with(path, || {})
+}
+
+/// Checks the EOF after calling `before_open` between classification and opening the path.
+fn lacks_bgzf_eof_with<F: FnOnce()>(path: &Path, before_open: F) -> Result<bool> {
+    if !is_regular_file(path) {
+        return Ok(false);
+    }
+    before_open();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let Ok(mut file) = options.open(path) else { return Ok(false) };
+    let Ok(metadata) = file.metadata() else { return Ok(false) };
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "{} changed type while being opened: expected a regular file",
+            path.display()
+        );
+    }
+    let mut check = || -> std::io::Result<bool> {
         if metadata.len() < BGZF_EOF.len() as u64 {
             return Ok(true);
         }
@@ -109,7 +249,7 @@ pub fn lacks_bgzf_eof(path: &Path) -> bool {
         file.read_exact(&mut tail)?;
         Ok(tail != BGZF_EOF)
     };
-    check().unwrap_or(false)
+    Ok(check().unwrap_or(false))
 }
 
 /// Writes a tab-separated file with a header line.
@@ -197,7 +337,8 @@ mod tests {
         assert!(open_table(&plain).is_ok());
     }
 
-    /// A table read from a pipe (e.g. `--strlen <(...)`) is read once, from its start.
+    /// A table read from a pipe (e.g. `--strlen <(...)`) is read once, from its start. The reader
+    /// and writer are separate processes under one deadline, so a missed read fails, not hangs.
     #[cfg(unix)]
     #[test]
     fn tables_are_read_from_a_pipe() {
@@ -205,15 +346,180 @@ mod tests {
         let fifo = dir.path().join("table.fifo");
         let status = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(status.success());
-        let data = [bgzf_block(b"a\nb\n"), BGZF_EOF.to_vec()].concat();
-        let writer = {
-            let fifo = fifo.clone();
-            std::thread::spawn(move || std::fs::write(fifo, data).unwrap())
+        let mut processes = crate::testing::TestProcesses::default();
+        for role in ["reader", "writer"] {
+            let envs = [
+                ("WINNOWR_IO_FIFO_ROLE", std::ffi::OsStr::new(role)),
+                ("WINNOWR_IO_FIFO", fifo.as_os_str()),
+            ];
+            // A log each: the two run at once.
+            let log = dir.path().join(format!("{role}.log"));
+            processes.spawn_test("io::tests::fifo_table_child", envs, &log);
+        }
+        processes.wait_for_success(std::time::Duration::from_secs(10));
+    }
+
+    /// Child of [`tables_are_read_from_a_pipe`]: one end of its pipe.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_table_child() {
+        let Some(role) = std::env::var_os("WINNOWR_IO_FIFO_ROLE") else { return };
+        let fifo = std::env::var_os("WINNOWR_IO_FIFO").unwrap();
+        if role == "writer" {
+            let data = [bgzf_block(b"a\nb\n"), BGZF_EOF.to_vec()].concat();
+            std::fs::write(fifo, data).unwrap();
+        } else {
+            let mut text = String::new();
+            open_table(fifo).unwrap().read_to_string(&mut text).unwrap();
+            assert_eq!(text, "a\nb\n");
+        }
+        crate::testing::child_body_ran();
+    }
+
+    fn read_regular(path: &Path) -> Result<Option<Vec<u8>>> {
+        let Some(mut reader) = open_regular_table(path)? else { return Ok(None) };
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    #[test]
+    fn regular_tables_are_decompressed_from_their_start() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("table.tsv.gz");
+        let mut long = b"#a long first line, longer than the prefix used to detect gzip\n".to_vec();
+        long.extend_from_slice(b"b\n");
+        let bgzf = [bgzf_block(b"a\n"), bgzf_block(b"b\n"), BGZF_EOF.to_vec()].concat();
+        for (bytes, expected) in [
+            (Vec::new(), b"".to_vec()),
+            (b"a".to_vec(), b"a".to_vec()),
+            (vec![0x1f], vec![0x1f]),
+            (long.clone(), long.clone()),
+            (gzip(&long), long.clone()),
+            ([gzip(b"a\n"), gzip(b"b\n")].concat(), b"a\nb\n".to_vec()),
+            (bgzf, b"a\nb\n".to_vec()),
+            (BGZF_EOF.to_vec(), Vec::new()),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(read_regular(&path).unwrap(), Some(expected), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn review_bgzf_with_an_extra_subfield_before_bc_checks_eof() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("extra.bgz");
+        let mut block = bgzf_block(b"a\n");
+        // Insert a legal, zero-length gzip extra subfield before BC; update XLEN and BSIZE.
+        block.splice(12..12, [b'X', b'Y', 0, 0]);
+        block[10..12].copy_from_slice(&10u16.to_le_bytes());
+        let bsize = u16::try_from(block.len() - 1).unwrap();
+        block[20..22].copy_from_slice(&bsize.to_le_bytes());
+        std::fs::write(&path, [&block[..], &BGZF_EOF].concat()).unwrap();
+        assert_eq!(read_regular(&path).unwrap().unwrap(), b"a\n");
+        std::fs::write(&path, block).unwrap();
+        let error = read_regular(&path).unwrap_err().to_string();
+        assert!(error.contains("no BGZF end-of-file block"), "{error}");
+    }
+
+    #[test]
+    fn regular_tables_without_the_bgzf_eof_block_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("table.tsv.gz");
+        for bytes in [bgzf_block(b"a\n"), [bgzf_block(b"a\n"), BGZF_EOF[..27].to_vec()].concat()] {
+            std::fs::write(&path, bytes).unwrap();
+            let message = read_regular(&path).unwrap_err().to_string();
+            assert!(message.ends_with("is truncated (no BGZF end-of-file block): write it again"));
+        }
+        // A missing file is not a regular file; scoring reports it when it reads the table.
+        assert!(read_regular(&dir.path().join("missing")).unwrap().is_none());
+    }
+
+    /// A pipe is never opened, which would consume it (or release and then break its writer).
+    /// Run in a child, so a regression that waits for a writer fails, not hangs.
+    #[cfg(unix)]
+    #[test]
+    fn pipes_are_not_regular_tables() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("table.fifo");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let log = dir.path().join("child.log");
+        let mut processes = crate::testing::TestProcesses::default();
+        let envs = [("WINNOWR_IO_UNREAD_FIFO", &fifo)];
+        processes.spawn_test("io::tests::unread_pipe_child", envs, &log);
+        processes.wait_for_success(std::time::Duration::from_secs(10));
+    }
+
+    /// Child of [`pipes_are_not_regular_tables`].
+    #[cfg(unix)]
+    #[test]
+    fn unread_pipe_child() {
+        let Some(fifo) = std::env::var_os("WINNOWR_IO_UNREAD_FIFO") else { return };
+        assert!(read_regular(Path::new(&fifo)).unwrap().is_none());
+        assert!(!lacks_bgzf_eof(Path::new(&fifo)).unwrap());
+        crate::testing::child_body_ran();
+    }
+
+    /// A path replaced by a FIFO after classification fails closed. Run in a child, so a
+    /// regression that waits for a writer fails, not hangs.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_replaced_by_a_pipe_before_opening_is_not_a_regular_table() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("table.tsv");
+        std::fs::write(&path, b"a\n").unwrap();
+        let log = dir.path().join("child.log");
+        let mut processes = crate::testing::TestProcesses::default();
+        let envs = [("WINNOWR_IO_RACED_PATH", &path)];
+        processes.spawn_test("io::tests::raced_regular_table_child", envs, &log);
+        processes.wait_for_success(std::time::Duration::from_secs(10));
+    }
+
+    /// Child of [`a_path_replaced_by_a_pipe_before_opening_is_not_a_regular_table`].
+    #[cfg(unix)]
+    #[test]
+    fn raced_regular_table_child() {
+        let Some(path) = std::env::var_os("WINNOWR_IO_RACED_PATH") else { return };
+        let path = Path::new(&path);
+        let replace = || {
+            std::fs::remove_file(path).unwrap();
+            assert!(std::process::Command::new("mkfifo").arg(path).status().unwrap().success());
         };
+        let error = open_regular_table_with(path, replace)
+            .err()
+            .expect("a regular table replaced by a FIFO must fail closed");
+        assert!(error.to_string().contains("changed type while being opened"), "{error:#}");
+        crate::testing::child_body_ran();
+    }
+
+    /// Bytes come from the opened handle, even once the path names a pipe. Run in a child, so a
+    /// regression that reads the path again (and waits for a writer) fails, not hangs.
+    #[cfg(unix)]
+    #[test]
+    fn an_opened_regular_table_is_read_after_its_path_is_replaced_by_a_pipe() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("table.tsv.gz");
+        std::fs::write(&path, [bgzf_block(b"a\n"), BGZF_EOF.to_vec()].concat()).unwrap();
+        let log = dir.path().join("child.log");
+        let mut processes = crate::testing::TestProcesses::default();
+        let envs = [("WINNOWR_IO_OPENED_PATH", &path)];
+        processes.spawn_test("io::tests::opened_regular_table_child", envs, &log);
+        processes.wait_for_success(std::time::Duration::from_secs(10));
+    }
+
+    /// Child of [`an_opened_regular_table_is_read_after_its_path_is_replaced_by_a_pipe`].
+    #[cfg(unix)]
+    #[test]
+    fn opened_regular_table_child() {
+        let Some(path) = std::env::var_os("WINNOWR_IO_OPENED_PATH") else { return };
+        let path = Path::new(&path);
+        let mut reader = open_regular_table(path).unwrap().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(path).status().unwrap().success());
         let mut text = String::new();
-        open_table(&fifo).unwrap().read_to_string(&mut text).unwrap();
-        writer.join().unwrap();
-        assert_eq!(text, "a\nb\n");
+        reader.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "a\n");
+        crate::testing::child_body_ran();
     }
 
     #[test]
@@ -245,12 +551,64 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("in.bed.gz");
         std::fs::write(&path, [bgzf_block(b"a\n"), BGZF_EOF.to_vec()].concat()).unwrap();
-        assert!(!lacks_bgzf_eof(&path));
+        assert!(!lacks_bgzf_eof(&path).unwrap());
         std::fs::write(&path, bgzf_block(b"a\n")).unwrap();
-        assert!(lacks_bgzf_eof(&path));
+        assert!(lacks_bgzf_eof(&path).unwrap());
         std::fs::write(&path, b"").unwrap();
-        assert!(lacks_bgzf_eof(&path));
-        assert!(!lacks_bgzf_eof(&dir.path().join("missing.gz")));
+        assert!(lacks_bgzf_eof(&path).unwrap());
+        assert!(!lacks_bgzf_eof(&dir.path().join("missing.gz")).unwrap());
+    }
+
+    #[test]
+    fn eof_check_still_skips_a_file_that_cannot_be_opened() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("removed.gz");
+        std::fs::write(&path, BGZF_EOF).unwrap();
+        assert!(!lacks_bgzf_eof_with(&path, || std::fs::remove_file(&path).unwrap()).unwrap());
+    }
+
+    /// A failed EOF inspection must reach the caller before a second open for rows. Both cases
+    /// run under a deadline: no producer to wait for, or a one-shot producer that may be released.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    fn review_bgzf_eof_check_does_not_wait_for_a_replaced_fifo(
+        #[values(false, true)] producer: bool,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("table.gz");
+        std::fs::write(&path, BGZF_EOF).unwrap();
+        let mut processes = crate::testing::TestProcesses::default();
+        let envs = [
+            ("WINNOWR_IO_EOF_RACE", path.into_os_string()),
+            ("WINNOWR_IO_EOF_PRODUCER", producer.to_string().into()),
+        ];
+        processes.spawn_test(
+            "io::tests::review_bgzf_replaced_fifo_child",
+            envs,
+            &dir.path().join("child.log"),
+        );
+        processes.wait_for_success(std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_bgzf_replaced_fifo_child() {
+        let Some(path) = std::env::var_os("WINNOWR_IO_EOF_RACE") else { return };
+        let path = Path::new(&path);
+        let mut processes = crate::testing::TestProcesses::default();
+        let error = open_table_with(path, || {
+            std::fs::remove_file(path).unwrap();
+            assert!(std::process::Command::new("mkfifo").arg(path).status().unwrap().success());
+            if std::env::var("WINNOWR_IO_EOF_PRODUCER").unwrap() == "true" {
+                processes.spawn(
+                    std::process::Command::new("sh").args(["-c", ": > \"$1\"", "writer"]).arg(path),
+                );
+            }
+        })
+        .err()
+        .expect("a failed EOF check must not reopen the replaced FIFO for rows");
+        assert!(error.to_string().contains("changed type while being opened"), "{error:#}");
+        crate::testing::child_body_ran();
     }
 
     #[test]

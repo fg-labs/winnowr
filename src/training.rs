@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use log::info;
 use winnowr_xgboost::Booster;
 
+use crate::alignment_provenance::AlignmentProvenance;
 use crate::common::{Task, VariantType};
 use crate::feature_source::FeatureSource;
 use crate::fitting::{fit_booster, validation_mask};
@@ -407,6 +408,8 @@ pub struct TrainingSpec<'a> {
     pub pileup_settings: Option<PileupOptions>,
     /// The feature source of the training tables.
     pub feature_source: FeatureSource,
+    /// How the training tables' reads were aligned, if known.
+    pub alignment: Option<AlignmentProvenance>,
 }
 
 /// What a cross-validation fold holds out.
@@ -821,6 +824,7 @@ fn model_info(
         strlen_settings: spec.strlen_settings,
         pileup_settings: spec.pileup_settings,
         feature_source: spec.feature_source,
+        alignment: spec.alignment.clone(),
         winnowr_version: VERSION.clone(),
         xgboost_version: XGBOOST_VERSION.clone(),
     }
@@ -1054,6 +1058,7 @@ mod tests {
             strlen_settings: None,
             pileup_settings: None,
             feature_source: FeatureSource::Gvcf,
+            alignment: None,
         }
     }
 
@@ -1143,6 +1148,7 @@ mod tests {
             strlen_settings: strlen,
             pileup_settings: pileup,
             feature_source: FeatureSource::Gvcf,
+            alignment: None,
             ..toy_spec(&features, threads(1))
         };
         let thresholds =

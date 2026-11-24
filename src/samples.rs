@@ -298,7 +298,7 @@ mod tests {
             // Another ALT at the same position and REF: not this call's evidence.
             row(500, "GA", "GAA", "A", 5),
         ];
-        let strlen = StrlenTables { options: StrlenOptions::default(), rows };
+        let strlen = StrlenTables::new(StrlenOptions::default(), rows);
         let table = add_strlen_features(table, &strlen).unwrap();
         assert!(table.info().strlen);
         let shown = |name: &str| -> Vec<String> {

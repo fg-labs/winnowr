@@ -17,6 +17,7 @@
 use bzip2_sys as _;
 use lzma_sys as _;
 
+mod alignment_provenance;
 mod alleles;
 mod check_models;
 pub mod cli;

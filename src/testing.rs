@@ -6,6 +6,214 @@ use std::path::{Path, PathBuf};
 use rust_htslib::bcf::index::{self, Type};
 use rust_htslib::bgzf;
 
+/// Owns the subprocesses of a test that reads or writes a FIFO, which can block forever (e.g. a
+/// writer whose reader never opens it). All are waited for under one deadline, and killed and
+/// reaped on a timeout or when this is dropped (e.g. as a failed assertion unwinds), so a missed
+/// read fails the test instead of hanging it.
+#[derive(Default)]
+pub struct TestProcesses {
+    children: Vec<std::process::Child>,
+    /// How many children run a test of this binary, by the log they write (see
+    /// [`TestProcesses::spawn_test`]): counted per log, as each log holds only its own children's
+    /// output, so this can be reused with the same or another log.
+    tests: std::collections::HashMap<PathBuf, usize>,
+}
+
+impl TestProcesses {
+    /// Starts a child, retaining ownership even if a later spawn or assertion fails.
+    pub fn spawn(&mut self, command: &mut std::process::Command) {
+        self.children.push(command.spawn().unwrap());
+    }
+
+    /// Runs the test `name` (its full path, e.g. `io::tests::child`) of this test binary in a
+    /// child, with `envs` set and its output appended to `log`. The test must return at once
+    /// unless its environment asks it to do something, as it also runs in the ordinary suite.
+    pub fn spawn_test<K, V, I>(&mut self, name: &str, envs: I, log: &Path)
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        *self.tests.entry(log.to_path_buf()).or_default() += 1;
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+        self.spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .envs(envs)
+                .stdout(log.try_clone().unwrap())
+                .stderr(log),
+        );
+    }
+
+    /// Waits for every child under one deadline. A timeout kills and reaps all children.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a child cannot be waited for or the deadline passes.
+    pub fn wait(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Vec<std::process::ExitStatus>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let statuses = self
+                .children
+                .iter_mut()
+                .map(std::process::Child::try_wait)
+                .collect::<std::io::Result<Option<Vec<_>>>>()?;
+            if let Some(statuses) = statuses {
+                return Ok(statuses);
+            }
+            if std::time::Instant::now() >= deadline {
+                self.stop();
+                anyhow::bail!(
+                    "test subprocesses exceeded {timeout:?}; all children killed and reaped"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// [`TestProcesses::wait`]s, then asserts every child succeeded and every test child actually
+    /// ran its test and its body, by the logs each was given: a misspelled name runs none, and
+    /// exits 0. Children that run at once need logs of their own, as their output interleaves.
+    pub fn wait_for_success(&mut self, timeout: std::time::Duration) {
+        let statuses = self.wait(timeout);
+        let output: String =
+            self.tests.keys().map(|log| std::fs::read_to_string(log).unwrap_or_default()).collect();
+        let statuses = statuses.unwrap_or_else(|error| panic!("{error:#}\n{output}"));
+        assert!(statuses.iter().all(std::process::ExitStatus::success), "{statuses:?}\n{output}");
+        for (log, &spawned) in &self.tests {
+            let output = std::fs::read_to_string(log).unwrap_or_default();
+            let ran = output.matches("test result: ok. 1 passed").count();
+            assert_eq!(ran, spawned, "not every test child ran its test:\n{output}");
+            // A child whose guard variable is missing returns early and still passes. (libtest
+            // may print the marker on its `test NAME ...` line.)
+            let bodies = output.matches(CHILD_BODY_RAN).count();
+            assert_eq!(bodies, spawned, "not every test child ran its body:\n{output}");
+        }
+    }
+
+    fn stop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+        }
+        for child in &mut self.children {
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for TestProcesses {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_deadline_kills_and_reaps_both_blocked_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let reader = dir.path().join("unfed.fifo");
+    let writer = dir.path().join("unread.fifo");
+    for fifo in [&reader, &writer] {
+        assert!(std::process::Command::new("mkfifo").arg(fifo).status().unwrap().success());
+    }
+    let mut processes = TestProcesses::default();
+    processes.spawn(std::process::Command::new("sh").args(["-c", ": < \"$1\"", "r"]).arg(reader));
+    processes
+        .spawn(std::process::Command::new("sh").args(["-c", "printf x > \"$1\"", "w"]).arg(writer));
+    let error = processes.wait(std::time::Duration::from_millis(100)).unwrap_err();
+    assert!(error.to_string().contains("killed and reaped"), "{error}");
+    for child in &mut processes.children {
+        assert!(!child.try_wait().unwrap().expect("child must have been reaped").success());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_deadline_reaps_a_writer_when_the_reader_returns_early() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("unread.fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let mut processes = TestProcesses::default();
+    processes.spawn(std::process::Command::new("sh").args(["-c", "exit 0"]));
+    // The early reader gets a generous deadline of its own, so that only the blocked writer is
+    // raced against the short one below, however slow the runner is to start a shell.
+    processes.wait(std::time::Duration::from_secs(10)).unwrap();
+    processes
+        .spawn(std::process::Command::new("sh").args(["-c", "printf x > \"$1\"", "w"]).arg(fifo));
+    assert!(processes.wait(std::time::Duration::from_millis(100)).is_err());
+    assert!(processes.children[0].try_wait().unwrap().unwrap().success());
+    assert!(!processes.children[1].try_wait().unwrap().unwrap().success());
+}
+
+/// Printed by a test child once its body has run: passing alone does not show it, as a child run
+/// without its guard variable returns early and passes (see [`TestProcesses::wait_for_success`]).
+pub const CHILD_BODY_RAN: &str = "winnowr test child body ran";
+
+/// Marks, at its end, that a test child's body ran (see [`CHILD_BODY_RAN`]).
+pub fn child_body_ran() {
+    println!("{CHILD_BODY_RAN}");
+}
+
+/// Child of [`a_test_child_that_runs_no_test_fails`] and
+/// [`a_test_child_that_runs_its_test_succeeds`]: does nothing but mark that its body ran.
+#[test]
+fn test_child() {
+    child_body_ran();
+}
+
+/// Child of [`a_test_child_whose_body_did_not_run_fails`]: passes without marking its body, as a
+/// child run without its guard variable does.
+#[test]
+fn test_child_without_body() {}
+
+#[test]
+#[should_panic(expected = "not every test child ran its body")]
+fn a_test_child_whose_body_did_not_run_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("child.log");
+    let mut processes = TestProcesses::default();
+    processes.spawn_test(
+        "testing::test_child_without_body",
+        std::iter::empty::<(&str, &str)>(),
+        &log,
+    );
+    processes.wait_for_success(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn a_test_child_that_runs_its_test_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("child.log");
+    let mut processes = TestProcesses::default();
+    processes.spawn_test("testing::test_child", std::iter::empty::<(&str, &str)>(), &log);
+    processes.wait_for_success(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn test_processes_can_be_reused_with_the_same_or_another_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.log");
+    let second = dir.path().join("second.log");
+    let mut processes = TestProcesses::default();
+    for log in [&first, &second, &first] {
+        processes.spawn_test("testing::test_child", std::iter::empty::<(&str, &str)>(), log);
+        processes.wait_for_success(std::time::Duration::from_secs(10));
+    }
+}
+
+#[test]
+#[should_panic(expected = "not every test child ran its test")]
+fn a_test_child_that_runs_no_test_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("child.log");
+    let mut processes = TestProcesses::default();
+    processes.spawn_test("testing::no_such_test", std::iter::empty::<(&str, &str)>(), &log);
+    processes.wait_for_success(std::time::Duration::from_secs(10));
+}
+
 /// The INFO and FORMAT declarations of a HaplotypeCaller VCF, without the raw annotations.
 pub const CALL_FIELDS: &str = "\
 ##FILTER=<ID=PASS,Description=\"All filters passed\">
@@ -116,12 +324,33 @@ pub struct TestRead<'a> {
 
 /// Writes a coordinate-sorted, indexed BAM of reads on `chr1` (of `length` bases) to `dir/name`.
 pub fn write_bam(dir: &Path, name: &str, length: u64, reads: &[TestRead<'_>]) -> PathBuf {
+    write_bam_with_header(dir, name, length, reads, &[])
+}
+
+/// As [`write_bam`], with `header_lines` (e.g. `@PG` lines, tab-separated) after the `@SQ`.
+pub fn write_bam_with_header(
+    dir: &Path,
+    name: &str,
+    length: u64,
+    reads: &[TestRead<'_>],
+    header_lines: &[&str],
+) -> PathBuf {
     use rust_htslib::bam::{self, header::HeaderRecord, record::CigarString};
     let path = dir.join(name);
     let mut header = bam::Header::new();
     let mut sq = HeaderRecord::new(b"SQ");
     sq.push_tag(b"SN", "chr1").push_tag(b"LN", length);
     header.push_record(&sq);
+    for line in header_lines {
+        let mut fields = line.split('\t');
+        let kind = fields.next().unwrap().trim_start_matches('@');
+        let mut record = HeaderRecord::new(kind.as_bytes());
+        for field in fields {
+            let (tag, value) = field.split_once(':').unwrap();
+            record.push_tag(tag.as_bytes(), value);
+        }
+        header.push_record(&record);
+    }
     let mut writer = bam::Writer::from_path(&path, &header, bam::Format::Bam).unwrap();
     let mut sorted: Vec<&TestRead<'_>> = reads.iter().collect();
     sorted.sort_by_key(|read| read.pos);
@@ -309,6 +538,7 @@ pub fn separable_model_of(
             .contains(&feature)
             .then(crate::pileup::PileupOptions::default),
         feature_source: crate::feature_source::FeatureSource::Gvcf,
+        alignment: None,
         winnowr_version: env!("CARGO_PKG_VERSION").to_string(),
         xgboost_version: "test".to_string(),
     };
@@ -321,4 +551,42 @@ pub fn separable_model_of(
 #[must_use]
 pub fn fit_stutter_model(sites: &[crate::stutter::StutterSite]) -> crate::stutter::StutterModel {
     crate::stutter::fit_stutter_model_with(sites, crate::stutter::StutterFit::default())
+}
+
+/// Manually declared fixture settings, complete unless `tags_only` (source `tags`).
+/// Complete BWA fixtures without an inference marker are explicitly certified as declarations;
+/// an existing marker is preserved. Actual header/legacy-inference tests must parse raw headers
+/// or JSON instead, or deliberately remove the explicit marker after constructing the fixture.
+pub fn provenance(
+    tags: &[(&str, &str)],
+    tags_only: bool,
+) -> crate::alignment_provenance::AlignmentProvenance {
+    let source = tags_only.then_some(("source", "tags"));
+    let mut provenance: crate::alignment_provenance::AlignmentProvenance =
+        tags.iter().copied().chain(source).collect();
+    if !provenance.0.contains_key("options-inference")
+        && crate::alignment_provenance::incomplete_options_reason(&provenance).is_some()
+    {
+        provenance.0.insert("options-inference".to_string(), "explicit".to_string());
+    }
+    provenance
+}
+
+#[test]
+fn declared_bwa_fixtures_are_explicit_without_certifying_incomplete_or_tags_only_inputs() {
+    assert_eq!(
+        provenance(&[("aligner", "bwa"), ("Y", "")], false).get("options-inference"),
+        Some("explicit")
+    );
+    assert_eq!(
+        provenance(&[("aligner", "bwa"), ("options-inference", "incomplete")], false)
+            .get("options-inference"),
+        Some("incomplete")
+    );
+    assert_eq!(provenance(&[("aligner", "bwa")], true).get("options-inference"), None);
+}
+
+/// Explicitly declared complete fixture settings for bwa-mem3 with `--alt-project alt_project`.
+pub fn bwa_provenance(alt_project: &str) -> crate::alignment_provenance::AlignmentProvenance {
+    provenance(&[("aligner", "bwa-mem3"), ("alt-project", alt_project)], false)
 }

@@ -18,6 +18,7 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use winnowr_xgboost::{Booster, DMatrix};
 
+use crate::alignment_provenance::AlignmentProvenance;
 use crate::common::{Task, VariantType};
 use crate::feature_source::FeatureSource;
 use crate::labels::{Label, PromoteLabel, UnfixableFlips};
@@ -205,6 +206,11 @@ pub struct ModelInfo {
     /// the gVCF source.
     #[serde(default, skip_serializing_if = "FeatureSource::is_default")]
     pub feature_source: FeatureSource,
+    /// How the training tables' reads were aligned (see [`crate::alignment_provenance`]), which
+    /// `score` compares with the reads it scores. `None` when unknown, not written then, so that
+    /// such models are as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<AlignmentProvenance>,
     /// The winnowr version that trained the model.
     pub winnowr_version: String,
     /// The XGBoost version that trained the model.
@@ -391,10 +397,26 @@ impl ModelWarnings {
 ///
 /// Returns an error if the path does not end in `.winnowr.json`, or the file cannot be read.
 pub fn read_model_file(path: &Path) -> Result<String> {
+    read_model_file_with_metadata(path).map(|(text, _)| text)
+}
+
+/// The model text and metadata from the same open file, so a later path replacement cannot
+/// hide the identity of the model that was read.
+///
+/// # Errors
+///
+/// Returns the errors of [`read_model_file`], or an error reading the opened file's metadata.
+pub fn read_model_file_with_metadata(path: &Path) -> Result<(String, fs::Metadata)> {
+    use std::io::Read as _;
     if !path.to_string_lossy().ends_with(MODEL_SUFFIX) {
         bail!("a model file must end in {MODEL_SUFFIX}: {}", path.display());
     }
-    fs::read_to_string(path).with_context(|| format!("failed to read model {}", path.display()))
+    let context = || format!("failed to read model {}", path.display());
+    let mut file = fs::File::open(path).with_context(context)?;
+    let metadata = file.metadata().with_context(context)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).with_context(context)?;
+    Ok((text, metadata))
 }
 
 /// A trained booster with its model information.
@@ -859,6 +881,7 @@ mod tests {
             strlen_settings: None,
             pileup_settings: None,
             feature_source: FeatureSource::Gvcf,
+            alignment: None,
             winnowr_version: crate::version::VERSION.clone(),
             xgboost_version: "3.4.2".to_string(),
         }
@@ -1011,6 +1034,34 @@ mod tests {
         let unknown = text.replace(r#""feature_source":"vcf""#, r#""feature_source":"bam""#);
         let error = format!("{:#}", WinnowrModel::from_json(&unknown, THREADS).unwrap_err());
         assert!(error.contains("unknown feature source 'bam'"), "{error}");
+    }
+
+    /// A model of unknown alignment provenance is written without the field, as before it was
+    /// recorded, so such a model loads with it unknown; a known one round trips.
+    #[test]
+    fn models_record_their_alignment_provenance_when_known() {
+        let features = ["a", "b"];
+        let unknown =
+            WinnowrModel { booster: booster(&features, 3), info: genotype_info(&features) };
+        let text = unknown.to_json().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(json.get("alignment").is_none(), "{text}");
+        assert_eq!(WinnowrModel::from_json(&text, THREADS).unwrap().info.alignment, None);
+
+        let mut info = genotype_info(&features);
+        info.alignment = Some(crate::testing::bwa_provenance("primary"));
+        let known = WinnowrModel { booster: booster(&features, 3), info };
+        let text = known.to_json().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["alignment"],
+            serde_json::json!({
+                "aligner": "bwa-mem3",
+                "alt-project": "primary",
+                "options-inference": "explicit",
+            })
+        );
+        assert_eq!(WinnowrModel::from_json(&text, THREADS).unwrap().info, known.info);
     }
 
     /// A model's information is read without its booster, which may come first; a file cut short

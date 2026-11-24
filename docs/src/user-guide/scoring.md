@@ -23,6 +23,11 @@ at the first region BED it cannot read (see [check-models](../tools/check-models
 differs). It rejects a `--regions` name given twice even if no model uses it, and models that
 record different lengths of a contig even when the VCF's header gives that contig no length.
 
+When the models record how their training reads were aligned, `score` compares it with how the
+reads it scores were aligned (from the header of `--alignments` and the `--strlen` and `--pileup`
+tables, with `--alignment-tags` applied over each, which must then agree, or `--alignment-tags`
+alone) and warns where they differ; `--strict-provenance` makes that an error. See [Alignment provenance](alignment-provenance.md).
+
 `--regions` must name every region BED the models were trained with, under the same names. It
 also takes the not-difficult regions, `notinalldifficultregions=PATH`, described below. Models with
 repeat-length or pileup features need `--strlen` or `--pileup` tables, or `--alignments` and

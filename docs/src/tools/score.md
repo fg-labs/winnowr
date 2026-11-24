@@ -5,6 +5,16 @@ re-genotypes. See [Scoring](../user-guide/scoring.md). The models' feature sourc
 whether `--gvcf` is read, and whether `--alignments` is needed (see
 [Feature sources](../user-guide/feature-sources.md)).
 
+Models that record how their training reads were aligned are compared with how the reads were
+aligned (the header of `--alignments` and the `--strlen` and `--pileup` tables, with
+`--alignment-tags` applied over each, which must then agree): a difference is a warning, and with
+`--strict-provenance` an error.
+See [Alignment provenance](../user-guide/alignment-provenance.md).
+
+Regular evidence files are inspected before their rows are loaded, and each loaded file is checked against that effective provenance snapshot. Required FIFO or process-substitution inputs are opened only for their row read; their declarations contribute to the final model check before any calls are scored. An unknown-provenance error waits for a required stream that can supply it, but unrelated model checks still run early. Explicitly supplied regular sources can supply provenance even when no model needs their rows. If every model is legacy and records no provenance, otherwise unused sources are not inspected and required evidence skips provenance parsing and agreement while still validating its settings, column headers and rows.
+
+Incomplete alignment-option inference produces a warning, or an error with `--strict-provenance`, on either the models or the scoring reads, even when both record the same incomplete marker. Supply the intended read settings with `--alignment-tags` and `options-inference=explicit` to assert them; this is a user declaration, not recovery of the original arguments. Models carrying incomplete provenance must be regenerated from explicitly declared training provenance. Unrelated tag overrides do not resolve uncertainty. A comparison with no comparable tags is reported as such, not as agreement, and does not itself introduce a strict-mode error.
+
 ## Usage
 
 ```console

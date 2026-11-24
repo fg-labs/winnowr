@@ -3,6 +3,11 @@
 Trains a genotype or promote model for one variant type from labelled feature tables, choosing its
 thresholds by cross-validation. See [Training](../user-guide/training.md).
 
+The model records how the training tables' reads were aligned. Tables whose recorded alignment
+provenance differs are an error, unless `--mixed-alignments`, which records only the tags they
+share; `score` then compares the model with the reads on those tags only. See
+[Alignment provenance](../user-guide/alignment-provenance.md).
+
 ## Usage
 
 ```console

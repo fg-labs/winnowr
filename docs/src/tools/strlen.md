@@ -5,6 +5,10 @@ repeat-length features. It writes one row per indel record with a pure insertion
 other records are skipped, and counted in the log. See [Repeat-length
 features](../user-guide/repeat-length.md).
 
+The table records how the reads were aligned, read from the header of `--alignments` (with
+`--alignment-tags` over it), in an `##alignment=` line. See
+[Alignment provenance](../user-guide/alignment-provenance.md).
+
 ## Usage
 
 ```console

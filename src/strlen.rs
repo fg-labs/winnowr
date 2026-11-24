@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::alignment_provenance::AlignmentProvenance;
 use crate::evidence::{Evidence, EvidenceTables, write_table};
 use crate::read_pass::{
     MAX_READS, ReadInputs, Shard, SweepSites, anchored_length, run_shards, sweep_clusters,
@@ -811,8 +812,8 @@ pub fn sites_to_rows(sites: &[StrlenSite]) -> Vec<StrlenRow> {
         .collect()
 }
 
-/// Writes sites measured with `options` as a strlen table (see [`write_table`]). Returns the
-/// number of sites written.
+/// Writes sites measured with `options`, of reads aligned as `alignment` records (when known), as a
+/// strlen table (see [`write_table`]). Returns the number of sites written.
 ///
 /// # Errors
 ///
@@ -821,8 +822,9 @@ pub fn write_strlen_table(
     path: &Path,
     sites: &[StrlenSite],
     options: StrlenOptions,
+    alignment: Option<&AlignmentProvenance>,
 ) -> Result<usize> {
-    write_table(path, options, sites.iter().map(StrlenSite::to_row))
+    write_table(path, options, alignment, sites.iter().map(StrlenSite::to_row))
 }
 
 #[cfg(test)]
@@ -1315,10 +1317,13 @@ mod tests {
         };
         let path = dir.path().join("sites.tsv");
         let options = StrlenOptions::default();
-        write_strlen_table(&path, std::slice::from_ref(&site), options).unwrap();
+        let alignment = crate::testing::provenance(&[("aligner", "bwa-mem3")], false);
+        write_strlen_table(&path, std::slice::from_ref(&site), options, Some(&alignment)).unwrap();
         let read_back = read_tables::<StrlenOptions>(&[&path]).unwrap();
         let rows = sites_to_rows(&[site]);
-        assert_eq!(read_back, StrlenTables { options, rows: rows.clone() });
+        let expected = Some(alignment.clone());
+        assert_eq!(read_back, StrlenTables { options, rows: rows.clone(), alignment: expected });
+        assert_eq!(crate::evidence::read_alignment(&[&path]).unwrap(), Some(alignment));
         // Rounded as written: the mean MAPQ (7 + 60 + 60) / 3 to one decimal.
         assert_eq!(rows[0].mean_mapq, 42.3);
     }
@@ -1343,7 +1348,13 @@ mod tests {
             reference.len() as u64,
             &[read("ref", 50, "70M")],
         );
-        let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
+        let inputs = ReadInputs {
+            observed_indexes: None,
+            vcf: &vcf,
+            alignments: &bam,
+            reference: &fasta,
+            expected_alignment: None,
+        };
         let sites = measure_regions(&inputs, &["chr1", "chr2"], &StrlenOptions::default()).unwrap();
         // The SNP is not measured; the insertion has an empty tract (no T next to it).
         assert_eq!(
@@ -1360,7 +1371,7 @@ mod tests {
         assert!(only_snp.is_empty());
 
         let table = dir.path().join("strlen.tsv.gz");
-        assert_eq!(write_strlen_table(&table, &sites, StrlenOptions::default()).unwrap(), 2);
+        assert_eq!(write_strlen_table(&table, &sites, StrlenOptions::default(), None).unwrap(), 2);
         let rows = read_tables::<StrlenOptions>(&[&table]).unwrap().rows;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].length_histogram, "0:1");
@@ -1409,7 +1420,13 @@ mod tests {
         let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
         let vcf = crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[record]);
         let bam = crate::testing::write_bam(dir.path(), "reads.bam", reference.len() as u64, &[]);
-        let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
+        let inputs = ReadInputs {
+            observed_indexes: None,
+            vcf: &vcf,
+            alignments: &bam,
+            reference: &fasta,
+            expected_alignment: None,
+        };
         let message = format!(
             "{:#}",
             measure_regions(&inputs, &["chr2"], &StrlenOptions::default()).unwrap_err()

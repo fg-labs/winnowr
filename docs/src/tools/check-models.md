@@ -16,7 +16,14 @@ problem at once:
   given. While a model cannot be read, every BED counts as used;
 - the models' reference is that of `--reference` (a FASTA with its `.fai`, or the `.fai`
   itself; only the index is read) and of `--vcf` (only its header is read, so it need not be
-  indexed or compressed, though `score` needs it bgzipped and indexed).
+  indexed or compressed, though `score` needs it bgzipped and indexed);
+- the reads were aligned as the models' training reads were: the header of `--alignments` (a
+  BAM or CRAM; only its header is read, so no reference is needed), with `--alignment-tags` over
+  it, or `--alignment-tags` alone, which is compared on the tags given only (see
+  [Alignment provenance](../user-guide/alignment-provenance.md)). With `--alignment-tags none`,
+  the header is not read, `inputs.alignment` is `null` and `inputs.alignment_from` is `tags`. An
+  aligner read without a profile is only logged, not a problem.
+  These problems are warnings, and errors with `--strict-provenance`, as in `score`.
 
 It does not check that a booster loads, has the model's features or its classes (`score` checks
 that when it loads the boosters, after the model-set checks), nor the sample's evidence (the VCF's fields, the reads, or the
@@ -28,12 +35,15 @@ winnowr version, do not.
 `score` runs the model-set checks at startup, before it reads any calls, and reports their
 problems together: one model per task and variant type, the same contigs and reference, one
 feature source and evidence settings, the region names (a BED for every region a model uses, and
-no name twice), and the VCF's contigs against the models' reference. It differs in what comes
+no name twice), the VCF's contigs against the models' reference, and the reads' alignment
+provenance against the models'. It differs in what comes
 before and after them: it stops at the first model whose information it cannot read and at an
 unreadable VCF before the checks, and after them loads the boosters (stopping at the first that
 does not load) and reads the region BEDs (those a model uses), stopping at the first it cannot
 read or that has no interval on the models' contigs. `model_unreadable`,
-`input_unreadable`, `reference_not_checked` and `not_difficult_missing` are `check-models`' own,
+`input_unreadable`, `reference_not_checked`, `not_difficult_missing`,
+`alignment_provenance_unknown` and `alignment_header_mixed` are `check-models`' own (`score` logs
+the last as a warning when it reads the header),
 and so is reading every BED given.
 
 ## Usage
@@ -44,6 +54,8 @@ winnowr check-models --models snp.winnowr.json indel.winnowr.json \
   --reference GRCh38.fa
 # A JSON summary, for a pipeline to read
 winnowr check-models --models snp.winnowr.json indel.winnowr.json --vcf sample.vcf.gz --json
+# How the reads to be scored were aligned, from their header
+winnowr check-models --models snp.winnowr.json indel.winnowr.json --alignments sample.cram
 ```
 
 Without `--json`, it prints a line per model (its task and variant type, feature source, what it
@@ -78,6 +90,13 @@ know.
 | `other_winnowr_version` | warning | a model was trained by another winnowr version |
 | `no_reference_contigs` | warning | a model records no reference contigs, so its reference cannot be checked |
 | `reference_not_checked` | warning | neither `--reference` nor `--vcf` was given |
+| `alignment_provenance_differs` | warning, or error with `--strict-provenance` | the models record different alignment provenance |
+| `alignment_provenance_mismatch` | warning, or error with `--strict-provenance` | the models' alignment provenance differs from the reads' (`--alignments` or `--alignment-tags`) on a compared tag (not metadata such as `version`, `source`, `options-inference` or the internal merge bookkeeping `winnowr-merged-complete`; only the tags given, for `--alignment-tags` alone); the problem lists the `differences` |
+| `alignment_provenance_indeterminate` | warning, or error with `--strict-provenance` | both the models and reads record `mixed` on a compared tag; equal markers do not establish agreement because they do not retain the underlying values |
+| `alignment_provenance_incomplete` | warning, or error with `--strict-provenance` | a model or the reads carry unresolved alignment-option inference, including when both carry the same marker; reads require intended settings declared with `--alignment-tags` and `options-inference=explicit`, while incomplete models must be regenerated from declared training provenance |
+| `alignment_provenance_unknown` | warning | a model records no alignment provenance (one problem per model) |
+| `alignment_provenance_not_checked` | warning, or error with `--strict-provenance` | models record alignment provenance, and the reads' is not known (the message says why: neither `--alignments` nor `--alignment-tags`, a header without a program, or `--alignment-tags none`); not raised when the `--alignments` header cannot be read (`input_unreadable`) |
+| `alignment_header_mixed` | warning | the header of `--alignments` has aligner records that normalize differently |
 
 ## JSON summary
 
@@ -94,8 +113,8 @@ ids and values do not change it, and a caller should ignore those it does not kn
 | `booster_checked` | always `false`: the boosters are not read |
 | `models` | each model, in the order given (below) |
 | `set` | what the models share (below); a value is `null` where they disagree |
-| `inputs` | `reference` and `vcf` as given (or `null`), and `regions`: each `name`, `path` and the models that use it (`used_by`) |
-| `problems` | every problem: `check`, `severity` (`error` or `warning`), `model` (its path, or `null` for a problem of the set) and `message` |
+| `inputs` | `reference`, `vcf` and `alignments` as given (or `null`); `regions`: each `name`, `path` and the models that use it (`used_by`); `alignment`: the reads' alignment provenance (or `null`), and `alignment_from`: `header`, `tags`, `header+tags` (or `null`) |
+| `problems` | every problem: `check`, `severity` (`error` or `warning`), `model` (its path, or `null` for a problem of the set) and `message`; only an `alignment_provenance_mismatch` also has `differences`: each `tag`, and its value in the `models`' and the `reads`' provenance (`null` where it is not set) |
 
 Each entry of `models` has its `path` and `readable`. A model that cannot be read has only
 those two keys; a readable one also has:
@@ -116,12 +135,14 @@ those two keys; a readable one also has:
 | `pileup_settings` | the settings its pileup evidence must be measured with, or `null` |
 | `needs` | what scoring with it needs: `strlen` and `pileup` (tables, or `--alignments`), `alignments` (the reads, for the `alignments` source) and `gvcf` (the raw annotations, in the VCF or a gVCF, for the `gvcf` source) |
 | `trained_with` | the `winnowr` and `xgboost` versions that trained it |
+| `alignment` | how its training reads were aligned, as an object of tags, or `null` if it records none |
 
 `set` has `contigs` (the first model's), `reference_contigs` (the models', merged: `null` if any
 model records none, or two models record different lengths of a contig), `region_names`
 (any model's), `feature_source`, `alignment_settings`, `strlen_settings`, `pileup_settings`,
 `needs` (what any model needs) and `not_difficult_regions`: their `name`, whether an indel
-genotype model `used` them, and whether `--regions` `given` them.
+genotype model `used` them, and whether `--regions` `given` them; and `alignment`, the models'
+alignment provenance (`null` if a model records none, or two record different provenance).
 
 ## Options
 
