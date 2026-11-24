@@ -43,15 +43,7 @@ const INDEX_MAGIC: [&[u8; 4]; 2] = [b"TBI\x01", b"CSI\x01"];
 /// or has no readable index.
 pub fn open_indexed<P: AsRef<Path>>(path: P) -> Result<IndexedReader> {
     let path = path.as_ref();
-    let text = path.to_string_lossy();
-    if text.contains("://") {
-        bail!("{text} is remote; only local VCF/BCF files are supported");
-    }
-    if !path.is_file() {
-        bail!("{} does not exist or is not a file", path.display());
-    }
-    rust_htslib::bcf::Reader::from_path(path)
-        .with_context(|| format!("failed to open {} as a VCF or BCF", path.display()))?;
+    open_unindexed(path)?;
     let bgzipped = rust_htslib::bgzf::is_bgzip(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     if !bgzipped {
@@ -70,6 +62,25 @@ pub fn open_indexed<P: AsRef<Path>>(path: P) -> Result<IndexedReader> {
         bail!("{} is not a tabix or CSI index", index.display());
     }
     IndexedReader::from_path(path).with_context(|| format!("failed to open {}", path.display()))
+}
+
+/// Opens a local VCF or BCF (uncompressed, or compressed, with or without an index) to read from
+/// its start.
+///
+/// # Errors
+///
+/// Returns an error if the path is remote, the file does not exist, or it does not open as a VCF
+/// or BCF.
+fn open_unindexed(path: &Path) -> Result<rust_htslib::bcf::Reader> {
+    let text = path.to_string_lossy();
+    if text.contains("://") {
+        bail!("{text} is remote; only local VCF/BCF files are supported");
+    }
+    if !path.is_file() {
+        bail!("{} does not exist or is not a file", path.display());
+    }
+    rust_htslib::bcf::Reader::from_path(path)
+        .with_context(|| format!("failed to open {} as a VCF or BCF", path.display()))
 }
 
 /// True if a local, bgzipped VCF or BCF has a tabix or CSI index next to it, so it can be read
@@ -353,11 +364,27 @@ impl VcfSummary {
     /// Returns an error if the VCF cannot be opened, or a header line is not UTF-8.
     pub fn read<P: AsRef<Path>>(vcf: P) -> Result<Self> {
         let reader = open_indexed(&vcf)?;
-        let header = reader.header();
+        Self::of_header(reader.header(), vcf.as_ref())
+    }
+
+    /// Reads the summary of a VCF's header alone: the VCF (or BCF) may be uncompressed, and needs
+    /// no index, as its records are not read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is remote, the file does not exist or does not open as a VCF
+    /// or BCF, or a header line is not UTF-8.
+    pub fn read_header<P: AsRef<Path>>(vcf: P) -> Result<Self> {
+        let path = vcf.as_ref();
+        Self::of_header(open_unindexed(path)?.header(), path)
+    }
+
+    /// The summary of the header of the VCF at `path`.
+    fn of_header(header: &HeaderView, path: &Path) -> Result<Self> {
         let samples =
             header.samples().iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect();
         let mut contig_lengths = IndexMap::new();
-        for record in header_records(header, vcf.as_ref())? {
+        for record in header_records(header, path)? {
             if let HeaderRecord::Contig { values, .. } = record
                 && let Some(id) = values.get("ID")
             {

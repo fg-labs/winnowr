@@ -3,15 +3,17 @@ Machine-learned genotyping and filtering of germline small-variant calls
 Usage: winnowr [OPTIONS] <COMMAND>
 
 Commands:
-  extract   Extract a feature table for a sample's calls, optionally labelled with truth
-  train     Train a genotype or promote model from labelled feature tables
-  evaluate  Report F1 for models' decisions on a labelled sample
-  stratify  Report models' decisions, outcomes, F1 and P(keep) calibration by benchmark stratum
-  score     Score a sample's calls and write a VCF with drops, promotions, flips and re-genotypes
-  strlen    Measure read lengths across repeat tracts at indel calls (repeat-length evidence)
-  pileup    Count the reads of each call's alleles by MAPQ, at any MAPQ (pileup evidence)
-  subset    Restrict a labelled feature table to some of its contigs, or away from some regions
-  help      Print this message or the help of the given subcommand(s)
+  extract       Extract a feature table for a sample's calls, optionally labelled with truth
+  train         Train a genotype or promote model from labelled feature tables
+  evaluate      Report F1 for models' decisions on a labelled sample
+  stratify      Report models' decisions, outcomes, F1 and P(keep) calibration by benchmark stratum
+  check-models  Check a set of models before a run, and report what they need
+  score         Score a sample's calls and write a VCF with drops, promotions, flips and
+                re-genotypes
+  strlen        Measure read lengths across repeat tracts at indel calls (repeat-length evidence)
+  pileup        Count the reads of each call's alleles by MAPQ, at any MAPQ (pileup evidence)
+  subset        Restrict a labelled feature table to some of its contigs, or away from some regions
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
   -t, --threads <THREADS>  The number of worker threads to use [default: OMP_NUM_THREADS when set,

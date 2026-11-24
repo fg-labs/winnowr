@@ -11,6 +11,7 @@ Each page has a short description, typical usage, and the command's full `--help
 | [train](train.md)       | train a model for one variant type; thresholds chosen by cross-validation          |
 | [evaluate](evaluate.md) | F1 of a model's decisions on a held-out labelled sample                            |
 | [stratify](stratify.md) | decisions, F1 and P(keep) calibration by benchmark stratum and GIAB stratification |
+| [check-models](check-models.md) | check a set of models before a run, and report what they need (text or JSON) |
 | [score](score.md)       | apply models to a sample and write the re-genotyped, filtered VCF                  |
 
 ## Global options

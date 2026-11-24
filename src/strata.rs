@@ -962,7 +962,7 @@ pub fn stratify(
     regions: &[RegionSet],
     outputs: CallOutputs<'_>,
 ) -> Result<(StratifiedReport, RegionReport)> {
-    check_model_kinds(models)?;
+    check_model_kinds(models.iter().map(|model| &model.info))?;
     let mut timer = PhaseTimer::start();
     let views = [table.clone(), with_truth_labels(table, second)?];
     let strata = table_strata(table, truths.beds)?;

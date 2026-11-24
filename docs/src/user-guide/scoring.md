@@ -13,6 +13,16 @@ same contigs. `score` scores the calls on those contigs. When the models record 
 contigs (models trained from tables that record them do), `score` stops with an error if one is
 missing from the VCF's header or has another length there.
 
+To check a set of models before a run (that they can be scored together, against the region
+BEDs and the reference, and what evidence they need), without scoring, use
+[`winnowr check-models`](../tools/check-models.md). `score` runs its model-set checks at startup,
+before it reads any calls, and reports their problems together (one problem alone keeps its
+message), before it loads the models' boosters; but it stops alone at the first model whose
+information it cannot read, at a VCF it cannot read, at the first booster that does not load, and
+at the first region BED it cannot read (see [check-models](../tools/check-models.md) for what
+differs). It rejects a `--regions` name given twice even if no model uses it, and models that
+record different lengths of a contig even when the VCF's header gives that contig no length.
+
 `--regions` must name every region BED the models were trained with, under the same names. It
 also takes the not-difficult regions, `notinalldifficultregions=PATH`, described below. Models with
 repeat-length or pileup features need `--strlen` or `--pileup` tables, or `--alignments` and

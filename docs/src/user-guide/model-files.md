@@ -34,7 +34,8 @@ refitted.
 
 ## Compatibility
 
-When it loads a model, winnowr checks:
+[`winnowr check-models`](../tools/check-models.md) runs these checks (all but the booster's) on a
+set of models, without scoring, and reports every problem. When it loads a model, winnowr checks:
 
 - **Format version.** This winnowr reads format version 3 only, and refuses other versions:
   train new models with `winnowr train`.

@@ -9,7 +9,7 @@ use log::info;
 use rayon::prelude::*;
 
 use crate::common::{PASS, PhaseTimer, Task, VariantType};
-use crate::model::WinnowrModel;
+use crate::model::{ModelInfo, WinnowrModel};
 use crate::promote_labels::promote_eligible;
 use crate::regenotype::{
     RegenotypeTarget, regenotype_targets, with_regenotype_columns, without_regenotype,
@@ -24,6 +24,13 @@ use crate::table::FeatureTable;
 /// The name of the region set (`--regions NAME=PATH`) that the default policy acts fully inside:
 /// GIAB's GRCh38 genome stratification "notinalldifficultregions" (sample-independent).
 pub const NOT_DIFFICULT_REGIONS: &str = "notinalldifficultregions";
+
+/// True if a model is an indel genotype model, which the default policy decides with the
+/// [`NOT_DIFFICULT_REGIONS`] (see [`DEFAULT_OUTSIDE_INDEL_T_DROP`]).
+#[must_use]
+pub fn is_indel_genotype(info: &ModelInfo) -> bool {
+    info.task == Task::Genotype && info.variant_type == VariantType::Indel
+}
 
 /// The variant types whose genotype models use [`Rule::KeepFallback`] by default.
 pub const DEFAULT_KEEP_FALLBACK: [VariantType; 1] = [VariantType::Indel];
@@ -194,7 +201,7 @@ pub fn decide_calls(
     models: &[WinnowrModel],
     policy: &Policy,
 ) -> Result<HashMap<CallKey, Decision>> {
-    check_model_kinds(models)?;
+    check_model_kinds(models.iter().map(|model| &model.info))?;
     let per_model = models
         .iter()
         .map(|model| decide_model_calls(table, model, policy))
@@ -206,19 +213,34 @@ pub fn decide_calls(
 ///
 /// # Errors
 ///
-/// Returns an error naming a task and variant type with two models.
-pub fn check_model_kinds(models: &[WinnowrModel]) -> Result<()> {
-    let mut kinds = HashSet::new();
-    for model in models {
-        if !kinds.insert((model.info.task, model.info.variant_type)) {
-            bail!(
-                "expected at most one model per task and variant type, got two {} {} models",
-                model.info.task,
-                model.info.variant_type
-            );
-        }
+/// Returns an error naming the first task and variant type with more than one model (see
+/// [`duplicate_kinds`]).
+pub fn check_model_kinds<'a, I: IntoIterator<Item = &'a ModelInfo>>(models: I) -> Result<()> {
+    match duplicate_kinds(models).first() {
+        Some(&(task, variant_type)) => bail!("{}", model_kinds_message(task, variant_type)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Each task and variant type with more than one model, once, in the order they first appear.
+#[must_use]
+pub fn duplicate_kinds<'a, I: IntoIterator<Item = &'a ModelInfo>>(
+    models: I,
+) -> Vec<(Task, VariantType)> {
+    let mut counts: indexmap::IndexMap<(Task, VariantType), usize> = indexmap::IndexMap::new();
+    for info in models {
+        *counts.entry((info.task, info.variant_type)).or_default() += 1;
+    }
+    counts.into_iter().filter(|(_, count)| *count > 1).map(|(kind, _)| kind).collect()
+}
+
+/// The message of a task and variant type with more than one model.
+#[must_use]
+pub fn model_kinds_message(task: Task, variant_type: VariantType) -> String {
+    format!(
+        "expected at most one model per task and variant type, got two {task} {variant_type} \
+         models"
+    )
 }
 
 /// Merges the decisions of each model, in model order: a call decided by more than one model
@@ -492,7 +514,7 @@ mod tests {
             separable_model(Task::Genotype, VariantType::Snp),
             separable_model(Task::Genotype, VariantType::Snp),
         ];
-        let message = check_model_kinds(&models).unwrap_err().to_string();
+        let message = check_model_kinds(models.iter().map(|m| &m.info)).unwrap_err().to_string();
         assert_eq!(
             message,
             "expected at most one model per task and variant type, got two genotype snp models"

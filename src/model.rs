@@ -32,6 +32,10 @@ use crate::thresholds::{PromoteThresholds, Thresholds};
 /// The suffix of a model file.
 pub const MODEL_SUFFIX: &str = ".winnowr.json";
 
+/// The reference contigs a model or table records: each contig's length (`None` where unknown),
+/// in order.
+pub type ReferenceContigs = IndexMap<String, Option<u64>>;
+
 /// The model format version this winnowr reads and writes.
 pub const MODEL_FORMAT_VERSION: u32 = 3;
 
@@ -176,7 +180,7 @@ pub struct ModelInfo {
     pub contigs: Vec<String>,
     /// The lengths of `contigs` in the reference the training calls were called on (`None` when
     /// unknown).
-    pub reference_contigs: Option<IndexMap<String, Option<u64>>>,
+    pub reference_contigs: Option<ReferenceContigs>,
     /// The training parameters.
     pub params: TrainingParams,
     /// The stutter model of a model with repeat-length features (see [`crate::stutter`]); its
@@ -265,54 +269,40 @@ impl ModelInfo {
     }
 }
 
-/// A trained booster with its model information.
-#[derive(Debug)]
-pub struct WinnowrModel {
-    /// The XGBoost booster.
-    pub booster: Booster,
-    /// The model information.
-    pub info: ModelInfo,
+/// The error of a model file of a format version this winnowr does not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedFormatVersion {
+    /// The file's format version, if it records one.
+    pub format_version: Option<u64>,
+    /// The winnowr version that wrote it, if it records one.
+    pub winnowr_version: Option<String>,
 }
 
-impl WinnowrModel {
-    /// Loads a model file, predicting with at most `threads` threads.
-    ///
-    /// Logs a warning when the model was trained by another winnowr version, or records no
-    /// reference contigs (so the reference of the calls cannot be checked).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the path does not end in `.winnowr.json`, the file cannot be read, is
-    /// not of a supported format version, has unknown or invalid fields, or its booster does not
-    /// load or does not have the model's features and classes.
-    pub fn load<P: AsRef<Path>>(path: P, threads: NonZeroUsize) -> Result<Self> {
-        let path = path.as_ref();
-        if !path.to_string_lossy().ends_with(MODEL_SUFFIX) {
-            bail!("a model file must end in {MODEL_SUFFIX}: {}", path.display());
-        }
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("failed to read model {}", path.display()))?;
-        let model = Self::from_json(&text, threads)
-            .with_context(|| format!("failed to load model {}", path.display()))?;
-        if let Some(warning) = other_version_warning(path, &model.info.winnowr_version) {
-            warn!("{warning}");
-        }
-        if model.info.reference_contigs.is_none() {
-            warn!(
-                "{} records no reference contigs, so the reference of the calls cannot be checked \
-                 against it",
-                path.display()
-            );
-        }
-        Ok(model)
+impl std::fmt::Display for UnsupportedFormatVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unsupported model format version {} (written by winnowr {}); this winnowr reads \
+             version {MODEL_FORMAT_VERSION}: train new models with this winnowr",
+            self.format_version.map_or_else(|| "none".to_string(), |v| v.to_string()),
+            self.winnowr_version.as_deref().unwrap_or("unknown")
+        )
     }
+}
 
-    /// A model from the text of a model file.
+impl std::error::Error for UnsupportedFormatVersion {}
+
+impl ModelInfo {
+    /// The information of a model file's text, and the raw text of its booster, which is scanned
+    /// past but not parsed (see [`split_member`]): the booster's members may come in any order,
+    /// and a file cut short is an error.
     ///
     /// # Errors
     ///
-    /// See [`WinnowrModel::load`].
-    pub fn from_json(text: &str, threads: NonZeroUsize) -> Result<Self> {
+    /// Returns an error if the text is not a JSON object with a booster, is not of
+    /// [`MODEL_FORMAT_VERSION`] (an [`UnsupportedFormatVersion`]), has unknown or invalid fields,
+    /// or fails [`ModelInfo::validate`].
+    pub fn from_model_json(text: &str) -> Result<(ModelInfo, &str)> {
         // The booster is handed to XGBoost as written: it may hold tokens such as `NaN` that are
         // not standard JSON, and parsing a large model into a JSON tree would be wasteful.
         let (info_text, booster_json) = split_member(text, BOOSTER_KEY)
@@ -326,16 +316,131 @@ impl WinnowrModel {
         let versions: Versions =
             serde_json::from_str(&info_text).context("invalid model information")?;
         if versions.format_version != Some(u64::from(MODEL_FORMAT_VERSION)) {
-            bail!(
-                "unsupported model format version {} (written by winnowr {}); this winnowr reads \
-                 version {MODEL_FORMAT_VERSION}: train new models with this winnowr",
-                versions.format_version.map_or_else(|| "none".to_string(), |v| v.to_string()),
-                versions.winnowr_version.as_deref().unwrap_or("unknown")
-            );
+            return Err(UnsupportedFormatVersion {
+                format_version: versions.format_version,
+                winnowr_version: versions.winnowr_version,
+            }
+            .into());
         }
         let info: ModelInfo =
             serde_json::from_str(&info_text).context("invalid model information")?;
         info.validate()?;
+        Ok((info, booster_json))
+    }
+
+    /// Reads the information of a model file. Its booster is scanned past, never parsed or loaded
+    /// (see [`ModelInfo::from_model_json`]), so it is not checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path does not end in `.winnowr.json`, or the file cannot be read or
+    /// fails [`ModelInfo::from_model_json`].
+    pub fn read<P: AsRef<Path>>(path: P) -> Result<ModelInfo> {
+        let path = path.as_ref();
+        let text = read_model_file(path)?;
+        let (info, _) = ModelInfo::from_model_json(&text)
+            .with_context(|| format!("failed to load model {}", path.display()))?;
+        Ok(info)
+    }
+
+    /// True if the model's features use the region set `name` (its `--regions` BED).
+    #[must_use]
+    pub fn uses_region(&self, name: &str) -> bool {
+        self.region_names.iter().any(|region| region == name)
+    }
+
+    /// The warnings about a model file whose information this is: it was trained by another
+    /// winnowr version, or records no reference contigs (so the reference of the calls cannot be
+    /// checked against it).
+    #[must_use]
+    pub fn warnings(&self, path: &Path) -> ModelWarnings {
+        ModelWarnings {
+            other_version: other_version_warning(path, &self.winnowr_version),
+            no_reference_contigs: self.reference_contigs.is_none().then(|| {
+                format!(
+                    "{} records no reference contigs, so the reference of the calls cannot be \
+                     checked against it",
+                    path.display()
+                )
+            }),
+        }
+    }
+}
+
+/// The warnings about a model file (see [`ModelInfo::warnings`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelWarnings {
+    /// It was trained by another winnowr version.
+    pub other_version: Option<String>,
+    /// It records no reference contigs.
+    pub no_reference_contigs: Option<String>,
+}
+
+impl ModelWarnings {
+    /// Logs the warnings.
+    pub fn log(&self) {
+        for warning in [&self.other_version, &self.no_reference_contigs].into_iter().flatten() {
+            warn!("{warning}");
+        }
+    }
+}
+
+/// The text of a model file, after checking its name ends in [`MODEL_SUFFIX`].
+///
+/// # Errors
+///
+/// Returns an error if the path does not end in `.winnowr.json`, or the file cannot be read.
+pub fn read_model_file(path: &Path) -> Result<String> {
+    if !path.to_string_lossy().ends_with(MODEL_SUFFIX) {
+        bail!("a model file must end in {MODEL_SUFFIX}: {}", path.display());
+    }
+    fs::read_to_string(path).with_context(|| format!("failed to read model {}", path.display()))
+}
+
+/// A trained booster with its model information.
+#[derive(Debug)]
+pub struct WinnowrModel {
+    /// The XGBoost booster.
+    pub booster: Booster,
+    /// The model information.
+    pub info: ModelInfo,
+}
+
+impl WinnowrModel {
+    /// Loads a model file, predicting with at most `threads` threads. Its information is read as
+    /// [`ModelInfo::read`] reads it; [`ModelInfo::warnings`] are not logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path does not end in `.winnowr.json`, the file cannot be read, is
+    /// not of a supported format version, has unknown or invalid fields, or its booster does not
+    /// load or does not have the model's features and classes.
+    pub fn load<P: AsRef<Path>>(path: P, threads: NonZeroUsize) -> Result<Self> {
+        let path = path.as_ref();
+        let text = read_model_file(path)?;
+        Self::from_json(&text, threads)
+            .with_context(|| format!("failed to load model {}", path.display()))
+    }
+
+    /// A model from the text of a model file.
+    ///
+    /// # Errors
+    ///
+    /// See [`WinnowrModel::load`].
+    pub fn from_json(text: &str, threads: NonZeroUsize) -> Result<Self> {
+        let (info, booster_json) = ModelInfo::from_model_json(text)?;
+        WinnowrModel::from_parts(info, booster_json, threads)
+    }
+
+    /// A model from its information and the raw text of its booster (as
+    /// [`ModelInfo::from_model_json`] splits a model file's text), predicting with at most
+    /// `threads` threads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the booster does not load or does not have the model's features and
+    /// classes.
+    pub fn from_parts(info: ModelInfo, booster_json: &str, threads: NonZeroUsize) -> Result<Self> {
         let booster = Booster::from_json(booster_json.as_bytes(), threads)
             .context("invalid XGBoost booster")?;
         let model = WinnowrModel { booster, info };
@@ -649,7 +754,7 @@ pub fn predict_probabilities<S: AsRef<str>>(
 pub fn check_reference(
     model: &Path,
     info: &ModelInfo,
-    contigs: &IndexMap<String, Option<u64>>,
+    contigs: &ReferenceContigs,
     source: &str,
     require_all: bool,
 ) -> Result<()> {
@@ -906,6 +1011,32 @@ mod tests {
         let unknown = text.replace(r#""feature_source":"vcf""#, r#""feature_source":"bam""#);
         let error = format!("{:#}", WinnowrModel::from_json(&unknown, THREADS).unwrap_err());
         assert!(error.contains("unknown feature source 'bam'"), "{error}");
+    }
+
+    /// A model's information is read without its booster, which may come first; a file cut short
+    /// is an error.
+    #[test]
+    fn model_information_is_read_without_the_booster() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+        let path = dir.path().join("m.winnowr.json");
+        model.save(&path).unwrap();
+        assert_eq!(ModelInfo::read(&path).unwrap(), model.info);
+        assert_eq!(
+            ModelInfo::read(&path).unwrap(),
+            WinnowrModel::load(&path, THREADS).unwrap().info
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        let (info_text, booster) = split_member(&text, "booster").unwrap();
+        let first = format!(
+            "{{\"booster\":{booster},{}",
+            info_text.trim_start().strip_prefix('{').unwrap()
+        );
+        fs::write(&path, &first).unwrap();
+        assert_eq!(ModelInfo::read(&path).unwrap(), model.info);
+        fs::write(&path, &text[..text.len() / 2]).unwrap();
+        let message = format!("{:#}", ModelInfo::read(&path).unwrap_err());
+        assert!(message.contains("not a JSON object with a booster"), "{message}");
     }
 
     #[test]

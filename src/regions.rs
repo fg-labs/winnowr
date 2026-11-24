@@ -192,9 +192,8 @@ impl RegionSet {
         let source = self.source();
         let contigs: Vec<&str> = contigs.iter().map(AsRef::as_ref).collect();
         bail!(
-            "region BED {source} has no intervals on the extracted contigs ({}); its contigs \
-             include: {bed_contigs}. Its contig names must match the variant calls' (e.g. chr1, \
-             not 1)",
+            "region BED {source} has no intervals on the contigs ({}); its contigs include: \
+             {bed_contigs}. Its contig names must match them (e.g. chr1, not 1)",
             contigs.join(", ")
         )
     }
@@ -560,8 +559,8 @@ mod tests {
         regions.check_contigs(&["chr1", "2"]).unwrap();
         let message = regions.check_contigs(&["chr1", "chr2"]).unwrap_err().to_string();
         let expected = format!(
-            "region BED {} has no intervals on the extracted contigs (chr1, chr2); its contigs \
-             include: 1, 2. Its contig names must match the variant calls' (e.g. chr1, not 1)",
+            "region BED {} has no intervals on the contigs (chr1, chr2); its contigs include: 1, \
+             2. Its contig names must match them (e.g. chr1, not 1)",
             path.display()
         );
         assert_eq!(message, expected);

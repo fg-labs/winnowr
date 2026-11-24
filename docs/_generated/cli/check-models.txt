@@ -1,0 +1,37 @@
+Check a set of models before a run, and report what they need.
+
+Reads each model's information, but not its booster (which `score` loads, and this does not check),
+and runs the model-set checks `score` runs at startup, and more, reporting every problem: that the
+models can be scored together (one model per task and variant type, the same contigs and reference,
+one feature source, one setting of each evidence), that --regions has a BED for every region a model
+uses (each BED is read, and must have intervals on the models' contigs; for a BED `score` does not
+read, a problem is only a warning), and that the models' reference is that of --reference or --vcf.
+Warnings (e.g. a model trained by another winnowr version) do not fail it; errors do. With --json,
+prints a JSON summary (schema version 1) on stdout, also when it fails.
+
+Usage: winnowr check-models [OPTIONS] --models <MODELS>...
+
+Options:
+      --models <MODELS>...
+          The model files (`<name>.winnowr.json`), as given to `score --models`
+
+  -t, --threads <THREADS>
+          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+
+      --regions <NAME=PATH>...
+          Region BEDs as NAME=PATH, as given to `score --regions`; each is read and checked (a
+          problem of one `score` does not read is a warning)
+
+      --reference <REFERENCE>
+          The reference FASTA with its `.fai` beside it, or the `.fai` itself: only the index is
+          read, and the models' reference contigs are checked against its lengths
+
+      --vcf <VCF>
+          The VCF to be scored: only its header is read, and the models' reference contigs are
+          checked against its contigs
+
+      --json
+          Print the summary as JSON on stdout (schema version 1), with every problem
+
+  -h, --help
+          Print help (see a summary with '-h')

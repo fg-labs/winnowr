@@ -185,6 +185,7 @@ winnowr subset    # restrict a labelled feature table to some contigs, or away f
 winnowr train     # train a model for one variant type; thresholds chosen by cross-validation
 winnowr evaluate  # F1 of a model's decisions on a held-out labelled sample
 winnowr stratify  # decisions, F1 and P(keep) calibration by benchmark stratum and GIAB stratification
+winnowr check-models  # check a set of models before a run, and report what they need
 winnowr score     # apply models to a sample and write the re-genotyped, filtered VCF
 ```
 

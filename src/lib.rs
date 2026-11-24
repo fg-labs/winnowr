@@ -18,6 +18,7 @@ use bzip2_sys as _;
 use lzma_sys as _;
 
 mod alleles;
+mod check_models;
 pub mod cli;
 mod common;
 mod evaluation;
@@ -32,6 +33,7 @@ mod io;
 mod labels;
 mod model;
 mod model_evidence;
+mod model_set;
 mod neighbourhood;
 mod numeric;
 mod pileup;
