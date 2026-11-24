@@ -119,8 +119,9 @@ pub fn check_table_inputs<S: AsRef<str>>(
 ///
 /// Returns an error if the promote-label inputs are incomplete, the given depth median is not a
 /// depth (see [`crate::features::check_dp_median`]) or a contig is repeated (checked before any
-/// input is read), a region set has no intervals on `contigs`, the calls cannot be read (see
-/// [`extract_raw_records`]), or most hap.py labels match no call.
+/// input is read), a region set has no intervals on `contigs` or its covered-base total cannot fit
+/// in `u64`, the calls cannot be read (see [`extract_raw_records`]), or most hap.py labels match no
+/// call.
 pub fn build_feature_table<S: AsRef<str> + Sync>(
     sample: &str,
     vcf: &Path,
@@ -160,6 +161,11 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
         restricted_to: None,
         feature_source: inputs.annotations.feature_source(),
         alignment: inputs.alignment.cloned(),
+        region_digests: inputs
+            .regions
+            .iter()
+            .map(|r| Ok((r.name().to_string(), r.digest()?)))
+            .collect::<Result<_>>()?,
     };
     let mut table = FeatureTable::from_records(&records, derived, info)?;
     drop(records);

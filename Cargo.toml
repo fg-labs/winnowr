@@ -61,6 +61,9 @@ log = "0.4.35"
 mimalloc = { version = "0.1.52", default-features = false }
 parquet = { version = "60.2.0", default-features = false, features = ["arrow", "snap", "zstd"] }
 rayon = "1.12.0"
+# SHA-256 of region BEDs, recorded in tables and models so that scoring can tell a BED from
+# another under the same name.
+sha2 = "0.11.1"
 # VCF/BCF and BAM I/O, with htslib built from source and linked statically.
 rust-htslib = { version = "1.0.2", default-features = false, features = ["bzip2", "lzma", "libdeflate", "static"] }
 # Build htslib's bzip2 and xz from source and link them statically, rather than linking the

@@ -4,6 +4,7 @@
 // are literal, not HTML.
 #![allow(rustdoc::invalid_html_tags)]
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -25,16 +26,17 @@ use crate::feature_source::FeatureSource;
 use crate::features::feature_names;
 use crate::labels::{HappyPassOnly, UnfixableFlips};
 use crate::model::{
-    CvFolds, MODEL_SUFFIX, ModelInfo, ReferenceContigs, TrainingParams, WinnowrModel,
-    check_reference, read_model_file_with_metadata,
+    CvFolds, MODEL_SUFFIX, ModelFile, ModelInfo, ReferenceContigs, TrainingParams, WinnowrModel,
+    check_reference,
 };
 use crate::model_evidence::{
     Measuring, check_supplied, check_table, measure_and_decide, models_options, models_using,
     read_for_models, shared_options,
 };
 use crate::model_set::{
-    Check, ModelSet, Problem, ReadsCheck, SetInputs, Severity, alignment_provenance_problems,
-    check_model_set, error_message, models_feature_source,
+    Check, ModelSet, Problem, ReadsCheck, RegionPlan, ResolvedRegion, RunRegions, SetInputs,
+    Severity, alignment_provenance_problems, bundled_bed_files, check_model_set, error_message,
+    has_indel_genotype, mismatch_severity, models_feature_source, region_digests_differ,
 };
 use crate::pileup::{
     MeasuredSite, PileupOptions, PileupTables, measure_annotations_and_pileup, measure_pileup,
@@ -43,12 +45,14 @@ use crate::pileup::{
 use crate::pileup_features::PILEUP_FEATURES;
 use crate::policy::{
     Abstention, DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP, NOT_DIFFICULT_REGIONS, Policy,
-    decide_calls, is_indel_genotype,
+    decide_calls,
 };
 use crate::raw_records::AnnotationInputs;
 use crate::read_annotations::{ReadAnnotationOptions, summarise};
 use crate::read_pass::{AlignmentExpectation, ReadInputs};
-use crate::regions::{NamedBed, NamedPath, RegionSet, read_region_sets};
+use crate::regions::{
+    NamedBed, NamedPath, RegionDigest, RegionSet, read_region_sets, training_region_digests,
+};
 use crate::repeat_features::STRLEN_FEATURES;
 use crate::rescore::{Mode, Rule};
 use crate::samples::{PromoteSampleCalls, SampleCalls};
@@ -183,9 +187,10 @@ pub(crate) enum Command {
     /// not check), and runs the model-set checks `score` runs at startup, and more, reporting
     /// every problem: that the models can be scored together (one model per task and variant
     /// type, the same contigs and reference, one feature source, one setting of each evidence),
-    /// that --regions has a BED for every region a model uses (each BED is read, and must have
-    /// intervals on the models' contigs; for a BED `score` does not read, a problem is only a
-    /// warning), and that the models' reference is that of --reference or --vcf. Warnings (e.g.
+    /// that every region a model uses has a BED given with --regions or found beside the models
+    /// as regions/NAME.bed.gz, .bed.bgz or .bed (each BED is read, and must have intervals on the
+    /// models' contigs; for a BED `score` does not read, a problem is only a warning), and that
+    /// the models' reference is that of --reference or --vcf. Warnings (e.g.
     /// a model trained by another winnowr version) do not fail it; errors do. With --json, prints
     /// a JSON summary (schema version 1) on stdout, also when it fails.
     CheckModels(CheckModelsArgs),
@@ -415,6 +420,13 @@ pub(crate) struct TrainArgs {
     #[arg(long, short = 'o')]
     pub(crate) output: PathBuf,
 
+    /// The region BEDs of the decision policy the model will be scored with, as NAME=PATH (today
+    /// only notinalldifficultregions=PATH, GIAB's GRCh38 genome stratification): each is read
+    /// only to record its digest in the model, so that score can check the BED it is given or
+    /// finds beside the model.
+    #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
+    pub(crate) policy_regions: Vec<NamedBed>,
+
     /// Train on tables of reads aligned differently (e.g. to make a model of both): the model
     /// records only the alignment tags the tables share, and score compares it with the reads on
     /// those tags only. Without it, tables whose recorded alignment provenance differs are an
@@ -572,9 +584,16 @@ pub(crate) struct EvaluateArgs {
 
     /// The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
     /// with these. Only the not-difficult regions (notinalldifficultregions) are read; the models'
-    /// region features come from the table.
+    /// region features come from the table. Without them, regions/notinalldifficultregions.bed.gz,
+    /// .bed.bgz or .bed beside the models is used.
     #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
     pub(crate) regions: Vec<NamedBed>,
+
+    /// Use a feature table, or a not-difficult regions BED (given or found beside the models),
+    /// whose region BED digests are not the ones the models record, with a warning, rather than
+    /// failing. Models that record different digests of one region are still an error.
+    #[arg(long)]
+    pub(crate) allow_region_mismatch: bool,
 
     /// The contigs to evaluate: only their calls and truth FNs are counted (e.g. the chromosomes
     /// held out from a model's training) [default: all the table's contigs]. Needs --happy, and a
@@ -740,29 +759,68 @@ pub(crate) struct PolicyArgs {
 }
 
 impl PolicyArgs {
-    /// The policy in a mode, checking the not-difficult regions name some of `contigs`.
+    /// Validates both policy option lists before any potentially blocking BED read.
+    fn validate(&self) -> Result<()> {
+        without_none("--keep-fallback", &self.keep_fallback, KeepFallback::None)?;
+        without_none("--abstain-actions", &self.abstain_actions, AbstainAction::None)?;
+        Ok(())
+    }
+
+    /// True if the policy reads the not-difficult regions (when it has them): to withhold
+    /// actions outside them, or, for an indel genotype model (`indel_genotype`), to drop indel
+    /// calls outside them at the outside threshold. The one rule for whether a run reads them.
+    fn reads_not_difficult(&self, indel_genotype: bool) -> bool {
+        let abstains = self.abstain_actions.iter().any(|action| *action != AbstainAction::None);
+        abstains || (indel_genotype && self.outside_indel_t_drop.0.is_some())
+    }
+
+    /// Checks that the policy has the not-difficult regions (`found`: given, or found beside the
+    /// models) if it withholds actions outside them, which it cannot do without them. `score`
+    /// calls it right after it looks for the regions, before any long pass; [`PolicyArgs::policy`]
+    /// (which `evaluate` and `stratify` use) calls it too.
     ///
-    /// The not-difficult regions are the `regions` named [`NOT_DIFFICULT_REGIONS`]. Without them,
-    /// the outside indel drop threshold is not applied (with a warning when `indel_genotype`, i.e.
-    /// an indel genotype model will score). They are read only if an action is withheld outside
-    /// them or an indel genotype model will drop calls outside them.
+    /// # Errors
+    ///
+    /// Returns an error if `none` is given with other values of --abstain-actions, or actions are
+    /// withheld and the regions were not `found`.
+    fn require_not_difficult(&self, found: bool) -> Result<()> {
+        let abstain_actions =
+            without_none("--abstain-actions", &self.abstain_actions, AbstainAction::None)?;
+        if !found && !abstain_actions.is_empty() {
+            bail!(
+                "--abstain-actions needs the not-difficult regions: pass --regions \
+                 {NOT_DIFFICULT_REGIONS}=PATH, or put them beside the models as {}",
+                bundled_bed_files(NOT_DIFFICULT_REGIONS)
+            );
+        }
+        Ok(())
+    }
+
+    /// The policy in a mode, with the not-difficult regions (`not_difficult`: given, or found
+    /// beside the models, and read by the caller only if the policy reads them, see
+    /// [`PolicyArgs::reads_not_difficult`], so an unused BED cannot fail the run), checking they
+    /// name some of `contigs`.
+    ///
+    /// Without them, the outside indel drop threshold is not applied (with a warning when
+    /// `indel_genotype`, i.e. an indel genotype model will score).
     ///
     /// # Errors
     ///
     /// Returns an error if `none` is given with other values of --keep-fallback or
-    /// --abstain-actions, actions are withheld without the not-difficult regions, or they cannot be
-    /// read or name none of `contigs`.
+    /// --abstain-actions, actions are withheld without the not-difficult regions, or they name
+    /// none of `contigs`.
     fn policy<S: AsRef<str>>(
         &self,
         mode: Mode,
         contigs: &[S],
-        regions: &[NamedBed],
+        not_difficult: Option<RegionSet>,
         indel_genotype: bool,
     ) -> Result<Policy> {
         let keep_fallback =
             without_none("--keep-fallback", &self.keep_fallback, KeepFallback::None)?;
         let abstain_actions =
             without_none("--abstain-actions", &self.abstain_actions, AbstainAction::None)?;
+        self.require_not_difficult(not_difficult.is_some())?;
         let mut policy = Policy::new(mode);
         for vt in keep_fallback.iter().filter_map(|value| value.variant_type()) {
             policy.rules.insert(vt, Rule::KeepFallback);
@@ -774,31 +832,23 @@ impl PolicyArgs {
         let (flip, regenotype, promote) =
             (has(AbstainAction::Flip), has(AbstainAction::Regenotype), has(AbstainAction::Promote));
         let indel_t_drop = self.outside_indel_t_drop.0;
-        let path =
-            regions.iter().find(|r| r.name == NOT_DIFFICULT_REGIONS).map(|r| r.path.as_path());
-        // Read the not-difficult regions only when something uses them, so an unused BED (e.g. in a
-        // run without an indel genotype model) cannot fail the run.
-        let outside_t_drop = indel_t_drop.filter(|_| indel_genotype);
-        match path {
-            Some(path) if flip || regenotype || promote || outside_t_drop.is_some() => {
-                let regions = RegionSet::from_bed(NOT_DIFFICULT_REGIONS, path)?;
+        match not_difficult {
+            Some(regions) => {
                 regions.check_contigs(contigs)?;
-                info!("Not-difficult regions (acting fully inside): {}", path.display());
+                info!("Not-difficult regions (acting fully inside): {}", regions.source());
                 policy.abstain =
                     Some(Abstention { regions, flip, regenotype, promote, indel_t_drop });
             }
-            Some(_) => {}
-            None if flip || regenotype || promote => bail!(
-                "--abstain-actions needs the not-difficult regions: --regions \
-                 {NOT_DIFFICULT_REGIONS}=PATH"
-            ),
+            // Without them no action is withheld (see `require_not_difficult`).
             None => {
-                if let Some(t_drop) = outside_t_drop {
+                if let Some(t_drop) = indel_t_drop.filter(|_| indel_genotype) {
                     log::warn!(
-                        "--regions has no {NOT_DIFFICULT_REGIONS}=PATH, so indel calls are \
-                         dropped at the model's threshold everywhere; pass it (GIAB's GRCh38 \
-                         genome stratification {NOT_DIFFICULT_REGIONS}.bed.gz) to drop indel \
-                         calls outside it at P(drop) >= {t_drop} instead"
+                        "the not-difficult regions are neither given (--regions \
+                         {NOT_DIFFICULT_REGIONS}=PATH) nor beside the models ({}), so indel calls \
+                         are dropped at the model's threshold everywhere; give them (GIAB's GRCh38 \
+                         genome stratification {NOT_DIFFICULT_REGIONS}.bed.gz) to drop indel calls \
+                         outside them at P(drop) >= {t_drop} instead",
+                        bundled_bed_files(NOT_DIFFICULT_REGIONS)
                     );
                 }
             }
@@ -865,9 +915,16 @@ pub(crate) struct StratifyArgs {
 
     /// The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
     /// with these. Only the not-difficult regions (notinalldifficultregions) are read; the models'
-    /// region features come from the table. Not reported within: see --report-region.
+    /// region features come from the table. Not reported within: see --report-region. Without
+    /// them, regions/notinalldifficultregions.bed.gz, .bed.bgz or .bed beside the models is used.
     #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
     pub(crate) regions: Vec<NamedBed>,
+
+    /// Use a feature table, or a not-difficult regions BED (given or found beside the models),
+    /// whose region BED digests are not the ones the models record, with a warning, rather than
+    /// failing. Models that record different digests of one region are still an error.
+    #[arg(long)]
+    pub(crate) allow_region_mismatch: bool,
 
     /// The prefix of the reports to write (<output>.strata.tsv, <output>.rates.tsv and
     /// <output>.calibration.tsv).
@@ -963,7 +1020,9 @@ pub(crate) struct ScoreArgs {
     /// Region BEDs as NAME=PATH, with the names the models were trained with, plus the
     /// not-difficult regions as notinalldifficultregions=PATH (GIAB's GRCh38 genome stratification;
     /// outside them, indel calls are dropped at --outside-indel-t-drop in place of the model's
-    /// threshold).
+    /// threshold). A region not given is found beside the models, as regions/NAME.bed.gz,
+    /// regions/NAME.bed.bgz or regions/NAME.bed. Each BED used is checked against the digest the
+    /// models record (see --allow-region-mismatch).
     #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
     pub(crate) regions: Vec<NamedBed>,
 
@@ -1007,6 +1066,12 @@ pub(crate) struct ScoreArgs {
     /// --pileup tables, which must agree), compared with how the models' training reads were.
     #[command(flatten)]
     pub(crate) provenance: ProvenanceCheckArgs,
+
+    /// Use a region BED (given or found beside the models) whose digest is not the one the
+    /// models record, with a warning, rather than failing. Models that record different digests
+    /// of one region are still an error: no BED is the one all of them were trained with.
+    #[arg(long)]
+    pub(crate) allow_region_mismatch: bool,
 }
 
 /// The options of `score` and `check-models` that check how the reads were aligned against how
@@ -1032,7 +1097,8 @@ pub(crate) struct CheckModelsArgs {
     pub(crate) models: Vec<PathBuf>,
 
     /// Region BEDs as NAME=PATH, as given to `score --regions`; each is read and checked (a
-    /// problem of one `score` does not read is a warning).
+    /// problem of one `score` does not read is a warning). A region not given is found beside the
+    /// models, as `score` finds it.
     #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
     pub(crate) regions: Vec<NamedBed>,
 
@@ -1056,6 +1122,12 @@ pub(crate) struct CheckModelsArgs {
     /// were (as in `score`).
     #[command(flatten)]
     pub(crate) provenance: ProvenanceCheckArgs,
+
+    /// A region BED (given or found beside the models) whose digest is not the one the models
+    /// record is a warning, not an error (as `score --allow-region-mismatch`). Models that record
+    /// different digests of one region are still an error.
+    #[arg(long)]
+    pub(crate) allow_region_mismatch: bool,
 
     /// Print the summary as JSON on stdout (schema version 1), with every problem.
     #[arg(long)]
@@ -1683,6 +1755,35 @@ fn read_training_infos(paths: &[PathBuf]) -> Result<TrainingInfos> {
     Ok(TrainingInfos { infos, regions, contigs, reference_contigs, feature_source })
 }
 
+/// The digest of each `--policy-regions` BED, to record in the model.
+///
+/// # Errors
+///
+/// Returns an error if a name is not [`NOT_DIFFICULT_REGIONS`] or is given twice, or a BED cannot
+/// be read.
+fn policy_region_digests(regions: &[NamedBed]) -> Result<BTreeMap<String, RegionDigest>> {
+    let mut names = std::collections::BTreeSet::new();
+    for bed in regions {
+        if bed.name != NOT_DIFFICULT_REGIONS {
+            bail!(
+                "--policy-regions takes only {NOT_DIFFICULT_REGIONS}=PATH (the policy's only region \
+                 set), got {}",
+                bed.name
+            );
+        }
+        if !names.insert(&bed.name) {
+            bail!("--policy-regions gives {} more than once", bed.name);
+        }
+    }
+    let mut digests = BTreeMap::new();
+    for bed in regions {
+        let digest = RegionSet::from_bed(&bed.name, &bed.path)?.digest()?;
+        info!("The policy's {} regions ({}): {digest}", bed.name, bed.path.display());
+        digests.insert(bed.name.clone(), digest);
+    }
+    Ok(digests)
+}
+
 /// The contigs of any of the tables: those of the tables covering the most contigs first, ties
 /// broken by sample name, so that a whole-genome table sets the genome's order and the order does
 /// not depend on the order of `--tables`. Tables of the same contigs give those contigs, in their
@@ -1809,17 +1910,40 @@ fn training_params(args: &TrainArgs, threads: NonZeroUsize) -> Result<TrainingPa
     Ok(params)
 }
 
-/// Loads one training input using the same column selection as fitting.
+/// Loads one training input using the same column selection as fitting, checking that the
+/// metadata preflight read (`expected`), which the model records, has not changed since: e.g. its
+/// alignment provenance and its region BED digests.
+///
+/// # Errors
+///
+/// Returns an error naming the table and what changed if it cannot be read, or its metadata has
+/// changed.
 fn read_training_table(
     path: &Path,
     selection: &TableSelection,
     expected: &FeatureTableInfo,
 ) -> Result<FeatureTable> {
     let table = FeatureTable::read_parquet_selected(path, selection)?;
-    if table.info().alignment != expected.alignment {
+    let info = table.info();
+    let changed: Vec<&str> = [
+        ("alignment provenance", info.alignment != expected.alignment),
+        ("region BED digests", info.region_digests != expected.region_digests),
+        ("sample", info.sample != expected.sample),
+        ("contigs", info.contigs != expected.contigs),
+        ("reference contigs", info.reference_contigs != expected.reference_contigs),
+        ("region names", info.region_names != expected.region_names),
+        ("feature source", info.feature_source != expected.feature_source),
+        ("repeat-length settings", info.strlen_settings != expected.strlen_settings),
+        ("pileup settings", info.pileup_settings != expected.pileup_settings),
+    ]
+    .into_iter()
+    .filter_map(|(what, changed)| changed.then_some(what))
+    .collect();
+    if !changed.is_empty() {
         bail!(
-            "{} has changed alignment provenance since training preflight; read and check the training inputs again",
-            path.display()
+            "{} has changed {} since training preflight; read and check the training inputs again",
+            path.display(),
+            changed.join(" and ")
         );
     }
     Ok(table)
@@ -1846,11 +1970,35 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
     };
     // Checked now rather than after hours of training.
     check_output_dir("--output", &output)?;
+    let inputs = || {
+        args.tables
+            .iter()
+            .map(|path| ("feature table", path.as_path()))
+            .chain(args.policy_regions.iter().map(|bed| ("policy region BED", bed.path.as_path())))
+    };
+    crate::scoring::check_output_not_input(&output, inputs())?;
     let TrainingInfos { infos, regions, contigs, reference_contigs, feature_source } =
         read_training_infos(&args.tables)?;
     let provenances: Vec<(&str, Option<&AlignmentProvenance>)> =
         infos.iter().map(|info| (info.sample.as_str(), info.alignment.as_ref())).collect();
     let alignment = training_provenance(&provenances, args.mixed_alignments)?;
+    let table_digests: Vec<(&str, &BTreeMap<String, RegionDigest>)> =
+        infos.iter().map(|info| (info.sample.as_str(), &info.region_digests)).collect();
+    let region_digests = training_region_digests(&table_digests, &regions)?;
+    let policy_region_digests = policy_region_digests(&args.policy_regions)?;
+    for (name, policy_digest) in &policy_region_digests {
+        if let Some(feature_digest) =
+            region_digests.get(name).filter(|digest| *digest != policy_digest)
+        {
+            log::warn!(
+                "the {name} feature and policy region digests differ: feature {feature_digest}, \
+                 policy {policy_digest}; train records both, but score cannot use one live BED for \
+                 both roles (even with --allow-region-mismatch); use the same BED for both roles \
+                 to score with that policy, or disable the policy's use of this BED. Table-based \
+                 evaluate and stratify can use different BEDs for the two roles"
+            );
+        }
+    }
     let info_refs: Vec<&FeatureTableInfo> = infos.iter().collect();
     let groups: Vec<Vec<String>> =
         args.sample_groups.iter().map(|g| g.split(',').map(str::to_string).collect()).collect();
@@ -1901,6 +2049,8 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
         pileup_settings: pileup_options,
         feature_source,
         alignment,
+        region_digests,
+        policy_region_digests,
     };
     let mut timer = PhaseTimer::start();
     let model = if args.task == Task::Promote {
@@ -1983,6 +2133,7 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
         }
     };
     let mut timer = PhaseTimer::start();
+    crate::scoring::check_output_not_input(&output, inputs())?;
     model.save(&output)?;
     timer.lap("saving the model");
     info!("Wrote model {}", output.display());
@@ -2031,12 +2182,34 @@ fn log_samples(samples: &[SampleCalls], args: &TrainArgs) {
 
 /// Runs `winnowr evaluate`.
 fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
+    evaluate_with(args, threads, || {})
+}
+
+/// Evaluates with a callback after consuming the policy BED and before any report is written.
+fn evaluate_with<F: FnOnce()>(
+    args: &EvaluateArgs,
+    threads: NonZeroUsize,
+    before_reports: F,
+) -> Result<()> {
     use crate::evaluation::{
         EvaluationPolicy, baseline_metric, evaluate_model, evaluate_promote_model,
-        write_policy_metrics,
+        write_policy_metrics_protecting,
     };
+    args.policy.validate()?;
     check_output_dir("--output", &args.output)?;
-    let models = load_models(&args.models, threads)?;
+    // The output is none of the inputs: checked now, and against the not-difficult regions BED
+    // once it is found, before it is read.
+    let outputs = [args.output.clone()];
+    let inputs = args
+        .models
+        .iter()
+        .map(|model| ("model", model.as_path()))
+        .chain([("feature table", args.table.as_path())])
+        .chain(args.happy.iter().map(|happy| ("hap.py VCF", happy.as_path())));
+    check_no_output_is_input(&outputs, inputs)?;
+    let files = ModelFile::resolve_all(&args.models);
+    let models = load_models(&files, threads)?;
+    check_models_region_digests(&models, &files)?;
     let genotype: Vec<&WinnowrModel> =
         models.iter().filter(|m| m.info.task == Task::Genotype).collect();
     let promote: Vec<&WinnowrModel> =
@@ -2075,15 +2248,20 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
         Some(happy) => restrict_to_contigs(&table, happy, &args.contigs)?,
     };
     let info = table.info();
-    check_labelled_table(&args.table, info, &models, &args.models)?;
+    check_labelled_table(&args.table, info, &models, &args.models, args.allow_region_mismatch)?;
     warn_policy_only_regions(&args.regions);
-    // The mode is a placeholder: evaluate reports both.
-    let policy = args.policy.policy(
-        Mode::Genotyper,
-        &extracted,
+    let indel_genotype = !genotype.is_empty() && variant_type == VariantType::Indel;
+    let infos: Vec<&ModelInfo> = models.iter().map(|model| &model.info).collect();
+    let (not_difficult, protected_beds) = policy_not_difficult(
+        &infos,
+        &files,
         &args.regions,
-        !genotype.is_empty() && variant_type == VariantType::Indel,
+        args.policy.reads_not_difficult(indel_genotype),
+        args.allow_region_mismatch,
+        &outputs,
     )?;
+    // The mode is a placeholder: evaluate reports both.
+    let policy = args.policy.policy(Mode::Genotyper, &extracted, not_difficult, indel_genotype)?;
     let stutter = genotype.first().and_then(|m| m.info.stutter.as_ref());
     let regenotype = genotype.first().is_some_and(|m| m.info.regenotype);
     let calls = SampleCalls::from_table(&table, variant_type, stutter, regenotype)?;
@@ -2154,20 +2332,22 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
             m.f1_gain
         );
     }
-    write_policy_metrics(&args.output, &metrics)
+    before_reports();
+    write_policy_metrics_protecting(&args.output, &metrics, &protected_beds)
 }
 
-/// Loads model files, logging their warnings (see [`crate::model::ModelInfo::warnings`]).
+/// Loads model files, each from the file it resolved to, logging their warnings (see
+/// [`crate::model::ModelInfo::warnings`]).
 ///
 /// # Errors
 ///
 /// Returns an error if a model cannot be loaded.
-fn load_models(paths: &[PathBuf], threads: NonZeroUsize) -> Result<Vec<WinnowrModel>> {
-    paths
+fn load_models(files: &[ModelFile], threads: NonZeroUsize) -> Result<Vec<WinnowrModel>> {
+    files
         .iter()
-        .map(|path| {
-            let model = WinnowrModel::load(path, threads)?;
-            model.info.warnings(path).log();
+        .map(|file| {
+            let model = WinnowrModel::load_file(file, threads)?;
+            model.info.warnings(&file.path).log();
             Ok(model)
         })
         .collect()
@@ -2180,14 +2360,17 @@ fn load_models(paths: &[PathBuf], threads: NonZeroUsize) -> Result<Vec<WinnowrMo
 /// # Errors
 ///
 /// Returns an error if the table is not on a model's reference, holds features from another
-/// source than a model was trained on, or lacks evidence a model needs.
+/// source than a model was trained on, lacks evidence a model needs, or flags a region with
+/// another BED than a model was trained with (unless `allow_region_mismatch`).
 fn check_labelled_table(
     table: &Path,
     info: &FeatureTableInfo,
     models: &[WinnowrModel],
     paths: &[PathBuf],
+    allow_region_mismatch: bool,
 ) -> Result<()> {
     check_table_reference(table, info, models, paths)?;
+    check_table_region_digests(table, info, models, paths, allow_region_mismatch)?;
     check_table_feature_source(table, info, models, paths)?;
     check_table::<StrlenOptions>(table, info, models, paths)?;
     check_table::<PileupOptions>(table, info, models, paths)?;
@@ -2206,6 +2389,77 @@ fn check_labelled_table(
             info.sample,
             trained_on.join(", ")
         );
+    }
+    Ok(())
+}
+
+/// Checks that the models of `evaluate` or `stratify` record the same digest of each region their
+/// features use: no labelled table can then be of the BED all were trained with. It depends on the
+/// models alone, so it is checked as soon as they are loaded, before any table is read.
+///
+/// # Errors
+///
+/// Returns an error naming the region and two models if the models record different digests of a
+/// region, even with `--allow-region-mismatch`.
+fn check_models_region_digests(models: &[WinnowrModel], files: &[ModelFile]) -> Result<()> {
+    let infos: Vec<&ModelInfo> = models.iter().map(|model| &model.info).collect();
+    let paths: Vec<PathBuf> = files.iter().map(|file| file.path.clone()).collect();
+    let resolved: Vec<PathBuf> = files.iter().map(|file| file.resolved.clone()).collect();
+    let given_dirs: Vec<PathBuf> = files.iter().map(|file| file.given_dir.clone()).collect();
+    let set =
+        ModelSet { paths: &paths, resolved: &resolved, given_dirs: &given_dirs, infos: &infos };
+    if let Some(message) = error_message(&region_digests_differ(&set, false)) {
+        bail!("{message}");
+    }
+    Ok(())
+}
+
+/// Checks that a labelled feature table flags each region a model uses with the BED the model was
+/// trained with, by their recorded digests. Where a model records one and the table none, it
+/// cannot be checked: warned, once per region. Nothing is checked where a model records none, and
+/// models that record different digests of a region are [`check_models_region_digests`]'s.
+///
+/// # Errors
+///
+/// Returns an error naming the region, the table and the model if their digests differ, unless
+/// `allow_mismatch`, which makes that a warning.
+fn check_table_region_digests(
+    table: &Path,
+    info: &FeatureTableInfo,
+    models: &[WinnowrModel],
+    paths: &[PathBuf],
+    allow_mismatch: bool,
+) -> Result<()> {
+    let mut unchecked: Vec<&str> = Vec::new();
+    for (path, model) in paths.iter().zip(models) {
+        for (name, trained) in &model.info.region_digests {
+            let Some(extracted) = info.region_digests.get(name) else {
+                if !unchecked.contains(&name.as_str()) {
+                    unchecked.push(name);
+                    log::warn!(
+                        "feature table {} records no digest of its {name} region BED, so it cannot \
+                         be checked against the one the models were trained with",
+                        table.display()
+                    );
+                }
+                continue;
+            };
+            if extracted == trained {
+                continue;
+            }
+            let (severity, advice) =
+                mismatch_severity(allow_mismatch, "extract it with the model's BED");
+            let message = format!(
+                "feature table {} flags the {name} regions with another BED than model {} was \
+                 trained with: the table's has {extracted}, the model's {trained}; {advice}",
+                table.display(),
+                path.display()
+            );
+            if severity == Severity::Error {
+                bail!("{message}");
+            }
+            log::warn!("{message}");
+        }
     }
     Ok(())
 }
@@ -2410,13 +2664,35 @@ fn score_table_inputs<'a>(
     }
 }
 
+/// The suffixes of the reports `stratify` writes at its `--output` prefix (`<output>.<suffix>`):
+/// overall, and by report region.
+const STRATIFY_REPORTS: [&str; 6] = [
+    "strata.tsv",
+    "rates.tsv",
+    "calibration.tsv",
+    "regions.strata.tsv",
+    "regions.rates.tsv",
+    "regions.calibration.tsv",
+];
+
 /// Runs `winnowr stratify`.
 fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
+    stratify_with(args, threads, || {})
+}
+
+/// Stratifies with a callback after consuming the policy BED and before any report is written.
+fn stratify_with<F: FnOnce()>(
+    args: &StratifyArgs,
+    threads: NonZeroUsize,
+    before_reports: F,
+) -> Result<()> {
     use crate::regions::RegionSet;
     use crate::regions::read_stratification_manifest;
     use crate::strata::{
-        CALL_KEY_COLUMNS, CallOutputs, TRUTH_LABEL_COLUMNS, TruthSets, check_region_names, stratify,
+        CALL_KEY_COLUMNS, CallOutputs, TRUTH_LABEL_COLUMNS, TruthSets, check_region_names,
+        labelled_calls_path, stratify,
     };
+    args.policy.validate()?;
     check_output_dir("--output", &args.output)?;
     if let Some(calls) = &args.calls {
         check_output_dir("--calls", calls)?;
@@ -2424,7 +2700,32 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
     if let Some(dir) = args.labelled_calls.as_deref().filter(|dir| !dir.is_dir()) {
         bail!("the --labelled-calls directory {} does not exist", dir.display());
     }
-    let models = load_models(&args.models, threads)?;
+    let mut named = match &args.stratification {
+        Some(path) => read_stratification_manifest(path)?,
+        None => Vec::new(),
+    };
+    named.extend(args.report_region.iter().cloned());
+    // No output may be an input: checked before any input is read but the manifest, and for the
+    // labelled calls (named by the sample) and the not-difficult regions BED once they are known.
+    let report_path = |suffix: &str| PathBuf::from(format!("{}.{suffix}", args.output.display()));
+    let report_count = if named.is_empty() { 3 } else { STRATIFY_REPORTS.len() };
+    let mut outputs: Vec<PathBuf> =
+        STRATIFY_REPORTS[..report_count].iter().map(|s| report_path(s)).collect();
+    outputs.extend(args.calls.iter().cloned());
+    let inputs: Vec<(&str, &Path)> = args
+        .models
+        .iter()
+        .map(|model| ("model", model.as_path()))
+        .chain(args.tables.iter().map(|table| ("feature table", table.as_path())))
+        .chain(args.truth_beds.iter().map(|bed| ("truth BED", bed.as_path())))
+        .chain(args.happy.iter().map(|happy| ("hap.py VCF", happy.as_path())))
+        .chain(args.stratification.iter().map(|path| ("stratification manifest", path.as_path())))
+        .chain(named.iter().map(|named| ("report region BED", named.path.as_path())))
+        .collect();
+    check_no_output_is_input(&outputs, inputs.iter().copied())?;
+    let files = ModelFile::resolve_all(&args.models);
+    let models = load_models(&files, threads)?;
+    check_models_region_digests(&models, &files)?;
     let names: [String; 2] = [args.truth_names[0].clone(), args.truth_names[1].clone()];
     if names[0] == names[1] {
         bail!("--truth-names must differ, got {} twice", names[0]);
@@ -2458,24 +2759,36 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
     if second.info().sample != info.sample {
         bail!("--tables are of different samples: {} and {}", info.sample, second.info().sample);
     }
-    check_labelled_table(&args.tables[0], info, &models, &args.models)?;
-    let beds = [
-        RegionSet::from_bed(&names[0], &args.truth_beds[0])?,
-        RegionSet::from_bed(&names[1], &args.truth_beds[1])?,
-    ];
+    if let Some(dir) = &args.labelled_calls {
+        let labelled: Vec<PathBuf> = names
+            .iter()
+            .flat_map(|truth| {
+                VariantType::ALL
+                    .iter()
+                    .filter(|vt| models.iter().any(|model| model.info.variant_type == **vt))
+                    .map(|vt| labelled_calls_path(dir, &info.sample, truth, *vt))
+            })
+            .collect();
+        check_no_output_is_input(&labelled, inputs.iter().copied())?;
+        outputs.extend(labelled);
+    }
+    check_labelled_table(&args.tables[0], info, &models, &args.models, args.allow_region_mismatch)?;
+    // The identity of every regular BED read (truth and report BEDs here, the policy's below),
+    // retained so no report writer truncates one, even if its path is redirected meanwhile.
+    let mut consumed_beds: Vec<crate::io::FileIdentity> = Vec::new();
+    let mut read_bed = |name: &str, path: &Path| -> Result<RegionSet> {
+        let (regions, identity) = RegionSet::from_bed_with_identity(name, path)?;
+        consumed_beds.extend(identity);
+        Ok(regions)
+    };
+    let beds =
+        [read_bed(&names[0], &args.truth_beds[0])?, read_bed(&names[1], &args.truth_beds[1])?];
     for bed in &beds {
         bed.check_contigs(&extracted)?;
     }
-    let mut named = match &args.stratification {
-        Some(path) => read_stratification_manifest(path)?,
-        None => Vec::new(),
-    };
-    named.extend(args.report_region.iter().cloned());
     check_region_names(&named.iter().map(|named| named.name.as_str()).collect::<Vec<_>>())?;
-    let regions = named
-        .iter()
-        .map(|named| RegionSet::from_bed(&named.name, &named.path))
-        .collect::<Result<Vec<_>>>()?;
+    let regions =
+        named.iter().map(|named| read_bed(&named.name, &named.path)).collect::<Result<Vec<_>>>()?;
     for region in &regions {
         if let Err(e) = region.check_contigs(&extracted) {
             log::warn!("region {}: {e:#}", region.name());
@@ -2487,22 +2800,37 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
         happy: [&args.happy[0], &args.happy[1]],
     };
     warn_policy_only_regions(&args.regions);
-    if !args.regions.iter().any(|r| r.name == NOT_DIFFICULT_REGIONS)
+    let infos: Vec<&ModelInfo> = models.iter().map(|model| &model.info).collect();
+    let indel_genotype = has_indel_genotype(&infos);
+    let reads_not_difficult = args.policy.reads_not_difficult(indel_genotype);
+    let (not_difficult, policy_beds) = policy_not_difficult(
+        &infos,
+        &files,
+        &args.regions,
+        reads_not_difficult,
+        args.allow_region_mismatch,
+        &outputs,
+    )?;
+    let mut protected_beds = consumed_beds;
+    protected_beds.extend(policy_beds);
+    if reads_not_difficult
+        && not_difficult.is_none()
         && named.iter().any(|named| named.name == NOT_DIFFICULT_REGIONS)
     {
         log::warn!(
             "{NOT_DIFFICULT_REGIONS} is reported within but not given to the policy: pass \
-             --regions {NOT_DIFFICULT_REGIONS}=PATH to decide calls as score does with it"
+             --regions {NOT_DIFFICULT_REGIONS}=PATH, or put it beside the models as {}, to decide \
+             calls as score does with it",
+            bundled_bed_files(NOT_DIFFICULT_REGIONS)
         );
     }
-    let policy = args.policy.policy(
-        args.mode,
-        &extracted,
-        &args.regions,
-        models.iter().any(|model| is_indel_genotype(&model.info)),
-    )?;
-    let outputs =
-        CallOutputs { calls: args.calls.as_deref(), labelled_dir: args.labelled_calls.as_deref() };
+    let policy = args.policy.policy(args.mode, &extracted, not_difficult, indel_genotype)?;
+    before_reports();
+    let outputs = CallOutputs {
+        calls: args.calls.as_deref(),
+        labelled_dir: args.labelled_calls.as_deref(),
+        protected_beds: &protected_beds,
+    };
     let (report, by_region) =
         stratify(&table, &second, &models, &policy, truths, &regions, outputs)?;
     for line in report.summary_lines() {
@@ -2512,14 +2840,16 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
         info!("{line}");
     }
     let path = |suffix: &str| PathBuf::from(format!("{}.{suffix}", args.output.display()));
-    report.write_outcomes(&path("strata.tsv"))?;
-    report.write_rates(&path("rates.tsv"))?;
-    report.write_calibration(&path("calibration.tsv"))?;
+    // The files of STRATIFY_REPORTS.
+    report.write_outcomes_protecting(&path("strata.tsv"), &protected_beds)?;
+    report.write_rates_protecting(&path("rates.tsv"), &protected_beds)?;
+    report.write_calibration_protecting(&path("calibration.tsv"), &protected_beds)?;
     info!("Wrote {}.{{strata,rates,calibration}}.tsv", args.output.display());
     if !by_region.is_empty() {
-        by_region.write_outcomes(&path("regions.strata.tsv"))?;
-        by_region.write_rates(&path("regions.rates.tsv"))?;
-        by_region.write_calibration(&path("regions.calibration.tsv"))?;
+        by_region.write_outcomes_protecting(&path("regions.strata.tsv"), &protected_beds)?;
+        by_region.write_rates_protecting(&path("regions.rates.tsv"), &protected_beds)?;
+        by_region
+            .write_calibration_protecting(&path("regions.calibration.tsv"), &protected_beds)?;
         info!(
             "Wrote {}.regions.{{strata,rates,calibration}}.tsv for {} regions",
             args.output.display(),
@@ -2731,6 +3061,7 @@ fn score_with<F: FnOnce()>(
     threads: NonZeroUsize,
     before_output_check: F,
 ) -> Result<()> {
+    args.policy.validate()?;
     check_output_dir("--output", &args.output)?;
     // Checked again (for the VCF) as it is written, but now too, before any pass over the reads.
     // Optional inputs are checked once the models say whether they are read.
@@ -2750,12 +3081,15 @@ fn score_with<F: FnOnce()>(
             [("scored VCF", args.output.as_path())],
         )?;
     }
-    // Each model file is read once: its information is checked before its booster is parsed, so
-    // a set that cannot be scored never pays for parsing the boosters.
-    let (texts, model_metadata): (Vec<String>, Vec<std::fs::Metadata>) = args
-        .models
+    // Each model file is resolved and read once: its information is checked before its booster is
+    // parsed, so a set that cannot be scored never pays for parsing the boosters, and its region
+    // BEDs are looked for beside the file read, even if a staged symlink is retargeted meanwhile.
+    let files = ModelFile::resolve_all(&args.models);
+    let resolved: Vec<PathBuf> = files.iter().map(|file| file.resolved.clone()).collect();
+    let given_dirs: Vec<PathBuf> = files.iter().map(|file| file.given_dir.clone()).collect();
+    let (texts, model_metadata): (Vec<String>, Vec<std::fs::Metadata>) = files
         .iter()
-        .map(|path| read_model_file_with_metadata(path))
+        .map(ModelFile::read_text_with_metadata)
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .unzip();
@@ -2832,15 +3166,32 @@ fn score_with<F: FnOnce()>(
         },
         ..SetInputs::default()
     };
-    let infos: Vec<&ModelInfo> = parts.iter().map(|(info, _)| info).collect();
-    let mut problems =
-        check_model_set(&ModelSet { paths: &args.models, infos: &infos }, &set_inputs);
+    // The region plan outlives the model files' text (and so `parts`): its BEDs are read after
+    // the evidence. The information alone is small.
+    let set_infos: Vec<ModelInfo> = parts.iter().map(|(info, _)| info.clone()).collect();
+    let infos: Vec<&ModelInfo> = set_infos.iter().collect();
+    let set = ModelSet {
+        paths: &args.models,
+        resolved: &resolved,
+        given_dirs: &given_dirs,
+        infos: &infos,
+    };
+    let mut problems = check_model_set(&set, &set_inputs);
     if pending_alignment {
         // A required stream can establish provenance in its one row read. Other checks remain early.
         problems.retain(|problem| problem.check != Check::AlignmentProvenanceNotChecked);
     }
-    // Warnings about the reads' provenance come from the final comparison, of the evidence
-    // actually loaded, so they and its agreement describe the same reads (errors stay early).
+    // The region BEDs the models' features and the policy use, given or beside the models: only
+    // those are read, so an unused one cannot fail the run. One a model uses that is neither is a
+    // problem of the set.
+    let indel_genotype = has_indel_genotype(&infos);
+    let reads_not_difficult = args.policy.reads_not_difficult(indel_genotype);
+    let run = RunRegions::Features { policy: reads_not_difficult };
+    problems.extend(region_digests_differ(&set, reads_not_difficult));
+    let (plan, missing) = RegionPlan::new(&set, &args.regions, run);
+    problems.extend(missing);
+    problems.sort_by_key(|problem| problem.check);
+    // Keep BED planning and all errors early, but report reads-side warnings from loaded evidence.
     for problem in problems.iter().filter(|problem| {
         problem.severity == Severity::Warning && !reads_alignment_problem(problem)
     }) {
@@ -2848,6 +3199,18 @@ fn score_with<F: FnOnce()>(
     }
     if let Some(message) = error_message(&problems) {
         bail!("{message}");
+    }
+    let protected_beds: Vec<PathBuf> = plan.paths().map(Path::to_path_buf).collect();
+    let prospective_beds: Vec<PathBuf> = plan.prospective_paths().map(Path::to_path_buf).collect();
+    for output in &outputs {
+        crate::scoring::check_output_not_input(
+            output,
+            plan.paths().map(|path| ("region BED", path)),
+        )?;
+        crate::scoring::check_output_not_prospective_inputs(
+            output,
+            prospective_beds.iter().map(|path| ("region BED", path.as_path())),
+        )?;
     }
     let models: Vec<WinnowrModel> = args
         .models
@@ -2895,6 +3258,33 @@ fn score_with<F: FnOnce()>(
         evidence_tags,
         check,
     )?;
+    // The region BEDs are read after the evidence, as one producer may feed an evidence stream
+    // before a BED stream: reading the BEDs first would wait on it forever.
+    // The features' regions, and the not-difficult regions when the policy reads them: by
+    // themselves, or (of a model trained with them as a feature) as the features' entry, taken
+    // once the features are built.
+    let mut regions: Vec<RegionSet> = Vec::new();
+    let mut not_difficult: Option<RegionSet> = None;
+    let mut not_difficult_feature: Option<usize> = None;
+    let mut bed_identities = Vec::new();
+    for (region, intervals) in checked_regions(plan.read(args.allow_region_mismatch))? {
+        bed_identities.extend(region.input_identities);
+        if !infos.iter().any(|info| info.uses_region(&region.name)) {
+            not_difficult = Some(intervals);
+            continue;
+        }
+        if reads_not_difficult && region.name == NOT_DIFFICULT_REGIONS {
+            not_difficult_feature = Some(regions.len());
+        }
+        regions.push(intervals);
+    }
+    for output in &outputs {
+        check_output_not_bed_identities(output, &bed_identities)?;
+    }
+    // Withholding actions needs the not-difficult regions: fail now, not after a pass over the
+    // reads. Without them the outside indel threshold alone is not applied, with a warning.
+    args.policy
+        .require_not_difficult(not_difficult.is_some() || not_difficult_feature.is_some())?;
     let scored_reads = if checks_provenance {
         loaded_score_alignment(
             args,
@@ -2907,7 +3297,12 @@ fn score_with<F: FnOnce()>(
         ReadsAlignment::default()
     };
     let alignment_problems = alignment_provenance_problems(
-        &ModelSet { paths: &args.models, infos: &infos },
+        &ModelSet {
+            paths: &args.models,
+            resolved: &resolved,
+            given_dirs: &given_dirs,
+            infos: &infos,
+        },
         ReadsCheck {
             alignment: scored_reads.provenance.as_ref(),
             unknown: scored_reads.unknown,
@@ -2962,30 +3357,6 @@ fn score_with<F: FnOnce()>(
     // The models' contigs are the same, perhaps in different orders; the first model's order is
     // the order the calls are extracted in.
     let contigs = &models[0].info.contigs;
-    // Only the region BEDs a model uses are read, so an unused one cannot fail the run.
-    let used: Vec<NamedBed> = args
-        .regions
-        .iter()
-        .filter(|r| models.iter().any(|m| m.info.region_names.contains(&r.name)))
-        .cloned()
-        .collect();
-    let regions = read_region_sets(&used)?;
-    // The policy, and the BEDs only it reads, are checked before any pass over the reads.
-    let policy = args.policy.policy(
-        args.mode,
-        contigs,
-        &args.regions,
-        models.iter().any(|model| is_indel_genotype(&model.info)),
-    )?;
-    // Unused BED arguments are ignored, including ones naming an existing output on a rerun.
-    let policy_bed = args.regions.iter().find(|r| r.name == NOT_DIFFICULT_REGIONS);
-    let protected_beds = used.iter().chain(policy_bed.filter(|_| policy.abstain.is_some()));
-    for output in &outputs {
-        crate::scoring::check_output_not_input(
-            output,
-            protected_beds.clone().map(|bed| ("region BED", bed.path.as_path())),
-        )?;
-    }
     let sample = summary.sample_name(&args.vcf);
     // The alignments feature source's annotations are measured before the table is built, as
     // dp_norm needs every call's depth; so is the pileup evidence, in the same pass when it
@@ -3014,7 +3385,10 @@ fn score_with<F: FnOnce()>(
         score_table_inputs(args, source.annotations(), &regions, strlen.as_ref(), pileup);
     inputs.outputs = &outputs;
     let table = build_feature_table(&sample, &args.vcf, contigs, &summary, &inputs)?;
+    let not_difficult =
+        not_difficult.or_else(|| not_difficult_feature.map(|index| regions.swap_remove(index)));
     let mut timer = PhaseTimer::start();
+    let policy = args.policy.policy(args.mode, contigs, not_difficult, indel_genotype)?;
     let decisions = match measure {
         None => decide_calls(&table, &models, &policy)?,
         Some((measure, strlen, pileup)) => {
@@ -3036,20 +3410,148 @@ fn score_with<F: FnOnce()>(
             if needs_pileup.is_empty() { &[] } else { &args.pileup },
         )?;
         let header = args.alignments.as_deref().filter(|_| checked_reads.header.is_some());
+        // The files the models resolved to, as well as the paths given: a staged symlink may be
+        // retargeted after its model was read.
         let consumed = args
             .models
             .iter()
+            .chain(&resolved)
             .map(|path| ("model", path.as_path()))
             .chain(header.map(|path| ("alignment header", path)))
-            .chain(protected_beds.clone().map(|bed| ("region BED", bed.path.as_path())))
+            .chain(protected_beds.iter().map(|path| ("region BED", path.as_path())))
             .chain(checked_tables.iter().map(|(path, _)| ("provenance table", path.as_path())));
         crate::scoring::check_output_not_input(output, consumed)?;
         for metadata in &model_metadata {
             crate::scoring::check_output_not_loaded_input(output, "model", metadata)?;
         }
+        crate::scoring::check_output_not_prospective_inputs(
+            output,
+            prospective_beds.iter().map(|path| ("region BED", path.as_path())),
+        )?;
+        check_output_not_bed_identities(output, &bed_identities)?;
     }
-    write_scored_vcf(&args.vcf, &args.output, decisions, threads)?;
+    write_scored_vcf(&args.vcf, &args.output, decisions, threads, &bed_identities)?;
     timer.lap("writing the VCF");
+    Ok(())
+}
+
+/// Logs the problems that are warnings, and fails naming every one that is an error.
+///
+/// # Errors
+///
+/// Returns an error naming every problem that is one (see [`error_message`]).
+fn log_and_fail(problems: &[Problem]) -> Result<()> {
+    for problem in problems.iter().filter(|problem| problem.severity == Severity::Warning) {
+        log::warn!("{}", problem.message);
+    }
+    match error_message(problems) {
+        Some(message) => bail!("{message}"),
+        None => Ok(()),
+    }
+}
+
+/// The region BEDs a run reads, read and checked (see [`RegionPlan::read`]), with their problems:
+/// warnings are logged, and so is each BED used.
+///
+/// # Errors
+///
+/// Returns an error naming every problem that is one.
+fn checked_regions(
+    (resolved, problems): (Vec<(ResolvedRegion, RegionSet)>, Vec<Problem>),
+) -> Result<Vec<(ResolvedRegion, RegionSet)>> {
+    log_and_fail(&problems)?;
+    for (region, _) in &resolved {
+        let verified = match region.verified() {
+            Some(true) => "the models' own",
+            Some(false) => "not the models'",
+            None => "unchecked: no model records its digest",
+        };
+        info!(
+            "Region BED {} ({}, {}): {}; {verified}",
+            region.name,
+            region.origin().as_str(),
+            region.path.display(),
+            region.digest
+        );
+    }
+    Ok(resolved)
+}
+
+/// The not-difficult regions `evaluate` and `stratify` give the policy when it reads them
+/// (`policy`): the `--regions` BED (`given`), else the one beside the models (`infos`, read from
+/// `files`), checked against the digests the models record (see
+/// [`crate::model_set::RegionPlan::read`]). Each of `outputs` is checked not to be the BED
+/// before it is read. Returns the intervals together with every consumed regular BED's identity,
+/// retained independently of pathname changes for the report writers' same-handle checks.
+///
+/// # Errors
+///
+/// Returns an error if an output is the BED, or the BED cannot be read or is not the models'
+/// (unless `allow_mismatch`).
+fn policy_not_difficult(
+    infos: &[&ModelInfo],
+    files: &[ModelFile],
+    given: &[NamedBed],
+    policy: bool,
+    allow_mismatch: bool,
+    outputs: &[PathBuf],
+) -> Result<(Option<RegionSet>, Vec<crate::io::FileIdentity>)> {
+    let paths: Vec<PathBuf> = files.iter().map(|file| file.path.clone()).collect();
+    let resolved: Vec<PathBuf> = files.iter().map(|file| file.resolved.clone()).collect();
+    let given_dirs: Vec<PathBuf> = files.iter().map(|file| file.given_dir.clone()).collect();
+    let set = ModelSet { paths: &paths, resolved: &resolved, given_dirs: &given_dirs, infos };
+    let (plan, mut problems) = RegionPlan::new(&set, given, RunRegions::Policy(policy));
+    // Models recording different policy digests are rejected before the BED is opened: no BED
+    // can be both, and an explicit stream would block until its producer writes.
+    log_and_fail(&plan.digest_conflicts())?;
+    check_no_output_is_input(outputs, plan.paths().map(|path| ("region BED", path)))?;
+    for output in outputs {
+        crate::scoring::check_output_not_prospective_inputs(
+            output,
+            plan.prospective_paths().map(|path| ("region BED", path)),
+        )?;
+    }
+    let (regions, read_problems) = plan.read(allow_mismatch);
+    problems.extend(read_problems);
+    problems.sort_by_key(|problem| problem.check);
+    let regions = checked_regions((regions, problems))?;
+    for (region, _) in &regions {
+        for output in outputs {
+            check_output_not_bed_identities(output, &region.input_identities)?;
+        }
+    }
+    let protected_beds =
+        regions.iter().flat_map(|(region, _)| region.input_identities.iter().copied()).collect();
+    Ok((regions.into_iter().next().map(|(_, regions)| regions), protected_beds))
+}
+
+/// Protects regular BEDs by the identity of the opened file whose intervals were read, even after
+/// a supplied symlink is retargeted or the file is renamed. Current input paths are checked too.
+fn check_output_not_bed_identities(
+    output: &Path,
+    identities: &[crate::io::FileIdentity],
+) -> Result<()> {
+    if identities.iter().any(|identity| identity.matches_path(output)) {
+        bail!("the output {} is the input region BED; write to another path", output.display());
+    }
+    Ok(())
+}
+
+/// Checks that none of `outputs` is one of `inputs`, each with what it is (see
+/// [`crate::scoring::check_output_not_input`]): checked before anything is written, so that a run
+/// that would overwrite an input fails without destroying it.
+///
+/// # Errors
+///
+/// Returns an error naming the first output that is an input, and the input it is.
+fn check_no_output_is_input<'a, I: IntoIterator<Item = (&'a str, &'a Path)>>(
+    outputs: &[PathBuf],
+    inputs: I,
+) -> Result<()> {
+    let inputs: Vec<(&str, &Path)> = inputs.into_iter().collect();
+    for output in outputs {
+        crate::scoring::check_output_not_input(output, inputs.iter().copied())?;
+    }
     Ok(())
 }
 
@@ -3243,6 +3745,7 @@ fn check_models_with_writers<W: std::io::Write, E: std::io::Write>(
         alignments: args.alignments.as_deref(),
         alignment_tags: tags.as_ref().ok().and_then(Option::as_ref),
         strict_provenance: args.provenance.strict_provenance,
+        allow_region_mismatch: args.allow_region_mismatch,
     });
     if let Err(error) = tags {
         report.problems.push(Problem::error(
@@ -3676,7 +4179,7 @@ mod tests {
     /// extract, train, evaluate and score on a small generated sample: the command bodies map
     /// their options as documented, and `score` decides as `evaluate` reports.
     mod end_to_end {
-        use std::io::{Read as _, Write as _};
+        use std::io::Read as _;
 
         use super::*;
 
@@ -3711,9 +4214,7 @@ mod tests {
         }
 
         fn write_bgzf_indexed(path: &Path, text: &str) {
-            let mut writer = rust_htslib::bgzf::Writer::from_path(path).unwrap();
-            writer.write_all(text.as_bytes()).unwrap();
-            drop(writer);
+            crate::testing::write_bgzf(path, text.as_bytes());
             let index = rust_htslib::bcf::index::Type::Tbx;
             rust_htslib::bcf::index::build(path, None, 1, index).unwrap();
         }
@@ -3816,6 +4317,134 @@ mod tests {
                 run(&[&base[..], self.folds, &["--tables"], &tables].concat());
                 WinnowrModel::load(format!("{model}{MODEL_SUFFIX}"), NonZeroUsize::new(1).unwrap())
                     .unwrap()
+            }
+        }
+
+        /// The final suffixed model path must not overwrite any training input, even when an
+        /// earlier table cannot be read. Symlinks and hard links count as aliases too.
+        #[cfg(unix)]
+        #[rstest]
+        #[case::table_stem(false, "stem")]
+        #[case::policy_stem(true, "stem")]
+        #[case::table_full(false, "full")]
+        #[case::policy_full(true, "full")]
+        #[case::table_symlink(false, "symlink")]
+        #[case::policy_symlink(true, "symlink")]
+        #[case::table_hardlink(false, "hardlink")]
+        #[case::policy_hardlink(true, "hardlink")]
+        fn train_protects_all_inputs_from_its_final_output(
+            #[case] policy: bool,
+            #[case] alias: &str,
+        ) {
+            let dir = tempfile::TempDir::new().unwrap();
+            let input = dir.path().join("input.winnowr.json");
+            let original = b"input bytes must survive\n";
+            std::fs::write(&input, original).unwrap();
+            let output = match alias {
+                "stem" => dir.path().join("input"),
+                "full" => input.clone(),
+                "symlink" | "hardlink" => {
+                    let output = dir.path().join("output.winnowr.json");
+                    if alias == "symlink" {
+                        std::os::unix::fs::symlink(&input, &output).unwrap();
+                    } else {
+                        std::fs::hard_link(&input, &output).unwrap();
+                    }
+                    output
+                }
+                _ => unreachable!(),
+            };
+            let output = output.display().to_string();
+            let input = input.display().to_string();
+            let missing = dir.path().join("missing.parquet").display().to_string();
+            let bed = format!("{NOT_DIFFICULT_REGIONS}={input}");
+            let mut args = vec!["train", "--variant-type", "snp", "-o", &output];
+            if policy {
+                args.extend(["--policy-regions", &bed, "--tables", &missing, &missing]);
+            } else {
+                args.extend(["--tables", &missing, &input]);
+            }
+            let error = try_run(&args).unwrap_err().to_string();
+            let what = if policy { "policy region BED" } else { "feature table" };
+            assert!(error.contains(&format!("is the input {what}")), "{error}");
+            assert_eq!(std::fs::read(&input).unwrap(), original);
+        }
+
+        /// Training warns when one name has distinct feature and policy BEDs, but keeps both
+        /// digests: evaluate/stratify can intentionally use those roles separately.
+        #[rstest]
+        #[case::conflict(true, true, true)]
+        #[case::agreement(true, true, false)]
+        #[case::feature_only(true, false, false)]
+        #[case::policy_only(false, true, false)]
+        fn train_reports_feature_policy_digest_conflicts(
+            #[case] feature: bool,
+            #[case] policy: bool,
+            #[case] conflict: bool,
+        ) {
+            let setup = MixedTables::new(&[]);
+            let feature_bed = setup.path("feature.bed");
+            let policy_bed = setup.path("policy.bed");
+            std::fs::write(&feature_bed, "chr1\t0\t100000\n").unwrap();
+            let policy_lines = if conflict { "chr1\t100\t1000\n" } else { "chr1\t0\t100000\n" };
+            std::fs::write(&policy_bed, policy_lines).unwrap();
+            let feature_region = format!("{NOT_DIFFICULT_REGIONS}={feature_bed}");
+            let policy_region = format!("{NOT_DIFFICULT_REGIONS}={policy_bed}");
+            let tables: Vec<String> = ["S1", "S2"]
+                .iter()
+                .map(|sample| {
+                    let table = setup.path(&format!("{sample}.parquet"));
+                    let (vcf, happy) = (setup.path("calls.vcf.gz"), setup.path("happy.vcf"));
+                    let mut args = vec![
+                        "extract",
+                        "--vcf",
+                        &vcf,
+                        "--happy",
+                        &happy,
+                        "--sample",
+                        sample,
+                        "--contigs",
+                        "chr1",
+                        "-o",
+                        &table,
+                    ];
+                    if feature {
+                        args.extend(["--regions", &feature_region]);
+                    }
+                    run(&args);
+                    table
+                })
+                .collect();
+            let output = setup.path("trained");
+            let mut args =
+                vec!["train", "--variant-type", "snp", "--max-rounds", "2", "-o", &output];
+            if policy {
+                args.extend(["--policy-regions", &policy_region]);
+            }
+            args.extend(["--tables", &tables[0], &tables[1]]);
+            let (result, logs) = captured_logs::capture(|| try_run(&args));
+            result.unwrap();
+            let warnings: Vec<&str> = logs
+                .iter()
+                .filter_map(|(level, message)| {
+                    (*level == log::Level::Warn && message.contains("feature and policy"))
+                        .then_some(message.as_str())
+                })
+                .collect();
+            assert_eq!(warnings.len(), usize::from(conflict), "{logs:?}");
+            let info = ModelInfo::read(format!("{output}{MODEL_SUFFIX}")).unwrap();
+            assert_eq!(info.region_digests.contains_key(NOT_DIFFICULT_REGIONS), feature);
+            assert_eq!(info.policy_region_digests.contains_key(NOT_DIFFICULT_REGIONS), policy);
+            if conflict {
+                let feature = &info.region_digests[NOT_DIFFICULT_REGIONS];
+                let policy = &info.policy_region_digests[NOT_DIFFICULT_REGIONS];
+                assert_ne!(feature, policy);
+                for text in
+                    [NOT_DIFFICULT_REGIONS.to_string(), feature.to_string(), policy.to_string()]
+                {
+                    assert!(warnings[0].contains(&text), "{}", warnings[0]);
+                }
+                assert!(warnings[0].contains("score"), "{}", warnings[0]);
             }
         }
 
@@ -4868,6 +5497,7 @@ mod tests {
                 Path::new(&bcf),
                 std::collections::HashMap::new(),
                 NonZeroUsize::new(1).unwrap(),
+                &[],
             )
             .unwrap();
             let csi = format!("{bcf}.csi");
@@ -5441,6 +6071,46 @@ mod tests {
             assert!(error.to_string().contains("alignment provenance"), "{error:#}");
         }
 
+        /// A training table whose region digests changed between preflight (which chose the
+        /// digests the model records) and its reload is rejected; an unchanged table, with or
+        /// without digests, is read.
+        #[rstest]
+        #[case::digest_changes(Some(&[("chr1", 0, 10)][..]), Some(&[("chr1", 0, 20)][..]), true)]
+        #[case::digest_appears(None, Some(&[("chr1", 0, 10)][..]), true)]
+        #[case::digest_disappears(Some(&[("chr1", 0, 10)][..]), None, true)]
+        #[case::unchanged(Some(&[("chr1", 0, 10)][..]), Some(&[("chr1", 0, 10)][..]), false)]
+        #[case::legacy_unchanged(None, None, false)]
+        fn training_rejects_region_digests_changed_since_preflight(
+            #[case] before: Option<&[(&str, u64, u64)]>,
+            #[case] after: Option<&[(&str, u64, u64)]>,
+            #[case] rejected: bool,
+        ) {
+            let digests = |spans: Option<&[(&str, u64, u64)]>| -> BTreeMap<String, RegionDigest> {
+                spans
+                    .map(|spans| {
+                        let digest = RegionSet::from_spans("segdups", spans.iter().copied());
+                        BTreeMap::from([("segdups".to_string(), digest.digest().unwrap())])
+                    })
+                    .unwrap_or_default()
+            };
+            let tables = MixedTables::new(&[]);
+            let path = tables.extract("S4", &["chr1", "chr2"]);
+            let mut table = FeatureTable::read_parquet(&path).unwrap();
+            table.info_mut().region_digests = digests(before);
+            table.write_parquet(&path).unwrap();
+            let expected = FeatureTable::read_info(&path).unwrap();
+            table.info_mut().region_digests = digests(after);
+            table.write_parquet(&path).unwrap();
+            let read = read_training_table(Path::new(&path), &TableSelection::default(), &expected);
+            if rejected {
+                let error = read.unwrap_err().to_string();
+                assert!(error.contains("region BED digests"), "{error}");
+                assert!(error.contains("since training preflight"), "{error}");
+            } else {
+                read.unwrap();
+            }
+        }
+
         #[rstest]
         #[case::known_changes(Some("primary"), Some("keep-alt"), None, true, false)]
         #[case::known_disappears(Some("primary"), None, None, true, false)]
@@ -5584,6 +6254,95 @@ mod tests {
             Score(Vec<String>),
             /// Replace the consumed BAM with an unread FIFO just before the output audit.
             ReplaceScoredAlignments(Vec<String>),
+        }
+
+        #[rstest]
+        fn review_invalid_policy_options_fail_before_opening_inputs(
+            #[values("score", "evaluate", "stratify")] command: &str,
+            #[values("--abstain-actions", "--keep-fallback")] option: &str,
+        ) {
+            let tables = MixedTables::new(&[]);
+            let (model, _) = bundled_model(&tables);
+            let output = tables.path("out");
+            let input = tables.path("unfed.bed");
+            assert!(std::process::Command::new("mkfifo").arg(&input).status().unwrap().success());
+            let region = format!("{NOT_DIFFICULT_REGIONS}={input}");
+            let table = tables.path("S1.parquet");
+            let vcf = tables.path("calls.vcf.gz");
+            let happy = tables.path("happy.vcf");
+            let mut args = vec![command, "--models", &model, "-o", &output];
+            match command {
+                "score" => args.extend(["--vcf", &vcf]),
+                "evaluate" => args.extend(["--table", &table]),
+                _ => args.extend([
+                    "--tables",
+                    &table,
+                    &table,
+                    "--truth-names",
+                    "v1",
+                    "v2",
+                    "--truth-beds",
+                    &input,
+                    &input,
+                    "--happy",
+                    &happy,
+                    &happy,
+                ]),
+            }
+            let action = if option == "--abstain-actions" { "flip" } else { "indel" };
+            args.extend(["--regions", &region, option, action, "none"]);
+            let mut processes = crate::testing::TestProcesses::default();
+            let (result, _) = run_fifo_score(&args, &mut processes);
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.starts_with(&format!("{option} none cannot")), "{error}");
+        }
+
+        #[rstest]
+        fn review_valid_flip_policy_reads_its_fifo(
+            #[values("score", "evaluate", "stratify")] command: &str,
+        ) {
+            let tables = MixedTables::new(&[]);
+            let (model, _) = bundled_model(&tables);
+            let (output, input) = (tables.path("out"), tables.path("policy.fifo"));
+            let mut processes = crate::testing::TestProcesses::default();
+            scoring_fifo_writer(
+                &mut processes,
+                Path::new(&input),
+                "chr1\t0\t100000\nchr2\t0\t100000\n",
+            );
+            let region = format!("{NOT_DIFFICULT_REGIONS}={input}");
+            let (table, vcf, happy, truth) = (
+                tables.path("S1.parquet"),
+                tables.path("calls.vcf.gz"),
+                tables.path("happy.vcf"),
+                tables.path("truth.bed"),
+            );
+            std::fs::write(&truth, b"chr1\t0\t100000\nchr2\t0\t100000\n").unwrap();
+            let mut args = vec![command, "--models", &model, "-o", &output];
+            match command {
+                "score" => args.extend(["--vcf", &vcf]),
+                "evaluate" => args.extend(["--table", &table]),
+                _ => args.extend([
+                    "--tables",
+                    &table,
+                    &table,
+                    "--truth-names",
+                    "v1",
+                    "v2",
+                    "--truth-beds",
+                    &truth,
+                    &truth,
+                    "--happy",
+                    &happy,
+                    &happy,
+                ]),
+            }
+            args.extend(["--regions", &region, "--abstain-actions", "flip"]);
+            let (result, _) = run_fifo_score(&args, &mut processes);
+            result.unwrap();
+            let written =
+                if command == "stratify" { format!("{output}.strata.tsv") } else { output };
+            assert!(std::fs::metadata(written).unwrap().len() > 0);
         }
 
         /// Child of [`run_fifo_operation`]: runs the requested operation, writing its error and
@@ -5736,6 +6495,55 @@ mod tests {
             } else {
                 assert!(read_gzip(Path::new(&output)).contains("WINNOWR_P="));
             }
+        }
+
+        /// `score` reads the required evidence before the region BEDs: one producer that feeds a
+        /// `--pileup` stream and then a `--regions` stream finishes, where reading the BED first
+        /// would wait forever.
+        #[test]
+        fn scoring_reads_evidence_streams_before_bed_streams() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_default_mode_calls(dir.path());
+            let mut model = crate::testing::separable_model_of(
+                Task::Genotype,
+                VariantType::Snp,
+                "pu_alt_mqhigh",
+            );
+            model.info.feature_source = FeatureSource::Vcf;
+            model.info.region_names = vec!["segdups".to_string()];
+            let model_path = path("model.winnowr.json");
+            model.save(&model_path).unwrap();
+            let (pileup, bed) = (path("pileup.fifo"), path("segdups.fifo"));
+            for fifo in [&pileup, &bed] {
+                assert!(std::process::Command::new("mkfifo").arg(fifo).status().unwrap().success());
+            }
+            let mut processes = crate::testing::TestProcesses::default();
+            processes.spawn(std::process::Command::new("sh").args([
+                "-c",
+                "printf '%s' \"$1\" > \"$2\" && printf 'chr1\\t0\\t10000\\n' > \"$3\"",
+                "evidence-then-bed",
+                &scoring_pileup_text(None),
+                &pileup,
+                &bed,
+            ]));
+            let (output, region) = (path("scored.vcf.gz"), format!("segdups={bed}"));
+            let args = [
+                "score",
+                "--vcf",
+                &path("default.vcf.gz"),
+                "--models",
+                &model_path,
+                "-o",
+                &output,
+                "--pileup",
+                &pileup,
+                "--regions",
+                &region,
+            ];
+            let (result, _) = run_fifo_score(&args, &mut processes);
+            result.unwrap();
+            assert!(read_gzip(Path::new(&output)).contains("WINNOWR_P="));
         }
 
         #[test]
@@ -6543,6 +7351,48 @@ mod tests {
             assert_eq!(std::fs::read_to_string(retained).unwrap(), before);
         }
 
+        /// A staged model symlink retargeted after scoring read it: the output may not alias the
+        /// model that was read, though the given path now names another.
+        #[cfg(unix)]
+        #[test]
+        fn review_final_alias_check_protects_a_retargeted_model_symlink() {
+            let dir = tempfile::tempdir().unwrap();
+            write_default_mode_calls(dir.path());
+            let mut model =
+                crate::testing::separable_model_of(Task::Genotype, VariantType::Snp, "mq");
+            model.info.feature_source = FeatureSource::Vcf;
+            let read = dir.path().join("a.winnowr.json");
+            model.save(&read).unwrap();
+            let original = std::fs::read(&read).unwrap();
+            let other = dir.path().join("b.winnowr.json");
+            std::fs::write(&other, b"another model").unwrap();
+            let staged = dir.path().join("staged.winnowr.json");
+            std::os::unix::fs::symlink(&read, &staged).unwrap();
+            let output = dir.path().join("scored.vcf");
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                dir.path().join("default.vcf.gz").to_str().unwrap(),
+                "--models",
+                staged.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let result = score_with(&args, NonZeroUsize::MIN, || {
+                std::fs::remove_file(&staged).unwrap();
+                std::os::unix::fs::symlink(&other, &staged).unwrap();
+                std::os::unix::fs::symlink(&read, &output).unwrap();
+            });
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("is the input model; write to another path"), "{error}");
+            assert_eq!(std::fs::read(&read).unwrap(), original);
+        }
+
         #[cfg(unix)]
         #[rstest]
         #[case::loaded_model(true)]
@@ -6948,6 +7798,896 @@ mod tests {
             score(&keep_alt).unwrap();
         }
 
+        #[rstest]
+        #[case::given(0)]
+        #[case::bundled_compressed(1)]
+        #[case::bundled_plain(2)]
+        #[case::explicit_bed_ignores_bundled_candidate(3)]
+        fn resolved_region_beds_are_protected_from_score_outputs(
+            #[case] source: usize,
+            #[values(false, true)] sidecar: bool,
+        ) {
+            let setup = VcfSourceModel::new();
+            let model = setup.model();
+            let vcf = setup.path("default.vcf.gz");
+            std::fs::create_dir(setup.path("regions")).unwrap();
+            let given_bed = setup.path("given.bed");
+            let compressed_bed = setup.path(&format!("regions/{NOT_DIFFICULT_REGIONS}.bed.gz"));
+            let plain_bed = setup.path(&format!("regions/{NOT_DIFFICULT_REGIONS}.bed"));
+            let contents = b"chr1\t0\t100000\n";
+            for bed in [&given_bed, &plain_bed] {
+                std::fs::write(bed, contents).unwrap();
+            }
+            crate::testing::write_gzip(Path::new(&compressed_bed), contents);
+            let input = [&given_bed, &compressed_bed, &plain_bed][source.min(2)];
+            let before = std::fs::read(input).unwrap();
+            let output = setup.path("scored.vcf.gz");
+            let target = format!("{output}{}", if sidecar { ".tbi" } else { "" });
+            std::os::unix::fs::symlink(input, &target).unwrap();
+            let region = format!("{NOT_DIFFICULT_REGIONS}={given_bed}");
+            let mut args = vec![
+                "score",
+                "--vcf",
+                &vcf,
+                "--models",
+                &model,
+                "-o",
+                &output,
+                "--abstain-actions",
+                "flip",
+            ];
+            if source == 0 || source == 3 {
+                args.extend(["--regions", &region]);
+            }
+            if source == 3 {
+                try_run(&args).unwrap();
+                assert!(read_gzip(Path::new(&output)).contains("WINNOWR_P="));
+                assert_eq!(std::fs::read(&given_bed).unwrap(), contents);
+            } else {
+                let error = format!("{:#}", try_run(&args).unwrap_err());
+                assert!(
+                    error.ends_with("is the input region BED; write to another path"),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read(input).unwrap(), before);
+                assert_eq!(std::fs::read(&target).unwrap(), before);
+            }
+        }
+
+        #[rstest]
+        fn review_outputs_do_not_create_bundled_bed_candidates(
+            #[values("score", "evaluate")] command: &str,
+            #[values(false, true)] explicit: bool,
+        ) {
+            let tables = MixedTables::new(&[]);
+            let (model, regions) = bundled_model(&tables);
+            let compressed = PathBuf::from(format!("{regions}/{NOT_DIFFICULT_REGIONS}.bed.gz"));
+            let contents = b"chr1\t0\t100000\nchr2\t0\t100000\n";
+            crate::testing::write_gzip(&compressed, contents);
+            let output = format!("{regions}/{NOT_DIFFICULT_REGIONS}.bed");
+            let given = tables.path("given.bed");
+            std::fs::write(&given, contents).unwrap();
+            let region = format!("{NOT_DIFFICULT_REGIONS}={given}");
+            let vcf = tables.path("calls.vcf.gz");
+            let table = tables.path("S1.parquet");
+            let mut args =
+                vec![command, "--models", &model, "-o", &output, "--abstain-actions", "flip"];
+            if command == "score" {
+                args.extend(["--vcf", &vcf]);
+            } else {
+                args.extend(["--table", &table]);
+            }
+            if explicit {
+                args.extend(["--regions", &region]);
+            }
+            let result = try_run(&args);
+            if explicit {
+                result.unwrap();
+                assert!(Path::new(&output).is_file());
+            } else {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(
+                    error.contains("region BED") && error.contains("write to another path"),
+                    "{error}"
+                );
+                assert!(!Path::new(&output).exists());
+            }
+            assert_eq!(read_gzip(&compressed).as_bytes(), contents);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn review_final_bed_guard_uses_the_identity_actually_read() {
+            let setup = VcfSourceModel::new();
+            let path = |name: &str| PathBuf::from(setup.path(name));
+            let (bed, other, alias, moved, output) = (
+                path("read.bed"),
+                path("other.bed"),
+                path("given.bed"),
+                path("moved.bed"),
+                path("scored.vcf.gz"),
+            );
+            let original = b"chr1\t0\t100000\n";
+            std::fs::write(&bed, original).unwrap();
+            std::fs::write(&other, b"chr1\t0\t100\n").unwrap();
+            std::os::unix::fs::symlink(&bed, &alias).unwrap();
+            let region = format!("{NOT_DIFFICULT_REGIONS}={}", alias.display());
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                &setup.path("default.vcf.gz"),
+                "--models",
+                &setup.model(),
+                "-o",
+                output.to_str().unwrap(),
+                "--regions",
+                &region,
+                "--abstain-actions",
+                "flip",
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let called = std::cell::Cell::new(false);
+            let result = score_with(&args, NonZeroUsize::MIN, || {
+                called.set(true);
+                std::fs::rename(&bed, &moved).unwrap();
+                std::fs::write(&bed, b"chr1\t0\t200\n").unwrap();
+                std::fs::remove_file(&alias).unwrap();
+                std::os::unix::fs::symlink(&other, &alias).unwrap();
+                std::os::unix::fs::symlink(&moved, &output).unwrap();
+            });
+            assert!(called.get());
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.ends_with("is the input region BED; write to another path"), "{error}");
+            assert_eq!(std::fs::read(&moved).unwrap(), original);
+        }
+
+        /// `evaluate` and `stratify` reject models recording different policy digests of the
+        /// not-difficult regions before the policy BED is opened: the BED here does not exist,
+        /// and is not named in the error.
+        #[rstest]
+        fn conflicting_policy_digests_fail_before_the_policy_bed_is_opened(
+            #[values(false, true)] allow_mismatch: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut paths = Vec::new();
+            let mut models = Vec::new();
+            for (task, sha) in [(Task::Genotype, "a"), (Task::Promote, "b")] {
+                let mut model = crate::testing::separable_model(task, VariantType::Indel);
+                let digest = RegionDigest { sha256: sha.repeat(64), intervals: 1, bases: 10 };
+                model.info.policy_region_digests =
+                    BTreeMap::from([(NOT_DIFFICULT_REGIONS.to_string(), digest)]);
+                let path = dir.path().join(format!("{task}{MODEL_SUFFIX}"));
+                model.save(&path).unwrap();
+                paths.push(path);
+                models.push(model);
+            }
+            let infos: Vec<&ModelInfo> = models.iter().map(|model| &model.info).collect();
+            let files = ModelFile::resolve_all(&paths);
+            let missing = dir.path().join("missing.bed");
+            let given =
+                [NamedBed { name: NOT_DIFFICULT_REGIONS.to_string(), path: missing.clone() }];
+            let outputs = [dir.path().join("out")];
+            let result =
+                policy_not_difficult(&infos, &files, &given, true, allow_mismatch, &outputs);
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.starts_with(&format!(
+                    "--models were trained with different {NOT_DIFFICULT_REGIONS} region BEDs"
+                )),
+                "{error}"
+            );
+            assert!(!error.contains(&missing.display().to_string()), "{error}");
+        }
+
+        #[rstest]
+        fn review_score_rejects_conflicting_digests_before_bed_reads(
+            #[values(false, true)] policy: bool,
+            #[values(false, true)] allow: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            write_default_mode_calls(dir.path());
+            let name = if policy { NOT_DIFFICULT_REGIONS } else { "segdups" };
+            let mut paths = Vec::new();
+            for (task, sha) in [(Task::Genotype, "a"), (Task::Promote, "b")] {
+                let mut model = crate::testing::separable_model_of(task, VariantType::Snp, "mq");
+                model.info.feature_source = FeatureSource::Vcf;
+                let digest = RegionDigest { sha256: sha.repeat(64), intervals: 1, bases: 10 };
+                if policy {
+                    model.info.policy_region_digests.insert(name.to_string(), digest);
+                } else {
+                    model.info.region_names = vec![name.to_string()];
+                    model.info.region_digests.insert(name.to_string(), digest);
+                }
+                let path = dir.path().join(format!("{task}{MODEL_SUFFIX}"));
+                model.save(&path).unwrap();
+                paths.push(path.display().to_string());
+            }
+            let vcf = dir.path().join("default.vcf.gz").display().to_string();
+            let output = dir.path().join("out.vcf.gz").display().to_string();
+            let region = format!("{name}={}", dir.path().join("missing.bed").display());
+            let mut args = vec![
+                "score",
+                "--vcf",
+                &vcf,
+                "--models",
+                &paths[0],
+                &paths[1],
+                "-o",
+                &output,
+                "--regions",
+                &region,
+            ];
+            if policy {
+                args.extend(["--abstain-actions", "flip"]);
+            }
+            if allow {
+                args.push("--allow-region-mismatch");
+            }
+            let error = format!("{:#}", try_run(&args).unwrap_err());
+            assert!(
+                error.starts_with(&format!(
+                    "--models were trained with different {name} region BEDs"
+                )),
+                "{error}"
+            );
+            assert!(!error.contains("missing.bed"), "{error}");
+        }
+
+        /// A snp model trained on `tables`' S1 and S2 tables (`S1.parquet`, `S2.parquet`, of chr1
+        /// and chr2), written to `models/snp.winnowr.json` beside an empty `models/regions`.
+        /// Returns the model's path and the `regions` directory.
+        fn bundled_model(tables: &MixedTables<'_>) -> (String, String) {
+            let (a, b) =
+                (tables.extract("S1", &["chr1", "chr2"]), tables.extract("S2", &["chr1", "chr2"]));
+            let regions = tables.path("models/regions");
+            std::fs::create_dir_all(&regions).unwrap();
+            let model = tables.path("models/snp");
+            let train = ["train", "--variant-type", "snp", "--max-rounds", "10", "-o", &model];
+            run(&[&train[..], &["--tables", &a, &b]].concat());
+            (format!("{model}{MODEL_SUFFIX}"), regions)
+        }
+
+        /// A destination can become the consumed BED after preflight. Every actual writer must
+        /// reject its opened handle, not just re-check the BED's now-retargeted supplied path.
+        #[rstest]
+        #[case::unrelated_output(true, false)]
+        #[case::bed_alias(true, true)]
+        #[case::no_policy_bed(false, false)]
+        fn review_report_writers_protect_the_bed_actually_read(
+            #[values(
+                "metrics",
+                "strata.tsv",
+                "rates.tsv",
+                "calibration.tsv",
+                "regions.strata.tsv",
+                "regions.rates.tsv",
+                "regions.calibration.tsv",
+                "calls",
+                "labelled-v1",
+                "labelled-v2"
+            )]
+            destination: &str,
+            #[case] policy: bool,
+            #[case] overwrite_bed: bool,
+        ) {
+            let tables = MixedTables::new(&[]);
+            let (model, _) = bundled_model(&tables);
+            let path = |name: &str| PathBuf::from(tables.path(name));
+            let (bed, supplied, moved, other) =
+                (path("read.bed"), path("given.bed"), path("moved.bed"), path("other.bed"));
+            let original = b"chr1\t0\t100000\nchr2\t0\t100000\n";
+            std::fs::write(&bed, original).unwrap();
+            std::fs::write(&other, original).unwrap();
+            std::os::unix::fs::symlink(&bed, &supplied).unwrap();
+            let region = format!("{NOT_DIFFICULT_REGIONS}={}", supplied.display());
+            let first = tables.path("S1.parquet");
+            let happy = tables.path("happy.vcf");
+            let prefix = tables.path("report");
+            let calls = tables.path("calls.tsv.gz");
+            let labelled = tables.path("labelled");
+            std::fs::create_dir(&labelled).unwrap();
+            let reported = format!("near={}", other.display());
+            let output = match destination {
+                "metrics" => path("metrics.tsv"),
+                "calls" => PathBuf::from(&calls),
+                "labelled-v1" => PathBuf::from(&labelled).join("S1.v1.snp.parquet"),
+                "labelled-v2" => PathBuf::from(&labelled).join("S1.v2.snp.parquet"),
+                suffix => PathBuf::from(format!("{prefix}.{suffix}")),
+            };
+            let mutate = || {
+                std::fs::rename(&bed, &moved).unwrap();
+                std::fs::write(&bed, b"chr1\t0\t5\n").unwrap();
+                std::fs::remove_file(&supplied).unwrap();
+                std::os::unix::fs::symlink(&other, &supplied).unwrap();
+                if overwrite_bed {
+                    std::os::unix::fs::symlink(&moved, &output).unwrap();
+                } else {
+                    std::fs::write(&output, b"stale output that must be truncated").unwrap();
+                }
+            };
+            let policy_args = if policy {
+                vec!["--regions", region.as_str(), "--abstain-actions", "flip"]
+            } else {
+                Vec::new()
+            };
+            let result = if destination == "metrics" {
+                let Command::Evaluate(args) = parse(
+                    &[
+                        &[
+                            "evaluate",
+                            "--models",
+                            &model,
+                            "--table",
+                            &first,
+                            "-o",
+                            output.to_str().unwrap(),
+                        ][..],
+                        &policy_args,
+                    ]
+                    .concat(),
+                )
+                .unwrap()
+                .command
+                else {
+                    panic!("not evaluate")
+                };
+                evaluate_with(&args, NonZeroUsize::MIN, mutate)
+            } else {
+                let Command::Stratify(args) = parse(
+                    &[
+                        &[
+                            "stratify",
+                            "--models",
+                            &model,
+                            "--tables",
+                            &first,
+                            &first,
+                            "--truth-names",
+                            "v1",
+                            "v2",
+                            "--truth-beds",
+                            other.to_str().unwrap(),
+                            other.to_str().unwrap(),
+                            "--happy",
+                            &happy,
+                            &happy,
+                            "-o",
+                            &prefix,
+                            "--calls",
+                            &calls,
+                            "--labelled-calls",
+                            &labelled,
+                            "--report-region",
+                            &reported,
+                        ][..],
+                        &policy_args,
+                    ]
+                    .concat(),
+                )
+                .unwrap()
+                .command
+                else {
+                    panic!("not stratify")
+                };
+                stratify_with(&args, NonZeroUsize::MIN, mutate)
+            };
+            assert_eq!(std::fs::read(&moved).unwrap(), original, "{destination} overwrote its BED");
+            if overwrite_bed {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("is the input region BED"), "{error}");
+            } else {
+                result.unwrap();
+                let bytes = std::fs::read(&output).unwrap();
+                if destination.starts_with("labelled-") {
+                    assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
+                    FeatureTable::read_parquet(&output).unwrap();
+                } else if destination == "calls" {
+                    assert!(read_gzip(&output).starts_with("row\tchrom\tpos\t"));
+                } else {
+                    assert!(String::from_utf8(bytes).unwrap().starts_with("sample\t"));
+                }
+            }
+        }
+
+        /// `stratify` also reads its truth and report BEDs: a destination redirected to one after
+        /// preflight fails before truncating it, even with no policy BED.
+        #[rstest]
+        fn review_stratify_writers_protect_truth_and_report_beds(
+            #[values("strata.tsv", "regions.rates.tsv", "calls", "labelled-v1")] destination: &str,
+            #[values("truth", "report")] bed_kind: &str,
+        ) {
+            let tables = MixedTables::new(&[]);
+            let (model, _) = bundled_model(&tables);
+            let path = |name: &str| PathBuf::from(tables.path(name));
+            let (truth, reported) = (path("truth.bed"), path("reported.bed"));
+            let original = b"chr1\t0\t100000\nchr2\t0\t100000\n";
+            std::fs::write(&truth, original).unwrap();
+            std::fs::write(&reported, original).unwrap();
+            let first = tables.path("S1.parquet");
+            let happy = tables.path("happy.vcf");
+            let prefix = tables.path("report");
+            let calls = tables.path("calls.tsv.gz");
+            let labelled = tables.path("labelled");
+            std::fs::create_dir(&labelled).unwrap();
+            let output = match destination {
+                "calls" => PathBuf::from(&calls),
+                "labelled-v1" => PathBuf::from(&labelled).join("S1.v1.snp.parquet"),
+                suffix => PathBuf::from(format!("{prefix}.{suffix}")),
+            };
+            let bed = if bed_kind == "truth" { &truth } else { &reported };
+            let near = format!("near={}", reported.display());
+            let Command::Stratify(args) = parse(&[
+                "stratify",
+                "--models",
+                &model,
+                "--tables",
+                &first,
+                &first,
+                "--truth-names",
+                "v1",
+                "v2",
+                "--truth-beds",
+                truth.to_str().unwrap(),
+                truth.to_str().unwrap(),
+                "--happy",
+                &happy,
+                &happy,
+                "-o",
+                &prefix,
+                "--calls",
+                &calls,
+                "--labelled-calls",
+                &labelled,
+                "--report-region",
+                &near,
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not stratify")
+            };
+            let result = stratify_with(&args, NonZeroUsize::MIN, || {
+                std::os::unix::fs::symlink(bed, &output).unwrap();
+            });
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("is the input region BED"), "{error}");
+            assert_eq!(std::fs::read(bed).unwrap(), original, "{destination} overwrote its BED");
+        }
+
+        /// The files `evaluate` reads (its model, its table, and the not-difficult regions BED,
+        /// given or found beside the models) are not its output: writing would destroy them.
+        #[test]
+        fn evaluate_does_not_write_over_its_inputs() {
+            let tables = MixedTables::new(&[]);
+            let (model, regions) = bundled_model(&tables);
+            let table = tables.path("S1.parquet");
+            let bundled = format!("{regions}/{NOT_DIFFICULT_REGIONS}.bed");
+            std::fs::write(&bundled, "chr1\t0\t100000\n").unwrap();
+            let given = tables.path("given.bed");
+            std::fs::write(&given, "chr1\t0\t100000\n").unwrap();
+            let region = format!("{NOT_DIFFICULT_REGIONS}={given}");
+            let evaluate = |output: &str, extra: &[&str]| {
+                let base = ["evaluate", "--models", &model, "--table", &table, "-o", output];
+                try_run(&[&base[..], &["--abstain-actions", "flip"], extra].concat())
+            };
+            evaluate(&tables.path("metrics.tsv"), &[]).unwrap();
+            for (output, what, extra) in [
+                (&bundled, "region BED", &[][..]),
+                (&given, "region BED", &["--regions", &region][..]),
+                (&table, "feature table", &[][..]),
+                (&model, "model", &[][..]),
+            ] {
+                let before = std::fs::read(output).unwrap();
+                let result = evaluate(output, extra);
+                assert_eq!(std::fs::read(output).unwrap(), before, "evaluate wrote over {output}");
+                let error = result.unwrap_err().to_string();
+                assert_eq!(
+                    error,
+                    format!("the output {output} is the input {what}; write to another path")
+                );
+            }
+        }
+
+        /// `evaluate` and `stratify` given models that record different digests of a region fail
+        /// on that before they read a feature table (here, ones that do not exist), even with
+        /// --allow-region-mismatch.
+        #[rstest]
+        fn models_of_different_region_beds_fail_before_the_tables_are_read(
+            #[values("evaluate", "stratify")] command: &str,
+            #[values(false, true)] allow_mismatch: bool,
+        ) {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            let models: Vec<String> = [(Task::Genotype, "a"), (Task::Promote, "b")]
+                .into_iter()
+                .map(|(task, sha)| {
+                    let mut model = crate::testing::separable_model(task, VariantType::Snp);
+                    let digest = RegionDigest { sha256: sha.repeat(64), intervals: 1, bases: 10 };
+                    model.info.region_names = vec!["segdups".to_string()];
+                    model.info.region_digests = BTreeMap::from([("segdups".to_string(), digest)]);
+                    let model_path = path(&format!("{task}{MODEL_SUFFIX}"));
+                    model.save(&model_path).unwrap();
+                    model_path
+                })
+                .collect();
+            let (table, output) = (path("missing.parquet"), path("out"));
+            let (bed, happy) = (path("missing.bed"), path("missing.vcf"));
+            let mut args = vec![command, "--models", &models[0], &models[1], "-o", &output];
+            if command == "evaluate" {
+                args.extend(["--table", &table]);
+            } else {
+                args.extend(["--truth-names", "v1", "v2", "--tables", &table, &table]);
+                args.extend(["--truth-beds", &bed, &bed, "--happy", &happy, &happy]);
+            }
+            if allow_mismatch {
+                args.push("--allow-region-mismatch");
+            }
+            let error = format!("{:#}", try_run(&args).unwrap_err());
+            assert!(
+                error.starts_with("--models were trained with different segdups region BEDs"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn review_stratify_ignores_regional_outputs_when_no_regions_are_reported() {
+            let tables = MixedTables::new(&[]);
+            let (model, _) = bundled_model(&tables);
+            let first = tables.path("S1.parquet");
+            let output = tables.path("run");
+            let truth = tables.path("run.regions.rates.tsv");
+            let contents = b"chr1\t0\t100000\nchr2\t0\t100000\n";
+            std::fs::write(&truth, contents).unwrap();
+            let happy = tables.path("happy.vcf");
+            try_run(&[
+                "stratify",
+                "--models",
+                &model,
+                "--tables",
+                &first,
+                &first,
+                "--truth-names",
+                "v1",
+                "v2",
+                "--truth-beds",
+                &truth,
+                &truth,
+                "--happy",
+                &happy,
+                &happy,
+                "-o",
+                &output,
+            ])
+            .unwrap();
+            assert_eq!(std::fs::read(&truth).unwrap(), contents);
+            for suffix in ["strata.tsv", "rates.tsv", "calibration.tsv"] {
+                assert!(Path::new(&format!("{output}.{suffix}")).is_file());
+            }
+            assert!(!Path::new(&format!("{output}.regions.strata.tsv")).exists());
+        }
+
+        /// `stratify` writes none of its outputs (--calls, and the reports at the -o prefix) over
+        /// a file it reads: its models, tables, truth BEDs, hap.py VCFs, the regions it reports
+        /// within, or the not-difficult regions BED it finds beside the models.
+        #[test]
+        fn stratify_does_not_write_over_its_inputs() {
+            let tables = MixedTables::new(&[]);
+            let (model, regions) = bundled_model(&tables);
+            let first = tables.path("S1.parquet");
+            let second = tables.path("S1.second.parquet");
+            let (vcf, happy) = (tables.path("calls.vcf.gz"), tables.path("happy.vcf"));
+            let extract = ["extract", "--vcf", &vcf, "--happy", &happy, "--sample", "S1"];
+            run(&[&extract[..], &["-o", &second, "--contigs", "chr1", "chr2"]].concat());
+            let truth = [tables.path("v1.bed"), tables.path("v2.bed")];
+            for bed in &truth {
+                std::fs::write(bed, "chr1\t0\t100000\nchr2\t0\t100000\n").unwrap();
+            }
+            let reported = tables.path("reported.strata.tsv");
+            std::fs::write(&reported, "chr1\t0\t5000\n").unwrap();
+            let bundled = format!("{regions}/{NOT_DIFFICULT_REGIONS}.bed");
+            std::fs::write(&bundled, "chr1\t0\t100000\nchr2\t0\t100000\n").unwrap();
+            let report = format!("near={reported}");
+            let stratify_with = |output: &str, calls: &str, second: &str, extra: &[&str]| {
+                let args = [
+                    "stratify",
+                    "--models",
+                    &model,
+                    "--truth-names",
+                    "v1",
+                    "v2",
+                    "--tables",
+                    &first,
+                    second,
+                    "--truth-beds",
+                    &truth[0],
+                    &truth[1],
+                    "--happy",
+                    &happy,
+                    &happy,
+                    "-o",
+                    output,
+                    "--calls",
+                    calls,
+                    "--report-region",
+                    &report,
+                    "--abstain-actions",
+                    "flip",
+                ];
+                try_run(&[&args[..], extra].concat())
+            };
+            let stratify = |output: &str, calls: &str| stratify_with(output, calls, &second, &[]);
+            let output = tables.path("strata");
+            stratify(&output, &tables.path("calls.tsv.gz")).unwrap();
+            for (calls, what) in [
+                (&bundled, "region BED"),
+                (&truth[0], "truth BED"),
+                (&reported, "report region BED"),
+                (&second, "feature table"),
+                (&model, "model"),
+                (&happy, "hap.py VCF"),
+            ] {
+                let before = std::fs::read(calls).unwrap();
+                let result = stratify(&output, calls);
+                assert_eq!(std::fs::read(calls).unwrap(), before, "stratify wrote over {calls}");
+                let error = result.unwrap_err().to_string();
+                assert_eq!(
+                    error,
+                    format!("the output {calls} is the input {what}; write to another path")
+                );
+            }
+            // A report at the -o prefix: reported.strata.tsv.
+            let prefix = tables.path("reported");
+            let before = std::fs::read(&reported).unwrap();
+            let result = stratify(&prefix, &tables.path("calls.tsv.gz"));
+            assert_eq!(std::fs::read(&reported).unwrap(), before, "stratify wrote over it");
+            let error = result.unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "the output {reported} is the input report region BED; write to another path"
+                )
+            );
+            // A labelled calls output, <dir>/<sample>.<truth>.<variant type>.parquet: here the
+            // second table.
+            let labelled = tables.path("labelled");
+            std::fs::create_dir(&labelled).unwrap();
+            let staged = format!("{labelled}/S1.v1.snp.parquet");
+            std::fs::copy(&second, &staged).unwrap();
+            let before = std::fs::read(&staged).unwrap();
+            let calls = tables.path("calls.tsv.gz");
+            let result = stratify_with(&output, &calls, &staged, &["--labelled-calls", &labelled]);
+            assert_eq!(std::fs::read(&staged).unwrap(), before, "stratify wrote over it");
+            let error = result.unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!("the output {staged} is the input feature table; write to another path")
+            );
+        }
+
+        #[test]
+        fn review_stratify_labelled_calls_protects_only_scored_variant_types() {
+            let tables = MixedTables::new(&[]);
+            let (model, _) = bundled_model(&tables);
+            let first = tables.path("S1.parquet");
+            let labelled = tables.path("labelled");
+            std::fs::create_dir(&labelled).unwrap();
+            let truth = tables.path("truth.bed");
+            std::fs::write(&truth, "chr1\t0\t100000\nchr2\t0\t100000\n").unwrap();
+            let happy = tables.path("happy.vcf");
+            for variant in ["indel", "snp"] {
+                let second = format!("{labelled}/S1.v1.{variant}.parquet");
+                std::fs::copy(&first, &second).unwrap();
+                let before = std::fs::read(&second).unwrap();
+                let result = try_run(&[
+                    "stratify",
+                    "--models",
+                    &model,
+                    "--tables",
+                    &first,
+                    &second,
+                    "--truth-names",
+                    "v1",
+                    "v2",
+                    "--truth-beds",
+                    &truth,
+                    &truth,
+                    "--happy",
+                    &happy,
+                    &happy,
+                    "-o",
+                    &tables.path("run"),
+                    "--labelled-calls",
+                    &labelled,
+                ]);
+                if variant == "indel" {
+                    result.unwrap();
+                } else {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        error.ends_with("is the input feature table; write to another path"),
+                        "{error}"
+                    );
+                }
+                assert_eq!(std::fs::read(&second).unwrap(), before);
+            }
+        }
+
+        /// `score` with actions to withhold and no not-difficult regions fails once it has looked
+        /// for the region BEDs, before it builds any feature (here, before it reads a missing
+        /// gVCF).
+        #[test]
+        fn score_without_the_not_difficult_regions_to_withhold_actions_fails_early() {
+            let tables = MixedTables::new(&[]);
+            let (model, _) = bundled_model(&tables);
+            // The calls without their raw annotations, which score then reads from the gVCF.
+            let calls = read_gzip(Path::new(&tables.path("calls.vcf.gz")));
+            let without_raw: String = calls
+                .lines()
+                .map(|line| {
+                    if line.starts_with('#') {
+                        return format!("{line}\n");
+                    }
+                    let mut fields: Vec<&str> = line.split('\t').collect();
+                    let depth = fields[7].split(';').find(|kv| kv.starts_with("DP=")).unwrap();
+                    fields[7] = depth;
+                    format!("{}\n", fields.join("\t"))
+                })
+                .collect();
+            let (vcf, out) = (tables.path("without_raw.vcf.gz"), tables.path("scored.vcf.gz"));
+            write_bgzf_indexed(Path::new(&vcf), &without_raw);
+            let gvcf = tables.path("missing.g.vcf.gz");
+            let base = ["score", "--vcf", &vcf, "--models", &model, "-o", &out, "--gvcf", &gvcf];
+            let error = try_run(&[&base[..], &["--abstain-actions", "flip"]].concat())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("--abstain-actions needs the not-difficult regions"),
+                "{error}"
+            );
+            // With them, what fails is the missing gVCF, read later.
+            let bed = tables.path("nd.bed");
+            std::fs::write(&bed, "chr1\t0\t100000\n").unwrap();
+            let region = format!("{NOT_DIFFICULT_REGIONS}={bed}");
+            let rest = ["--abstain-actions", "flip", "--regions", &region];
+            let error = format!("{:#}", try_run(&[&base[..], &rest].concat()).unwrap_err());
+            assert!(error.contains("missing.g.vcf.gz"), "{error}");
+            // Without actions to withhold, the regions are optional: the gVCF fails.
+            let error = format!("{:#}", try_run(&base).unwrap_err());
+            assert!(error.contains("missing.g.vcf.gz"), "{error}");
+        }
+
+        /// The region BEDs the tables are extracted with are recorded in the model, which `score`
+        /// finds beside the models, with no --regions, scoring as with them; another BED there is
+        /// an error naming it, unless --allow-region-mismatch.
+        #[test]
+        fn score_finds_and_checks_the_region_beds_beside_the_models() {
+            let tables = MixedTables::new(&[]);
+            let segdups = tables.path("segdups.bed");
+            std::fs::write(&segdups, "chr1\t1000\t3000\nchr2\t0\t500\n").unwrap();
+            let not_difficult = tables.path("not_difficult.bed");
+            std::fs::write(&not_difficult, "chr1\t0\t100000\n").unwrap();
+            let regions = format!("segdups={segdups}");
+            // Extracts the sample's table, flagging segdups with `bed`, to `out`.
+            let extract = |sample: &str, bed: &str, out: &str| {
+                let table = tables.path(out);
+                let (vcf, happy) = (tables.path("calls.vcf.gz"), tables.path("happy.vcf"));
+                let regions = format!("segdups={bed}");
+                run(&[
+                    "extract",
+                    "--vcf",
+                    &vcf,
+                    "--happy",
+                    &happy,
+                    "--sample",
+                    sample,
+                    "-o",
+                    &table,
+                    "--contigs",
+                    "chr1",
+                    "chr2",
+                    "--regions",
+                    &regions,
+                ]);
+                table
+            };
+            let (a, b) =
+                (extract("S1", &segdups, "S1.parquet"), extract("S2", &segdups, "S2.parquet"));
+            let models = tables.path("models");
+            std::fs::create_dir_all(format!("{models}/regions")).unwrap();
+            let model = format!("{models}/snp");
+            let policy = format!("{NOT_DIFFICULT_REGIONS}={not_difficult}");
+            run(&[
+                "train",
+                "--variant-type",
+                "snp",
+                "--max-rounds",
+                "10",
+                "-o",
+                &model,
+                "--policy-regions",
+                &policy,
+                "--tables",
+                &a,
+                &b,
+            ]);
+            let model = format!("{model}{MODEL_SUFFIX}");
+            let info = ModelInfo::read(&model).unwrap();
+            let digest = RegionSet::from_bed("segdups", &segdups).unwrap().digest().unwrap();
+            assert_eq!(info.region_digests.get("segdups"), Some(&digest));
+            let policy_digest = RegionSet::from_bed(NOT_DIFFICULT_REGIONS, &not_difficult)
+                .unwrap()
+                .digest()
+                .unwrap();
+            assert_eq!(info.policy_region_digests.get(NOT_DIFFICULT_REGIONS), Some(&policy_digest));
+
+            let score = |output: &str, extra: &[&str]| {
+                let vcf = tables.path("calls.vcf.gz");
+                let out = tables.path(output);
+                try_run(
+                    &[&["score", "--vcf", &vcf, "--models", &model, "-o", &out][..], extra]
+                        .concat(),
+                )
+                .map(|()| read_gzip(Path::new(&out)))
+            };
+            let given = score("given.vcf.gz", &["--regions", &regions]).unwrap();
+            // Not found beside the models: missing.
+            let error = score("missing.vcf.gz", &[]).unwrap_err().to_string();
+            assert!(error.contains("needs region BEDs for: segdups"), "{error}");
+            std::fs::copy(&segdups, format!("{models}/regions/segdups.bed")).unwrap();
+            let bundled = score("bundled.vcf.gz", &[]).unwrap();
+            let records = |vcf: &str| -> Vec<String> {
+                vcf.lines().filter(|line| !line.starts_with('#')).map(str::to_string).collect()
+            };
+            assert_eq!(records(&bundled), records(&given));
+
+            // Another BED beside the models.
+            let swapped = format!("{models}/regions/segdups.bed");
+            std::fs::write(&swapped, "chr1\t0\t10\n").unwrap();
+            let error = score("swapped.vcf.gz", &[]).unwrap_err().to_string();
+            // Named in the models' directory as resolved (e.g. macOS's /var is /private/var).
+            let named = Path::new(&swapped).canonicalize().unwrap();
+            assert!(
+                error.starts_with(&format!(
+                    "the segdups region BED {} (bundled) is not the one",
+                    named.display()
+                )),
+                "{error}"
+            );
+            score("allowed.vcf.gz", &["--allow-region-mismatch"]).unwrap();
+            // The swapped BED flags other calls, so a run with it is not the run with the
+            // models' BED: the equality above is of the BED used.
+            let flags = |bed: &str| {
+                let table = extract("S1", bed, "flags.parquet");
+                FeatureTable::read_parquet(&table)
+                    .unwrap()
+                    .f64_column("region_segdups")
+                    .unwrap()
+                    .to_vec()
+            };
+            assert_ne!(flags(&swapped), flags(&segdups));
+
+            // evaluate finds the not-difficult regions beside the models when its policy reads
+            // them (here to withhold flips), checked against the digest train recorded.
+            std::fs::copy(&not_difficult, format!("{models}/regions/{NOT_DIFFICULT_REGIONS}.bed"))
+                .unwrap();
+            let evaluate = |extra: &[&str]| {
+                let out = tables.path("evaluate.tsv");
+                let base = ["evaluate", "--models", &model, "--table", &a, "-o", &out];
+                try_run(&[&base[..], &["--abstain-actions", "flip"], extra].concat())
+            };
+            evaluate(&[]).unwrap();
+            std::fs::write(format!("{models}/regions/{NOT_DIFFICULT_REGIONS}.bed"), "chr1\t0\t9\n")
+                .unwrap();
+            let error = evaluate(&[]).unwrap_err().to_string();
+            assert!(error.contains("region BED"), "{error}");
+            assert!(error.contains("is not the one the models were trained with"), "{error}");
+            evaluate(&["--allow-region-mismatch"]).unwrap();
+        }
+
         /// `--alignment-tags` records provenance in tables extracted without reads; `train` fails
         /// on tables aligned differently unless --mixed-alignments, which records the tags they
         /// share; `score` compares the tags given with the models'; and a model that records none
@@ -7208,6 +8948,100 @@ mod tests {
         }
     }
 
+    /// A labelled table flagging a region with another BED than a model's is an error (a warning
+    /// with --allow-region-mismatch); one recording no digest, or a model recording none, is not
+    /// checked.
+    #[test]
+    fn tables_are_checked_against_the_models_region_beds() {
+        let digest = |sha: &str| RegionDigest { sha256: sha.repeat(64), intervals: 1, bases: 10 };
+        let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+        model.info.region_digests = [("segdups".to_string(), digest("a"))].into_iter().collect();
+        let paths = [PathBuf::from("m.winnowr.json")];
+        let models = std::slice::from_ref(&model);
+        let table = Path::new("t.parquet");
+        let mut info = crate::testing::call_table(&[]).info().clone();
+        // The table records none: not checked (a warning).
+        assert!(check_table_region_digests(table, &info, models, &paths, false).is_ok());
+        info.region_digests = [("segdups".to_string(), digest("a"))].into_iter().collect();
+        assert!(check_table_region_digests(table, &info, models, &paths, false).is_ok());
+        info.region_digests = [("segdups".to_string(), digest("b"))].into_iter().collect();
+        let error = check_table_region_digests(table, &info, models, &paths, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("feature table t.parquet flags the segdups regions with another BED"),
+            "{error}"
+        );
+        assert!(check_table_region_digests(table, &info, models, &paths, true).is_ok());
+        // The model records none: not checked.
+        model.info.region_digests.clear();
+        let models = std::slice::from_ref(&model);
+        assert!(check_table_region_digests(table, &info, models, &paths, false).is_ok());
+    }
+
+    /// Models that record different digests of one region are an error, as no labelled table can
+    /// be of the BED all were trained with; models that record the same one are not.
+    #[rstest]
+    #[case::differ("b", true)]
+    #[case::agree("a", false)]
+    fn models_of_different_region_beds_are_rejected(#[case] other: &str, #[case] rejected: bool) {
+        let digest = |sha: &str| RegionDigest { sha256: sha.repeat(64), intervals: 1, bases: 10 };
+        let models: Vec<WinnowrModel> = [("a", VariantType::Snp), (other, VariantType::Indel)]
+            .into_iter()
+            .map(|(sha, variant_type)| {
+                let mut model = crate::testing::separable_model(Task::Genotype, variant_type);
+                model.info.region_names = vec!["segdups".to_string()];
+                model.info.region_digests = BTreeMap::from([("segdups".to_string(), digest(sha))]);
+                model
+            })
+            .collect();
+        let paths = [PathBuf::from("snp.winnowr.json"), PathBuf::from("indel.winnowr.json")];
+        let result = check_models_region_digests(&models, &ModelFile::resolve_all(&paths));
+        if rejected {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.starts_with("--models were trained with different segdups region BEDs"),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn review_policy_region_names_are_validated_before_any_bed_is_read() {
+        let missing = NamedBed {
+            name: NOT_DIFFICULT_REGIONS.to_string(),
+            path: PathBuf::from("missing-policy-region.bed"),
+        };
+        let duplicate =
+            policy_region_digests(&[missing.clone(), missing.clone()]).unwrap_err().to_string();
+        assert!(duplicate.ends_with("more than once"), "{duplicate}");
+        let invalid = NamedBed { name: "segdups".to_string(), path: missing.path.clone() };
+        let invalid = policy_region_digests(&[missing, invalid]).unwrap_err().to_string();
+        assert!(invalid.starts_with("--policy-regions takes only"), "{invalid}");
+    }
+
+    /// `--policy-regions` takes the not-difficult regions only, once.
+    #[test]
+    fn policy_regions_are_the_not_difficult_regions_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nd.bed");
+        std::fs::write(&path, "chr1\t0\t10\n").unwrap();
+        let not_difficult = NamedBed { name: NOT_DIFFICULT_REGIONS.to_string(), path };
+        let recorded = policy_region_digests(std::slice::from_ref(&not_difficult)).unwrap();
+        assert_eq!(recorded[NOT_DIFFICULT_REGIONS].bases, 10);
+        let error =
+            policy_region_digests(&[not_difficult.clone(), not_difficult]).unwrap_err().to_string();
+        assert!(error.ends_with("more than once"), "{error}");
+        let bed = NamedBed { name: "segdups".to_string(), path: PathBuf::from("x.bed") };
+        let error = policy_region_digests(&[bed]).unwrap_err().to_string();
+        assert!(
+            error.starts_with("--policy-regions takes only notinalldifficultregions"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn merged_contigs_start_from_the_table_covering_the_most() {
         let odd = training_info("S1", &[("chr1", Some(100)), ("chr3", Some(300))]);
@@ -7436,8 +9270,15 @@ mod tests {
         assert_eq!(models_feature_source(&[&a, &b]), Some(vcf));
         let (a, b) = (info(Task::Genotype, gvcf), info(Task::Promote, vcf));
         assert_eq!(models_feature_source(&[&a, &b]), None);
-        let problems =
-            check_model_set(&ModelSet { paths: &paths, infos: &[&a, &b] }, &SetInputs::default());
+        let problems = check_model_set(
+            &ModelSet {
+                paths: &paths,
+                resolved: &paths,
+                given_dirs: &crate::testing::given_dirs(&paths),
+                infos: &[&a, &b],
+            },
+            &SetInputs::default(),
+        );
         assert_eq!(
             error_message(&problems).unwrap(),
             "--models were trained on features from different sources (g.winnowr.json: gvcf; \
@@ -7544,24 +9385,23 @@ mod tests {
         let error = run(&["score", "--vcf", &vcf, "--models", &snp, &other_snp, "-o", &out])
             .unwrap_err()
             .to_string();
-        assert_eq!(
-            error,
-            format!(
-                "2 problems with the models and their inputs:\n  model_kinds: expected at most \
-                 one model per task and variant type, got two genotype snp models\n  \
-                 region_missing: model {snp} (genotype snp) needs region BEDs (--regions \
-                 NAME=PATH) for: segdups"
-            )
+        let missing = format!(
+            "model {snp} (genotype snp) needs region BEDs for: segdups; pass --regions NAME=PATH, \
+             or put each beside the models as regions/NAME.bed.gz, regions/NAME.bed.bgz, \
+             regions/NAME.bed (looked in: {}",
+            // The models' directory as resolved (e.g. macOS's /var is /private/var).
+            dir.path().canonicalize().unwrap().join("regions").display()
         );
+        let expected = format!(
+            "2 problems with the models and their inputs:\n  model_kinds: expected at most one \
+             model per task and variant type, got two genotype snp models\n  region_missing: \
+             {missing}"
+        );
+        assert!(error.starts_with(&expected), "{error}");
         // One problem: its message alone, as before.
         let error =
             run(&["score", "--vcf", &vcf, "--models", &snp, "-o", &out]).unwrap_err().to_string();
-        assert_eq!(
-            error,
-            format!(
-                "model {snp} (genotype snp) needs region BEDs (--regions NAME=PATH) for: segdups"
-            )
-        );
+        assert!(error.starts_with(&missing), "{error}");
     }
 
     /// `score` checks the model set before it parses the boosters: a set that cannot be scored
@@ -7951,46 +9791,41 @@ mod tests {
         }
     }
 
-    /// The policy of a `score` command line with extra options, and `regions`.
-    fn score_policy(extra: &[&str], regions: &[NamedBed]) -> Result<Policy> {
+    /// The policy of a `score` command line with extra options, and the not-difficult regions.
+    fn score_policy(extra: &[&str], not_difficult: Option<RegionSet>) -> Result<Policy> {
         let base = ["score", "--vcf", "v", "--models", "m", "-o", "o"];
         let cli = parse(&[&base[..], extra].concat()).unwrap();
         let Command::Score(args) = cli.command else { panic!("not score") };
-        args.policy.policy(Mode::Genotyper, &["chr1"], regions, true)
+        args.policy.policy(Mode::Genotyper, &["chr1"], not_difficult, true)
     }
 
-    /// A one-interval BED of chr1 and a `--regions` entry naming it the not-difficult regions.
-    fn not_difficult_regions(dir: &tempfile::TempDir) -> Vec<NamedBed> {
-        let path = dir.path().join("not-difficult.bed");
-        std::fs::write(&path, "chr1\t100\t200\n").unwrap();
-        vec![NamedBed { name: NOT_DIFFICULT_REGIONS.to_string(), path }]
+    /// Not-difficult regions of one chr1 interval.
+    fn not_difficult_regions() -> Option<RegionSet> {
+        Some(RegionSet::from_spans(NOT_DIFFICULT_REGIONS, [("chr1", 100, 200)]))
     }
 
     #[test]
     fn the_default_policy_keeps_the_fallback_for_indels_and_an_outside_drop_threshold() {
         use crate::policy::{DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP};
         // Without the not-difficult regions: the indel keep fallback only.
-        let policy = score_policy(&[], &[]).unwrap();
+        let policy = score_policy(&[], None).unwrap();
         let expected: Vec<(VariantType, Rule)> =
             DEFAULT_KEEP_FALLBACK.iter().map(|&vt| (vt, Rule::KeepFallback)).collect();
         assert_eq!(policy.rules.into_iter().collect::<Vec<_>>(), expected);
         assert!(policy.abstain.is_none());
         // With them: indels outside are dropped at the outside threshold, in place of the
         // model's; no action is withheld.
-        let dir = tempfile::TempDir::new().unwrap();
-        let policy = score_policy(&[], &not_difficult_regions(&dir)).unwrap();
+        let policy = score_policy(&[], not_difficult_regions()).unwrap();
         let abstain = policy.abstain.unwrap();
         assert_eq!(abstain.indel_t_drop, Some(DEFAULT_OUTSIDE_INDEL_T_DROP));
         assert!(!abstain.flip && !abstain.regenotype && !abstain.promote);
-        // A BED under another name is not taken as the not-difficult regions.
-        let other =
-            vec![NamedBed { name: "segdups".into(), ..not_difficult_regions(&dir).remove(0) }];
-        assert!(score_policy(&[], &other).unwrap().abstain.is_none());
+        // Regions on none of the contigs are an error.
+        let elsewhere = RegionSet::from_spans(NOT_DIFFICULT_REGIONS, [("chr9", 0, 10)]);
+        assert!(score_policy(&[], Some(elsewhere)).is_err());
     }
 
     #[test]
     fn withheld_actions_read_the_not_difficult_regions_without_an_indel_genotype_model() {
-        let dir = tempfile::TempDir::new().unwrap();
         let cli = parse(&[
             "score",
             "--vcf",
@@ -8004,44 +9839,56 @@ mod tests {
         ])
         .unwrap();
         let Command::Score(args) = cli.command else { panic!("not score") };
-        let regions = not_difficult_regions(&dir);
-        let policy = args.policy.policy(Mode::Genotyper, &["chr1"], &regions, false).unwrap();
+        assert!(args.policy.reads_not_difficult(false));
+        let policy =
+            args.policy.policy(Mode::Genotyper, &["chr1"], not_difficult_regions(), false).unwrap();
         let abstain = policy.abstain.unwrap();
         assert!(abstain.flip && !abstain.regenotype && !abstain.promote);
         assert_eq!(abstain.indel_t_drop, args.policy.outside_indel_t_drop.0);
-        // A missing BED is still an error.
-        let missing = vec![NamedBed {
-            name: NOT_DIFFICULT_REGIONS.to_string(),
-            path: dir.path().join("missing.bed"),
-        }];
-        let error = args.policy.policy(Mode::Genotyper, &["chr1"], &missing, false).unwrap_err();
-        assert!(format!("{error:#}").contains("missing.bed"), "{error:#}");
     }
 
     #[test]
     fn the_not_difficult_regions_are_not_read_without_an_indel_genotype_model() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("missing.bed");
-        let regions = vec![NamedBed { name: NOT_DIFFICULT_REGIONS.to_string(), path }];
         let cli = parse(&["score", "--vcf", "v", "--models", "m", "-o", "o"]).unwrap();
         let Command::Score(args) = cli.command else { panic!("not score") };
-        let policy = args.policy.policy(Mode::Genotyper, &["chr1"], &regions, false).unwrap();
-        assert!(policy.abstain.is_none());
-        // With an indel genotype model they are read.
-        let error = args.policy.policy(Mode::Genotyper, &["chr1"], &regions, true).unwrap_err();
-        assert!(format!("{error:#}").contains("missing.bed"), "{error:#}");
+        assert!(!args.policy.reads_not_difficult(false));
+        assert!(args.policy.reads_not_difficult(true));
+        let policy =
+            args.policy.policy(Mode::Genotyper, &["chr1"], not_difficult_regions(), true).unwrap();
+        assert!(policy.abstain.is_some());
+    }
+
+    /// The policy reads the not-difficult regions to withhold actions outside them, or, for an
+    /// indel genotype model, to drop indel calls outside them at the outside threshold.
+    #[rstest]
+    #[case::default_snp(&[], false, false)]
+    #[case::default_indel(&[], true, true)]
+    #[case::no_outside_threshold(&["--outside-indel-t-drop", "none"], true, false)]
+    #[case::abstain_snp(&["--abstain-actions", "flip"], false, true)]
+    #[case::abstain_without_threshold(&["--abstain-actions", "promote", "--outside-indel-t-drop", "none"], false, true)]
+    #[case::abstain_none(&["--abstain-actions", "none"], true, true)]
+    fn when_the_policy_reads_the_not_difficult_regions(
+        #[case] extra: &[&str],
+        #[case] indel_genotype: bool,
+        #[case] expected: bool,
+    ) {
+        let base = ["score", "--vcf", "v", "--models", "m", "-o", "o"];
+        let Command::Score(args) = parse(&[&base[..], extra].concat()).unwrap().command else {
+            panic!("not score")
+        };
+        assert_eq!(args.policy.reads_not_difficult(indel_genotype), expected);
     }
 
     #[test]
     fn the_default_policy_can_be_turned_off() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let regions = not_difficult_regions(&dir);
+        // It reads no not-difficult regions (see
+        // `when_the_policy_reads_the_not_difficult_regions`), so it is given none.
         let policy =
-            score_policy(&["--keep-fallback", "none", "--outside-indel-t-drop", "none"], &regions)
+            score_policy(&["--keep-fallback", "none", "--outside-indel-t-drop", "none"], None)
                 .unwrap();
         assert!(policy.rules.is_empty() && policy.abstain.is_none());
         // --expected-f1 replaces the default keep fallback of its variant types.
-        let policy = score_policy(&["--expected-f1", "indel"], &[]).unwrap();
+        let policy = score_policy(&["--expected-f1", "indel"], None).unwrap();
         assert_eq!(policy.rule(VariantType::Indel), Rule::ExpectedF1);
         // Explicit options: SNPs too, another threshold, and withheld flips.
         let policy = score_policy(
@@ -8054,14 +9901,14 @@ mod tests {
                 "--abstain-actions",
                 "flip",
             ],
-            &regions,
+            not_difficult_regions(),
         )
         .unwrap();
         assert_eq!(policy.rule(VariantType::Snp), Rule::KeepFallback);
         let abstain = policy.abstain.unwrap();
         assert_eq!((abstain.indel_t_drop, abstain.flip), (Some(0.7), true));
         // Withholding actions needs the not-difficult regions.
-        let error = score_policy(&["--abstain-actions", "flip"], &[]).unwrap_err();
+        let error = score_policy(&["--abstain-actions", "flip"], None).unwrap_err();
         assert!(error.to_string().contains(NOT_DIFFICULT_REGIONS), "{error}");
     }
 
@@ -8070,22 +9917,19 @@ mod tests {
     #[case::keep_fallback_any_case(&["--keep-fallback", "INDEL", "None"], "--keep-fallback none cannot be given with other values, got: indel none")]
     #[case::abstain_actions(&["--abstain-actions", "flip", "none"], "--abstain-actions none cannot be given with other values, got: flip none")]
     fn none_cannot_be_given_with_other_values(#[case] extra: &[&str], #[case] expected: &str) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let error = score_policy(extra, &not_difficult_regions(&dir)).unwrap_err().to_string();
+        let error = score_policy(extra, not_difficult_regions()).unwrap_err().to_string();
         assert_eq!(error, expected);
     }
 
     #[test]
     fn abstain_actions_ignore_case() {
-        let dir = tempfile::TempDir::new().unwrap();
         let policy =
-            score_policy(&["--abstain-actions", "Flip", "PROMOTE"], &not_difficult_regions(&dir))
+            score_policy(&["--abstain-actions", "Flip", "PROMOTE"], not_difficult_regions())
                 .unwrap();
         let abstain = policy.abstain.unwrap();
         assert!(abstain.flip && abstain.promote && !abstain.regenotype);
         // `none` alone, in any case, withholds nothing.
-        let policy =
-            score_policy(&["--abstain-actions", "NONE"], &not_difficult_regions(&dir)).unwrap();
+        let policy = score_policy(&["--abstain-actions", "NONE"], not_difficult_regions()).unwrap();
         let abstain = policy.abstain.unwrap();
         assert!(!abstain.flip && !abstain.promote && !abstain.regenotype);
     }

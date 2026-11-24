@@ -22,6 +22,12 @@ Options:
   -o, --output <OUTPUT>
           The model file to write (`.winnowr.json` is appended if missing)
 
+      --policy-regions <NAME=PATH>...
+          The region BEDs of the decision policy the model will be scored with, as NAME=PATH (today
+          only notinalldifficultregions=PATH, GIAB's GRCh38 genome stratification): each is read
+          only to record its digest in the model, so that score can check the BED it is given or
+          finds beside the model
+
       --mixed-alignments
           Train on tables of reads aligned differently (e.g. to make a model of both): the model
           records only the alignment tags the tables share, and score compares it with the reads on

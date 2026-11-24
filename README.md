@@ -118,7 +118,9 @@ no model uses), measured with the settings the models were trained with (`strlen
 --settings`); `score` stops with an error when they differ. In place of them, `score --alignments
 sample.cram --reference ref.fa` measures the evidence itself. `--mode genotyper` (the default) lets
 the genotype models drop, flip and re-genotype calls; `--mode veto` lets them only drop calls. Give
-`--regions` the region names the models were trained with.
+`--regions` the region names the models were trained with, or keep each BED beside the models as
+`regions/NAME.bed.gz` (or `.bed.bgz`, or `.bed`) and leave `--regions` out: `score` finds them there, and checks
+each BED against the digest the models record of the one they were trained with.
 
 ### Train your own models
 

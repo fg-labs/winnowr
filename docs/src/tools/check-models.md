@@ -9,8 +9,14 @@ problem at once:
   the same contigs and reference, on features from one feature source (`gvcf`, `vcf`, or
   `alignments` with its read settings), and needing the repeat-length and pileup evidence
   measured one way;
-- `--regions` has a BED for every region a model uses, and no name twice; each BED given is
-  read, and must have intervals on the models' contigs. A BED that `score` does not read (one no
+- there is a BED for every region a model uses, and no `--regions` name twice: the `--regions`
+  BED of the name, else one found beside the models as `regions/NAME.bed.gz`, `.bed.bgz` or
+  `.bed` (as `score` finds them; see [Scoring](../user-guide/scoring.md)). Each BED a run uses
+  (the features', and the not-difficult regions with an indel genotype model) is read, must have
+  intervals on the models' contigs, and is checked against the digest the models record of it: a
+  different BED is an error (a warning with `--allow-region-mismatch`, as in `score`, which does
+  not cover models that record different digests of one region). Each
+  other BED given is read too. A BED that `score` does not read (one no
   model uses, or the not-difficult regions without an indel genotype model) only warns: `score`
   still reads the not-difficult regions with `--abstain-actions`, which `check-models` is not
   given. While a model cannot be read, every BED counts as used;
@@ -38,9 +44,11 @@ feature source and evidence settings, the region names (a BED for every region a
 no name twice), the VCF's contigs against the models' reference, and the reads' alignment
 provenance against the models'. It differs in what comes
 before and after them: it stops at the first model whose information it cannot read and at an
-unreadable VCF before the checks, and after them loads the boosters (stopping at the first that
-does not load) and reads the region BEDs (those a model uses), stopping at the first it cannot
-read or that has no interval on the models' contigs. `model_unreadable`,
+unreadable VCF before the checks. After the checks, it loads the boosters (stopping at the first
+that does not load) and reads the required `--strlen` and `--pileup` tables, and then reads all
+planned region BEDs and reports their problems together, including every unreadable required BED
+and every required BED with no interval on the models' contigs. The BEDs come after the evidence
+tables so that one producer can feed an evidence stream and then a BED stream. `model_unreadable`,
 `input_unreadable`, `reference_not_checked`, `not_difficult_missing`,
 `alignment_provenance_unknown` and `alignment_header_mixed` are `check-models`' own (`score` logs
 the last as a warning when it reads the header),
@@ -79,14 +87,19 @@ know.
 | `feature_source_differs` | error | the models' features come from different feature sources (read settings included) |
 | `strlen_settings_differ` | error | the models need repeat-length evidence measured with different settings |
 | `pileup_settings_differ` | error | the models need pileup evidence measured with different settings |
-| `region_missing` | error | a region a model uses has no `--regions` BED |
+| `region_missing` | error | a region a model uses has no `--regions` BED and none beside the models; the message names the directories looked in |
 | `region_repeated` | error | a `--regions` name is given twice |
 | `region_unreadable` | error, or warning | a region BED cannot be read; a warning for a BED `score` does not read |
 | `region_contigs` | error, or warning | a region BED has no interval on the models' contigs; a warning for a BED `score` does not read |
-| `input_unreadable` | error | `--reference` or `--vcf` cannot be read |
+| `input_unreadable` | error | `--reference`, `--vcf` or `--alignments` cannot be read, or `--alignment-tags` cannot be validated |
 | `pileup_alignment_passes` | warning | a model of the `alignments` source counts its pileup with another base quality or flank than its alignment settings, so `score` reads the reads twice |
 | `region_unused` | warning | a `--regions` BED no model uses (other than the not-difficult regions) |
-| `not_difficult_missing` | warning | an indel genotype model, and no `notinalldifficultregions` BED, which `score`'s default policy uses |
+| `region_ambiguous` | error | several BEDs of a region beside the models (e.g. `.bed.gz` and `.bed`) with different intervals |
+| `region_checksum` | error, or warning with `--allow-region-mismatch` | a region BED (given or found) whose digest is not the one the models record |
+| `region_digests_differ` | error | the models record different digests of a region BED |
+| `region_unverified` | warning | a region BED a model uses whose digest no model records, so it is used unchecked |
+| `policy_region_unrecorded` | warning | an indel genotype model, and no model records the policy digest of the not-difficult regions (`train --policy-regions`), even if their feature digest is checked |
+| `not_difficult_missing` | warning | an indel genotype model, and no policy-only `notinalldifficultregions` BED (neither given nor bundled); if a model requires it as a feature, `region_missing` is an error instead |
 | `other_winnowr_version` | warning | a model was trained by another winnowr version |
 | `no_reference_contigs` | warning | a model records no reference contigs, so its reference cannot be checked |
 | `reference_not_checked` | warning | neither `--reference` nor `--vcf` was given |
@@ -113,7 +126,7 @@ ids and values do not change it, and a caller should ignore those it does not kn
 | `booster_checked` | always `false`: the boosters are not read |
 | `models` | each model, in the order given (below) |
 | `set` | what the models share (below); a value is `null` where they disagree |
-| `inputs` | `reference`, `vcf` and `alignments` as given (or `null`); `regions`: each `name`, `path` and the models that use it (`used_by`); `alignment`: the reads' alignment provenance (or `null`), and `alignment_from`: `header`, `tags`, `header+tags` (or `null`) |
+| `inputs` | `reference`, `vcf` and `alignments` as given (or `null`); `regions`: each BED given (`--regions`), in order, with its `name`, `path`, the models that use it (`used_by`), and, for a BED a run uses, its `digest` (an object of `sha256`, `intervals` and `bases`, as in `models[].region_digests`) and whether it is the models' (`verified`: `true`, `false`, or `null` when no model records one; both `null` for a BED a run does not use); `bundled_regions`: each BED found beside the models and read (as no `--regions` BED of its name was given), with the same keys; `alignment`: the reads' alignment provenance (or `null`), and `alignment_from`: `header`, `tags`, `header+tags` (or `null`) |
 | `problems` | every problem: `check`, `severity` (`error` or `warning`), `model` (its path, or `null` for a problem of the set) and `message`; only an `alignment_provenance_mismatch` also has `differences`: each `tag`, and its value in the `models`' and the `reads`' provenance (`null` where it is not set) |
 
 Each entry of `models` has its `path` and `readable`. A model that cannot be read has only
@@ -128,6 +141,8 @@ those two keys; a readable one also has:
 | `contigs` | the contigs its training calls came from |
 | `reference_contigs` | those contigs' lengths in its reference (`null` if it records none) |
 | `region_names` | the region sets its features use |
+| `region_digests` | the digest of each of those region BEDs (`sha256`, `intervals`, `bases`), by name: `{}` if it records none |
+| `policy_region_digests` | the digest of each region BED of the policy it records (`train --policy-regions`): `{}` if none |
 | `training_samples` | the training samples |
 | `feature_source` | `gvcf`, `vcf`, or `alignments:` and the read settings (e.g. `alignments:mapq20,bq10,flank5`) |
 | `alignment_settings` | the read settings of the `alignments` source, else `null` |
@@ -141,7 +156,10 @@ those two keys; a readable one also has:
 model records none, or two models record different lengths of a contig), `region_names`
 (any model's), `feature_source`, `alignment_settings`, `strlen_settings`, `pileup_settings`,
 `needs` (what any model needs) and `not_difficult_regions`: their `name`, whether an indel
-genotype model `used` them, and whether `--regions` `given` them; and `alignment`, the models'
+genotype model `used` them, whether `--regions` `given` them, the digest the models record of them
+as a feature and, when `used`, for the policy (`recorded`, `null` if none does or they differ),
+and the BED used (`path`, given or found beside
+the models, or `null`); and `alignment`, the models'
 alignment provenance (`null` if a model records none, or two record different provenance).
 
 ## Options

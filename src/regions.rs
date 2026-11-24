@@ -1,13 +1,54 @@
 //! Membership lookups against named BED region sets (e.g. GIAB stratifications).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::io::open_text;
+use crate::io::{FileIdentity, open_regular_text_with_identity, open_text_with_identity};
+
+/// What identifies a region BED's content, however the file is compressed, ordered or split: the
+/// SHA-256 of its merged intervals as text (`contig\tstart\tend\n` for each interval, contigs
+/// in byte order of their names, intervals in order), and their number and size. Tables and
+/// models record it for each region BED, so that a BED other than the one they were extracted or
+/// trained with is detected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionDigest {
+    /// The SHA-256 of the merged intervals as text, in lower-case hexadecimal (checked when read).
+    #[serde(deserialize_with = "deserialize_sha256")]
+    pub sha256: String,
+    /// The number of merged intervals.
+    pub intervals: u64,
+    /// The number of bases they cover.
+    pub bases: u64,
+}
+
+/// Reads a SHA-256 in lower-case hexadecimal (64 digits).
+fn deserialize_sha256<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let sha256 = String::deserialize(deserializer)?;
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if sha256.len() != 64 || !sha256.bytes().all(hex) {
+        return Err(serde::de::Error::custom(format!(
+            "sha256 must be 64 lower-case hexadecimal digits, got {sha256:?}"
+        )));
+    }
+    Ok(sha256)
+}
+
+impl fmt::Display for RegionDigest {
+    /// The intervals, bases and the digest's first 12 hexadecimal digits.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let short = self.sha256.get(..12).unwrap_or(&self.sha256);
+        write!(f, "{} intervals covering {} bases (sha256 {short})", self.intervals, self.bases)
+    }
+}
 
 /// The merged, sorted, non-overlapping, half-open (0-based) intervals of one contig.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,8 +119,41 @@ impl RegionSet {
     /// tab-separated columns, an empty contig name, coordinates that are not integers,
     /// `start < 0` or `end < start`. The error names the file and line.
     pub fn from_bed<N: Into<String>, P: AsRef<Path>>(name: N, path: P) -> Result<Self> {
+        Self::from_bed_with_identity(name, path).map(|(regions, _)| regions)
+    }
+
+    /// Reads a BED once, returning the identity of the opened regular file alongside its regions.
+    /// Streams (e.g. FIFOs) have no identity. The identity remains valid if the path is retargeted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same read and parse errors as [`Self::from_bed`].
+    pub(crate) fn from_bed_with_identity<N: Into<String>, P: AsRef<Path>>(
+        name: N,
+        path: P,
+    ) -> Result<(Self, Option<FileIdentity>)> {
         let path = path.as_ref();
-        let mut reader = open_text(path)?;
+        let (reader, identity) = open_text_with_identity(path)?;
+        Self::from_bed_reader(name, path, reader).map(|regions| (regions, identity))
+    }
+
+    /// Reads a bundled BED from one verified regular handle, without blocking on a replacement
+    /// stream. Returns the read/parse errors of [`Self::from_bed`] or a nonregular-input error.
+    pub(crate) fn from_regular_bed_with_identity<N: Into<String>, P: AsRef<Path>>(
+        name: N,
+        path: P,
+    ) -> Result<(Self, Option<FileIdentity>)> {
+        let path = path.as_ref();
+        let (reader, identity) = open_regular_text_with_identity(path)?;
+        Self::from_bed_reader(name, path, reader).map(|regions| (regions, identity))
+    }
+
+    /// Parses BED intervals from an already opened, decompressing reader, naming `path` in errors.
+    fn from_bed_reader<N: Into<String>, R: std::io::BufRead>(
+        name: N,
+        path: &Path,
+        mut reader: R,
+    ) -> Result<Self> {
         let mut by_contig: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
         let mut line = String::new();
         let mut line_number = 0usize;
@@ -164,6 +238,37 @@ impl RegionSet {
     #[must_use]
     pub fn contains(&self, contig: &str, start: u64, end: u64) -> bool {
         self.contig(contig).is_some_and(|intervals| intervals.contains(start, end))
+    }
+
+    /// The set's [`RegionDigest`]: of all its contigs, so that every table and model that used the
+    /// same BED records the same digest, whatever contigs they cover.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the BED (or set name) if the covered-base total exceeds `u64::MAX`.
+    pub fn digest(&self) -> Result<RegionDigest> {
+        let mut contigs: Vec<&String> = self.intervals.keys().collect();
+        contigs.sort_unstable();
+        let mut hasher = Sha256::new();
+        let (mut intervals, mut bases) = (0u64, 0u64);
+        let mut line = String::new();
+        for contig in contigs {
+            let spans = &self.intervals[contig];
+            for (start, end) in spans.starts.iter().zip(&spans.ends) {
+                line.clear();
+                writeln!(line, "{contig}\t{start}\t{end}").expect("writing to a String");
+                hasher.update(line.as_bytes());
+                intervals += 1;
+                bases = bases.checked_add(end - start).with_context(|| {
+                    format!("region BED {} covers more than u64::MAX bases", self.source())
+                })?;
+            }
+        }
+        let mut sha256 = String::with_capacity(64);
+        for byte in hasher.finalize() {
+            write!(sha256, "{byte:02x}").expect("writing to a String");
+        }
+        Ok(RegionDigest { sha256, intervals, bases })
     }
 
     /// Where the set came from, for messages: the BED file it was read from, or else its name.
@@ -319,6 +424,97 @@ pub fn read_region_sets(specs: &[NamedBed]) -> Result<Vec<RegionSet>> {
     specs.iter().map(|spec| RegionSet::from_bed(&spec.name, &spec.path)).collect()
 }
 
+/// A source (its label) and the digest it records.
+pub type Recorded<'a, L> = (L, &'a RegionDigest);
+
+/// The digests of one region BED that several sources (tables or models, each with a label)
+/// record: each digest with the labels of the sources that record it, in the order first recorded,
+/// and the labels of the sources that record none.
+#[derive(Debug, Clone)]
+pub struct RecordedDigests<'a, L> {
+    /// Each digest recorded, with the sources that record it.
+    pub digests: Vec<(&'a RegionDigest, Vec<L>)>,
+    /// The sources that record none.
+    pub unrecorded: Vec<L>,
+}
+
+impl<'a, L: Copy> RecordedDigests<'a, L> {
+    /// Groups the digests the `sources` (each a label and the digest it records, if any) record.
+    pub fn group<I: IntoIterator<Item = (L, Option<&'a RegionDigest>)>>(sources: I) -> Self {
+        let mut recorded = RecordedDigests { digests: Vec::new(), unrecorded: Vec::new() };
+        for (label, digest) in sources {
+            let Some(digest) = digest else {
+                recorded.unrecorded.push(label);
+                continue;
+            };
+            match recorded.digests.iter_mut().find(|(known, _)| *known == digest) {
+                Some((_, labels)) => labels.push(label),
+                None => recorded.digests.push((digest, vec![label])),
+            }
+        }
+        recorded
+    }
+
+    /// The digest the sources that record one agree on: `None` if none does, or two differ.
+    #[must_use]
+    pub fn agreed(&self) -> Option<&'a RegionDigest> {
+        match self.digests.as_slice() {
+            [(digest, _)] => Some(*digest),
+            _ => None,
+        }
+    }
+
+    /// Two sources that record different digests, if any: the first source to record one, and the
+    /// first to record another, each with its digest.
+    #[must_use]
+    pub fn conflict(&self) -> Option<(Recorded<'a, L>, Recorded<'a, L>)> {
+        match self.digests.as_slice() {
+            [(first, first_labels), (other, other_labels), ..] => {
+                Some(((first_labels[0], *first), (other_labels[0], *other)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The digest of each region BED (`names`) the training tables (each its sample and the digests it
+/// records) flag, to record in the model: the one every table records. A name some table records
+/// no digest for (a table extracted before digests were recorded) is recorded with none, with a
+/// warning.
+///
+/// # Errors
+///
+/// Returns an error naming two samples if their tables record different digests of a region:
+/// they were extracted with different BEDs under one name.
+pub fn training_region_digests(
+    tables: &[(&str, &BTreeMap<String, RegionDigest>)],
+    names: &[String],
+) -> Result<BTreeMap<String, RegionDigest>> {
+    let mut digests = BTreeMap::new();
+    for name in names {
+        let recorded = RecordedDigests::group(
+            tables.iter().map(|&(sample, digests)| (sample, digests.get(name))),
+        );
+        if let Some(((first_sample, first), (sample, digest))) = recorded.conflict() {
+            bail!(
+                "--tables were extracted with different {name} region BEDs: {first_sample}'s has \
+                 {first}, {sample}'s {digest}; extract every training table with the same BED"
+            );
+        }
+        match recorded.agreed() {
+            Some(digest) if recorded.unrecorded.is_empty() => {
+                digests.insert(name.clone(), digest.clone());
+            }
+            _ => log::warn!(
+                "the tables of {} record no digest of the {name} region BED, so the model records \
+                 none, and score cannot check the BED it is given",
+                recorded.unrecorded.join(", ")
+            ),
+        }
+    }
+    Ok(digests)
+}
+
 /// Reads a hap.py `--stratification` manifest: one `NAME<TAB>PATH` line per region, where a
 /// relative path is relative to the manifest's directory. Blank lines and lines starting with
 /// `#` are skipped.
@@ -384,6 +580,252 @@ mod tests {
         };
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// The digest of a BED of `lines`, written as `encoding`.
+    fn digest_of(lines: &[&str], encoding: Encoding) -> RegionDigest {
+        let dir = TempDir::new().unwrap();
+        let path = write_bed(&dir, "r.bed", lines, encoding);
+        RegionSet::from_bed("r", &path).unwrap().digest().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    fn bed_identity_remembers_the_read_file_after_symlink_retargeting(
+        #[values(Encoding::Plain, Encoding::Gzip, Encoding::MultiMember)] encoding: Encoding,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let original = write_bed(&dir, "original.bed", &["chr1\t0\t5"], encoding);
+        let other = write_bed(&dir, "other.bed", &["chr2\t0\t9"], encoding);
+        let input = dir.path().join("input.bed");
+        let alias = dir.path().join("alias.bed");
+        std::os::unix::fs::symlink(&original, &input).unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+        let (regions, identity) = RegionSet::from_bed_with_identity("r", &input).unwrap();
+        assert_eq!(regions, RegionSet::from_bed("r", &input).unwrap());
+        std::fs::remove_file(&input).unwrap();
+        std::os::unix::fs::symlink(&other, &input).unwrap();
+        let identity = identity.expect("a regular BED has an identity");
+        assert!(regions.contains("chr1", 0, 5));
+        assert!(identity.matches_path(&alias));
+        assert!(identity.matches_path(&original));
+        assert!(!identity.matches_path(&input));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bed_identity_distinguishes_a_replacement_inode_with_identical_intervals() {
+        let dir = TempDir::new().unwrap();
+        let path = write_bed(&dir, "input.bed", &["chr1\t0\t5"], Encoding::Plain);
+        let replacement = write_bed(&dir, "replacement.bed", &["chr1\t0\t5"], Encoding::Plain);
+        let (regions, identity) = RegionSet::from_bed_with_identity("r", &path).unwrap();
+        let old_alias = dir.path().join("old.bed");
+        std::fs::hard_link(&path, &old_alias).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(regions, RegionSet::from_bed("r", &path).unwrap());
+        let identity = identity.unwrap();
+        assert!(identity.matches_path(&old_alias));
+        assert!(!identity.matches_path(&path));
+        assert!(!identity.matches_path(&replacement));
+        assert!(!identity.matches_path(dir.path()));
+    }
+
+    /// A BED pipe is consumed once, including when compressed and lacking a BGZF EOF marker.
+    /// Child processes share a deadline so a second open or a seek on the pipe cannot hang tests.
+    #[cfg(unix)]
+    #[rstest]
+    fn bed_identity_reads_a_fifo_once(
+        #[values("plain", "gzip", "multi", "bgzf", "bgzf_no_eof")] encoding: &str,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("input.fifo");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let mut processes = crate::testing::TestProcesses::default();
+        for role in ["reader", "writer"] {
+            let envs = [
+                ("WINNOWR_BED_FIFO_ROLE", std::ffi::OsStr::new(role)),
+                ("WINNOWR_BED_FIFO", fifo.as_os_str()),
+                ("WINNOWR_BED_FIFO_ENCODING", std::ffi::OsStr::new(encoding)),
+            ];
+            processes.spawn_test(
+                "regions::tests::bed_identity_fifo_child",
+                envs,
+                &dir.path().join(format!("{role}.log")),
+            );
+        }
+        processes.wait_for_success(std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bed_identity_fifo_child() {
+        let Some(role) = std::env::var_os("WINNOWR_BED_FIFO_ROLE") else { return };
+        let fifo = std::env::var_os("WINNOWR_BED_FIFO").unwrap();
+        if role == "writer" {
+            let lines = [b"chr1\t0\t5\n".as_slice(), b"chr2\t1\t9\n".as_slice()];
+            let encoding = std::env::var("WINNOWR_BED_FIFO_ENCODING").unwrap();
+            let bytes = match encoding.as_str() {
+                "plain" => lines.concat(),
+                "gzip" => gzip(&lines.concat()),
+                "multi" => lines.iter().flat_map(|line| gzip(line)).collect(),
+                "bgzf" | "bgzf_no_eof" => {
+                    let dir = TempDir::new().unwrap();
+                    let path = dir.path().join("blocks.gz");
+                    let mut writer = rust_htslib::bgzf::Writer::from_path(&path).unwrap();
+                    writer.write_all(&lines.concat()).unwrap();
+                    drop(writer);
+                    let mut bytes = std::fs::read(path).unwrap();
+                    if encoding == "bgzf_no_eof" {
+                        assert!(bytes.ends_with(&crate::io::BGZF_EOF));
+                        bytes.truncate(bytes.len() - crate::io::BGZF_EOF.len());
+                    }
+                    bytes
+                }
+                _ => panic!("unknown test encoding: {encoding}"),
+            };
+            // Write a byte at a time to exercise magic detection across short pipe reads.
+            let mut writer = std::fs::File::create(fifo).unwrap();
+            for byte in bytes {
+                writer.write_all(&[byte]).unwrap();
+            }
+        } else {
+            let (regions, identity) = RegionSet::from_bed_with_identity("r", fifo).unwrap();
+            assert!(identity.is_none());
+            assert!(regions.contains("chr1", 0, 5));
+            assert!(regions.contains("chr2", 1, 9));
+            assert_eq!(regions.digest().unwrap().intervals, 2);
+        }
+        crate::testing::child_body_ran();
+    }
+
+    /// The model records the digest of a region BED every table records alike; tables of
+    /// different BEDs under one name are an error; a table recording none leaves the model with
+    /// none for it.
+    #[test]
+    fn training_tables_record_their_region_beds() {
+        let digest = |sha: &str| RegionDigest { sha256: sha.repeat(64), intervals: 1, bases: 10 };
+        let table = |sha: Option<&str>| -> BTreeMap<String, RegionDigest> {
+            sha.map(|sha| ("segdups".to_string(), digest(sha))).into_iter().collect()
+        };
+        let names = ["segdups".to_string()];
+        let (a, b, none) = (table(Some("a")), table(Some("b")), table(None));
+        let recorded = training_region_digests(&[("S1", &a), ("S2", &a)], &names).unwrap();
+        assert_eq!(recorded, a);
+        let error =
+            training_region_digests(&[("S1", &a), ("S2", &b)], &names).unwrap_err().to_string();
+        assert!(
+            error.starts_with("--tables were extracted with different segdups region BEDs: S1's"),
+            "{error}"
+        );
+        assert!(training_region_digests(&[("S1", &a), ("S2", &none)], &names).unwrap().is_empty());
+    }
+
+    /// The digest of a fixed set, pinned from its documented text (`contig\tstart\tend\n`, contigs
+    /// in byte order, so chr10 before chr2): `printf 'chr10\t5\t9\nchr2\t0\t10\n' | shasum -a 256`.
+    #[test]
+    fn the_digest_is_pinned() {
+        let regions = RegionSet::from_spans("r", [("chr2", 0, 10), ("chr10", 5, 9)]);
+        assert_eq!(
+            regions.digest().unwrap(),
+            RegionDigest {
+                sha256: "5bdf8bf362be78c97c561c873d3c9acec5434ed0d3902944d5c45e844b505dcc"
+                    .to_string(),
+                intervals: 2,
+                bases: 14,
+            }
+        );
+    }
+
+    #[rstest]
+    fn digest_preserves_totals_through_u64_max(#[values(0, 1)] extra: u64) {
+        let dir = TempDir::new().unwrap();
+        let contents = format!("chr1\t0\t{0}\nchr2\t0\t{0}\nchr3\t0\t{extra}\n", i64::MAX);
+        let path = dir.path().join("huge.bed");
+        std::fs::write(&path, contents).unwrap();
+        let digest = RegionSet::from_bed("huge", &path).unwrap().digest().unwrap();
+        assert_eq!(digest.bases, u64::MAX - 1 + extra);
+        assert_eq!(digest.intervals, 2 + extra);
+        // The persisted format remains a u64, including its largest possible value.
+        let encoded = serde_json::to_string(&digest).unwrap();
+        let decoded: RegionDigest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.bases, digest.bases);
+    }
+
+    #[test]
+    fn digest_overflow_names_the_bed_or_in_memory_set() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overflow.bed");
+        std::fs::write(&path, format!("chr1\t0\t{0}\nchr2\t0\t{0}\nchr3\t0\t2\n", i64::MAX))
+            .unwrap();
+        let error = RegionSet::from_bed("huge", &path).unwrap().digest().unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("u64::MAX"), "{error}");
+        let regions = RegionSet::from_spans("in-memory", [("chr1", 0, u64::MAX), ("chr2", 0, 1)]);
+        let error = regions.digest().unwrap_err().to_string();
+        assert!(error.contains("in-memory") && error.contains("u64::MAX"), "{error}");
+    }
+
+    /// A digest read back must have a SHA-256 of 64 lower-case hexadecimal digits.
+    #[test]
+    fn a_malformed_digest_is_not_read() {
+        let good = r#"{"sha256":"5bdf8bf362be78c97c561c873d3c9acec5434ed0d3902944d5c45e844b505dcc","intervals":2,"bases":14}"#;
+        assert!(serde_json::from_str::<RegionDigest>(good).is_ok());
+        for bad in ["abc", "5BDF8BF362BE78C97C561C873D3C9ACEC5434ED0D3902944D5C45E844B505DCC"] {
+            let json = format!(r#"{{"sha256":"{bad}","intervals":2,"bases":14}}"#);
+            let error = serde_json::from_str::<RegionDigest>(&json).unwrap_err().to_string();
+            assert!(
+                error.starts_with("sha256 must be 64 lower-case hexadecimal digits"),
+                "{error}"
+            );
+        }
+        // Display does not panic on a short digest.
+        let short = RegionDigest { sha256: "ab".to_string(), intervals: 1, bases: 1 };
+        assert_eq!(short.to_string(), "1 intervals covering 1 bases (sha256 ab)");
+    }
+
+    /// The digest is of the merged intervals: the same however the BED is compressed, ordered,
+    /// split or ended, and different for any other interval.
+    #[test]
+    fn the_digest_is_of_the_intervals() {
+        let lines = ["chr1\t10\t20", "chr1\t30\t40", "chr2\t0\t5"];
+        let digest = digest_of(&lines, Encoding::Plain);
+        assert_eq!((digest.intervals, digest.bases), (3, 25));
+        assert_eq!(digest.sha256.len(), 64);
+        let same: [&[&str]; 5] = [
+            &["chr2\t0\t5", "chr1\t30\t40", "chr1\t10\t20"],
+            &["#header", "chr1\t10\t20", "chr1\t30\t40", "chr2\t0\t5"],
+            &["chr1\t10\t15", "chr1\t15\t20", "chr1\t30\t40", "chr2\t0\t5"],
+            &["chr1\t10\t20\r", "chr1\t30\t40\r", "chr2\t0\t5\r"],
+            &["chr1\t10\t20", "chr1\t30\t40", "chr2\t0\t5", "chr3\t7\t7"],
+        ];
+        for lines in same {
+            assert_eq!(digest_of(lines, Encoding::Plain), digest, "{lines:?}");
+        }
+        assert_eq!(digest_of(&lines, Encoding::Gzip), digest);
+        assert_eq!(digest_of(&lines, Encoding::MultiMember), digest);
+        let other: [&[&str]; 3] = [
+            &["chr1\t10\t21", "chr1\t30\t40", "chr2\t0\t5"],
+            &["chr1\t10\t20", "chr1\t30\t40", "chrX\t0\t5"],
+            &["chr1\t10\t20", "chr1\t30\t40", "chr2\t0\t5", "chr2\t9\t10"],
+        ];
+        for lines in other {
+            assert_ne!(digest_of(lines, Encoding::Plain).sha256, digest.sha256, "{lines:?}");
+        }
+        // An empty set has a defined digest: of no text.
+        let empty = RegionSet::from_spans("e", Vec::<(&str, u64, u64)>::new()).digest().unwrap();
+        assert_eq!(
+            empty,
+            RegionDigest {
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                intervals: 0,
+                bases: 0
+            }
+        );
+        assert_eq!(
+            digest.to_string(),
+            format!("3 intervals covering 25 bases (sha256 {})", &digest.sha256[..12])
+        );
     }
 
     fn read_bed(lines: &[&str]) -> RegionSet {

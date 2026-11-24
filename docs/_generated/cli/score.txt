@@ -47,7 +47,9 @@ Options:
           Region BEDs as NAME=PATH, with the names the models were trained with, plus the
           not-difficult regions as notinalldifficultregions=PATH (GIAB's GRCh38 genome
           stratification; outside them, indel calls are dropped at --outside-indel-t-drop in place
-          of the model's threshold)
+          of the model's threshold). A region not given is found beside the models, as
+          regions/NAME.bed.gz, regions/NAME.bed.bgz or regions/NAME.bed. Each BED used is checked
+          against the digest the models record (see --allow-region-mismatch)
 
       --mode <MODE>
           How genotype models act: genotyper (drop, flip and re-genotype) or veto (drop only)
@@ -122,6 +124,11 @@ Options:
           Fail when the reads were not aligned as the models' training reads were, when the models
           disagree on it, or when the models record it and the reads' is not known; without it,
           these are warnings. Models that record no alignment provenance are not checked
+
+      --allow-region-mismatch
+          Use a region BED (given or found beside the models) whose digest is not the one the models
+          record, with a warning, rather than failing. Models that record different digests of one
+          region are still an error: no BED is the one all of them were trained with
 
   -h, --help
           Print help (see a summary with '-h')

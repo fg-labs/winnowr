@@ -5,6 +5,15 @@ re-genotypes. See [Scoring](../user-guide/scoring.md). The models' feature sourc
 whether `--gvcf` is read, and whether `--alignments` is needed (see
 [Feature sources](../user-guide/feature-sources.md)).
 
+Without `--regions`, the region BEDs are found beside the models (`regions/NAME.bed.gz`,
+`.bed.bgz` or `.bed`), and each BED used is checked against the digest the models record: see
+[Scoring](../user-guide/scoring.md).
+
+```console
+winnowr score --vcf sample.vcf.gz --gvcf sample.g.vcf.gz \
+  --models models/snp.winnowr.json models/indel.winnowr.json -o sample.winnowr.vcf.gz
+```
+
 Models that record how their training reads were aligned are compared with how the reads were
 aligned (the header of `--alignments` and the `--strlen` and `--pileup` tables, with
 `--alignment-tags` applied over each, which must then agree): a difference is a warning, and with
