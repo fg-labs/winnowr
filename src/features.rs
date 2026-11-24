@@ -111,8 +111,8 @@ pub fn strand_odds_ratio(ref_fwd: f64, ref_rev: f64, alt_fwd: f64, alt_rev: f64)
     (ratio + 1.0 / ratio).ln() + ref_ratio.ln() - alt_ratio.ln()
 }
 
-/// The depth `dp_norm` divides each call's RAW_MQandDP depth by (see [`derive_features`]), as a
-/// feature table records it for provenance.
+/// The depth `dp_norm` divides each call's depth by (see [`derive_features`]), as a feature table
+/// records it for provenance.
 ///
 /// Equality compares `depth` bit for bit (the type is `Eq` so that the table metadata holding it
 /// can be); recorded depths are finite, so this is ordinary equality on them.
@@ -148,7 +148,8 @@ impl Eq for DpNormDivisor {}
 pub struct DerivedFeatures {
     /// AD of the first non-`*` alternate over AD\[0\] plus it (NaN if the total is not positive).
     pub ab: Vec<f64>,
-    /// GATK's StrandOddsRatio (see [`strand_odds_ratio`]).
+    /// GATK's StrandOddsRatio of FORMAT/SB (see [`strand_odds_ratio`]), or else the record's
+    /// [`crate::gvcf::RawAnnotation::sor`] (INFO/SOR, for the VCF feature source only).
     pub sor: Vec<f64>,
     /// 1 if the genotype is `0/1`, else 0.
     pub het: Vec<f64>,
@@ -182,14 +183,18 @@ pub struct DerivedFeatures {
 
 /// Derives the model features of raw records.
 ///
+/// The raw annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) are those of the records'
+/// feature source: a reblocked gVCF's, or the stand-ins that [`crate::vcf_source`] derives from a
+/// standard VCF (where the RAW_MQandDP depth is INFO/DP, and `mq` is INFO/MQ). The features of the
+/// two sources are computed alike.
+///
 /// The REF span of a record is `[pos - 1, pos - 1 + len(REF))` (0-based, half-open), so a
 /// deletion overlaps a region through its deleted bases.
 ///
 /// `dp_median` is the depth `dp_norm` divides by in place of the median RAW_MQandDP depth of
-/// `records` (e.g. for calls of only a target footprint, whose median is not the genome-wide one).
-/// It must pass [`check_dp_median`] (callers check it; debug builds assert it). The divisor, and
-/// with a given one the records' own median, is logged, and returned as
-/// [`DerivedFeatures::dp_norm_divisor`].
+/// `records` (e.g. for calls of only a target footprint, whose median is not the genome-wide one). It must pass [`check_dp_median`] (callers check it;
+/// debug builds assert it). The divisor, and with a given one the records' own median, is logged,
+/// and returned as [`DerivedFeatures::dp_norm_divisor`].
 #[must_use]
 pub fn derive_features(
     records: &[RawRecord],
@@ -230,7 +235,11 @@ pub fn derive_features(
         }
     };
     let mut derived = DerivedFeatures {
-        sor: column(&|r| strand_odds_ratio(r.sb_ref_fwd, r.sb_ref_rev, r.sb_alt_fwd, r.sb_alt_rev)),
+        sor: column(&|r| {
+            let from_sb = strand_odds_ratio(r.sb_ref_fwd, r.sb_ref_rev, r.sb_alt_fwd, r.sb_alt_rev);
+            // Only the VCF feature source sets a fallback (INFO/SOR); FORMAT/SB is preferred.
+            if from_sb.is_nan() { r.raw.sor } else { from_sb }
+        }),
         het: column(&|r| f64::from(u8::from(r.genotype == Genotype::HET))),
         flippable: records.par_iter().map(|r| r.genotype.is_flippable()).collect(),
         mq: column(&|r| (r.raw.raw_mq / positive_or_nan(r.raw.raw_dp)).sqrt()),
@@ -319,7 +328,6 @@ fn median<I: IntoIterator<Item = f64>>(values: I) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use rstest::rstest;
 
@@ -329,33 +337,8 @@ mod tests {
     /// A record with every numeric value missing, and the given keys.
     fn record(chrom: &str, pos: u64, reference: &str, alts: &[&str], filter: &str) -> RawRecord {
         RawRecord {
-            chrom: Arc::from(chrom),
-            pos,
-            reference: reference.as_bytes().to_vec(),
-            alts: alts.iter().map(|alt| alt.as_bytes().to_vec()).collect(),
             filter: filter.to_string(),
-            variant_type: VariantType::Snp,
-            genotype: Genotype::HET,
-            qual: f64::NAN,
-            dp: f64::NAN,
-            mq_rank_sum: f64::NAN,
-            read_pos_rank_sum: f64::NAN,
-            base_q_rank_sum: f64::NAN,
-            str_period: f64::NAN,
-            str_repeats: f64::NAN,
-            gq: f64::NAN,
-            ad_ref: f64::NAN,
-            ad_alt: f64::NAN,
-            sb_ref_fwd: f64::NAN,
-            sb_ref_rev: f64::NAN,
-            sb_alt_fwd: f64::NAN,
-            sb_alt_rev: f64::NAN,
-            excess_het: f64::NAN,
-            pl_ref: f64::NAN,
-            pl_het: f64::NAN,
-            pl_hom: f64::NAN,
-            ad_alt_total: f64::NAN,
-            raw: RawAnnotation::MISSING,
+            ..crate::testing::raw_record_with_missing_values(chrom, pos, reference, alts)
         }
     }
 
@@ -417,6 +400,7 @@ mod tests {
             as_mq_ref: 30.0,
             as_mq_alt: 10.0,
             n_alt: 1.0,
+            sor: f64::NAN,
         };
         let mut deletion = record("chr1", 200, "ACG", &["*", "A"], "LowQual");
         deletion.genotype = Genotype::HOM_ALT;

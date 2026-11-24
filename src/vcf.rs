@@ -223,6 +223,17 @@ pub fn has_format(header: &HeaderView, tag: &[u8]) -> bool {
     header.format_type(tag).is_ok()
 }
 
+/// True if the header declares `tag` as an INFO field (`is_info`) or else a FORMAT field.
+pub fn has_field(header: &HeaderView, tag: &[u8], is_info: bool) -> bool {
+    if is_info { has_info(header, tag) } else { has_format(header, tag) }
+}
+
+/// A field's name, as `INFO/MQ` or `FORMAT/AD`.
+#[must_use]
+pub fn field_name(tag: &str, is_info: bool) -> String {
+    format!("{}/{tag}", if is_info { "INFO" } else { "FORMAT" })
+}
+
 /// The structured lines of a VCF header (see [`HeaderView::header_records`]).
 ///
 /// rust-htslib panics on a header line that is not UTF-8 (e.g. a Latin-1 character in a

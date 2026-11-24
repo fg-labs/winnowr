@@ -19,13 +19,18 @@ repeat-length or pileup features need `--strlen` or `--pileup` tables, or `--ali
 `--reference` to measure the reads while scoring (see
 [Repeat-length features](repeat-length.md) and [Pileup features](pileup.md)).
 
-The depth feature (`dp_norm`) is each call's RAW_MQandDP depth over the median of that depth across
-the calls on the models' contigs, which `score` logs. For a VCF of only part of the genome, e.g. a
-target footprint, that median is skewed; `--dp-median` gives the depth to divide by instead (at
-least 1): the median RAW_MQandDP depth of the sample's whole-genome calls, as `extract` or `score`
-logs it, not coverage from another tool. Normalize as the models' training tables were: nothing
-records or checks the depth used, so a footprint VCF scored without `--dp-median` with models
-trained on whole-genome tables (or the reverse) is silently on a different depth scale.
+The models given to one run must share a feature source, which decides where the features of
+gVCF-mode annotations come from: models trained on `extract --feature-source vcf` tables need no
+`--gvcf`. See [Feature sources](feature-sources.md).
+
+The depth feature (`dp_norm`) is each call's RAW_MQandDP depth (for models of the `vcf` feature
+source, see [Feature sources](feature-sources.md)) over the median of that depth across the calls
+on the models' contigs, which `score` logs. For a VCF of only part of the genome, e.g. a target
+footprint, that median is skewed; `--dp-median` gives the depth to divide by instead (at least 1):
+the median depth of the sample's whole-genome calls, as `extract` or `score` logs it, not coverage
+from another tool. Normalize as the models' training tables were: nothing records or checks the
+depth used, so a footprint VCF scored without `--dp-median` with models trained on whole-genome
+tables (or the reverse) is silently on a different depth scale.
 
 ## Modes
 

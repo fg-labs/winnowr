@@ -32,6 +32,14 @@ pub const RAW_FIELDS: &str = "\
 ##INFO=<ID=AS_RAW_MQ,Number=1,Type=String,Description=\"Allele-specific raw MQ\">
 ";
 
+/// The INFO and FORMAT declarations that a VCF from HaplotypeCaller's default (non-gVCF) mode, or
+/// from GenotypeGVCFs, adds to [`CALL_FIELDS`], and that the VCF feature source reads.
+pub const DEFAULT_MODE_FIELDS: &str = "\
+##INFO=<ID=MQ,Number=1,Type=Float,Description=\"RMS mapping quality\">
+##INFO=<ID=SOR,Number=1,Type=Float,Description=\"Strand odds ratio\">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read depth\">
+";
+
 /// A complete VCF header with contigs `chr1` and `chr2`, the given field declarations, and the
 /// given samples.
 pub fn vcf_header(fields: &[&str], samples: &[&str]) -> String {
@@ -175,17 +183,49 @@ pub fn call_table(rows: &[CallRow<'_>]) -> crate::table::FeatureTable {
     let info = crate::table::FeatureTableInfo {
         sample: "S1".to_string(),
         contigs: vec!["chr1".to_string()],
-        region_names: vec![],
-        fn_counts: None,
-        promote_labelled: false,
-        strlen: false,
-        strlen_settings: None,
-        pileup_settings: None,
-        reference_contigs: None,
-        dp_norm_divisor: None,
-        restricted_to: None,
+        ..crate::table::FeatureTableInfo::default()
     };
     crate::table::FeatureTable::new(batch, info)
+}
+
+/// A het SNP-typed PASS record of the given keys with every numeric value missing (NaN), and no
+/// raw annotations.
+pub fn raw_record_with_missing_values(
+    chrom: &str,
+    pos: u64,
+    reference: &str,
+    alts: &[&str],
+) -> crate::raw_records::RawRecord {
+    let nan = f64::NAN;
+    crate::raw_records::RawRecord {
+        chrom: std::sync::Arc::from(chrom),
+        pos,
+        reference: reference.as_bytes().to_vec(),
+        alts: alts.iter().map(|alt| alt.as_bytes().to_vec()).collect(),
+        filter: crate::common::PASS.to_string(),
+        variant_type: crate::common::VariantType::Snp,
+        genotype: crate::alleles::Genotype::HET,
+        qual: nan,
+        dp: nan,
+        mq_rank_sum: nan,
+        read_pos_rank_sum: nan,
+        base_q_rank_sum: nan,
+        str_period: nan,
+        str_repeats: nan,
+        gq: nan,
+        ad_ref: nan,
+        ad_alt: nan,
+        sb_ref_fwd: nan,
+        sb_ref_rev: nan,
+        sb_alt_fwd: nan,
+        sb_alt_rev: nan,
+        excess_het: nan,
+        pl_ref: nan,
+        pl_het: nan,
+        pl_hom: nan,
+        ad_alt_total: nan,
+        raw: crate::gvcf::RawAnnotation::MISSING,
+    }
 }
 
 /// The probability a [`separable_model`] gives the class its feature `x` names, at least.
@@ -258,6 +298,7 @@ pub fn separable_model_of(
         pileup_settings: crate::pileup_features::PILEUP_FEATURES
             .contains(&feature)
             .then(crate::pileup::PileupOptions::default),
+        feature_source: crate::feature_source::FeatureSource::Gvcf,
         winnowr_version: env!("CARGO_PKG_VERSION").to_string(),
         xgboost_version: "test".to_string(),
     };

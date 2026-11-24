@@ -10,7 +10,7 @@ use crate::labels::{HappyPassOnly, attach_labels, check_label_join, read_happy_l
 use crate::pileup::PileupTables;
 use crate::pileup_features::add_pileup_features;
 use crate::promote_labels::{attach_promote_labels, read_truth_variants};
-use crate::raw_records::extract_raw_records;
+use crate::raw_records::{AnnotationInputs, extract_raw_records};
 use crate::regions::RegionSet;
 use crate::repeat_features::add_strlen_features;
 use crate::strlen::StrlenTables;
@@ -56,9 +56,9 @@ impl TruthInputs<'_> {
 /// The inputs of a feature table besides the calls.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TableInputs<'a> {
-    /// The indexed gVCF the VCF was genotyped from, read only when the VCF lacks the raw
-    /// annotations.
-    pub gvcf: Option<&'a Path>,
+    /// Where the raw annotations come from (the feature source the table records): by default
+    /// the VCF's own, with no gVCF.
+    pub annotations: AnnotationInputs<'a>,
     /// The region sets to flag.
     pub regions: &'a [RegionSet],
     /// Repeat-tract evidence (see [`crate::strlen`]) to join as repeat-length features.
@@ -81,7 +81,8 @@ pub struct TableInputs<'a> {
 /// * `vcf` - the indexed single-sample VCF.
 /// * `contigs` - the contigs to extract, in order.
 /// * `summary` - the VCF's header summary, for the contig lengths recorded in the metadata.
-/// * `inputs` - the gVCF, region sets, strlen and pileup evidence, and truth inputs.
+/// * `inputs` - the raw annotations' inputs, region sets, strlen and pileup evidence, and truth
+///   inputs.
 ///
 /// # Errors
 ///
@@ -105,7 +106,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
         region_set.check_contigs(contigs)?;
     }
     let mut timer = PhaseTimer::start();
-    let records = extract_raw_records(vcf, inputs.gvcf, contigs)?;
+    let records = extract_raw_records(vcf, inputs.annotations, contigs)?;
     timer.lap("reading the calls");
     let labels = inputs.truth.happy.map(|happy| read_happy_labels(happy, contigs)).transpose()?;
     if labels.is_some() {
@@ -125,6 +126,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
         reference_contigs: Some(summary.lengths_of(contigs)),
         dp_norm_divisor: Some(derived.dp_norm_divisor),
         restricted_to: None,
+        feature_source: inputs.annotations.feature_source(),
     };
     let mut table = FeatureTable::from_records(&records, derived, info)?;
     drop(records);
