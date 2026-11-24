@@ -16,8 +16,9 @@ env:
   CARGO_INCREMENTAL: 0
 
 # The Rust toolchain comes from rust-toolchain.toml (`rustup toolchain install` with no name
-# installs it), so the version is written in one place. Jobs that compile use sccache and set
-# RUSTC_WRAPPER themselves, next to the step that installs it.
+# installs it), so the version is written in one place. Jobs that compile use sccache through
+# ./.github/actions/setup-sccache, which sets RUSTC_WRAPPER and SCCACHE_GHA_ENABLED only once its
+# server starts; do not set them here or in a job or step `env:` (see that action).
 
 jobs:
   # Tests run natively on every release target: XGBoost (with static OpenMP) is built from C++
@@ -29,9 +30,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15]
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,7 +47,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        uses: ./.github/actions/setup-sccache
       - name: Install nextest
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
@@ -74,9 +72,6 @@ jobs:
   # libc++ that must not replace the system's.
   macos-shared-libomp:
     runs-on: macos-15
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,7 +97,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        uses: ./.github/actions/setup-sccache
       - name: Tests
         run: cargo test --locked --workspace
       # Outside cargo, which puts its build directories on the dyld fallback path: every binary
@@ -190,9 +185,6 @@ jobs:
 
   lint:
     runs-on: ubuntu-22.04
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -204,7 +196,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        uses: ./.github/actions/setup-sccache
       - name: Clippy check
         run: cargo ci-lint
 
@@ -219,6 +211,8 @@ jobs:
         run: rustup toolchain install
       - name: Rustfmt check
         run: cargo ci-fmt
+      - name: sccache setup fallback check
+        run: bash .github/actions/setup-sccache/test-start-server.sh
       # docs/Dockerfile.bookworm names the Rust version twice (its base image tag and
       # RUSTUP_TOOLCHAIN); both must be rust-toolchain.toml's channel. The image's digest is not
       # checked (see docs/DEVELOPING.md).
@@ -239,9 +233,6 @@ jobs:
   # Catches unresolved intra-doc links, which neither `cargo build` nor clippy reports.
   docs:
     runs-on: ubuntu-22.04
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -253,7 +244,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        uses: ./.github/actions/setup-sccache
       - name: Rustdoc check
         run: cargo ci-doc
       # docs.rs sets DOCS_RS, so winnowr-xgboost's build script skips XGBoost: check that the
@@ -268,9 +259,6 @@ jobs:
   # winnowr against the packaged winnowr-xgboost.
   package:
     runs-on: ubuntu-22.04
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -282,7 +270,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        uses: ./.github/actions/setup-sccache
       # Cargo only warns when a target's file is left out of a package (e.g. a test missing from a
       # crate's include list), so the warning fails the job.
       - name: Package and build both crates
