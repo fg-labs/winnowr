@@ -7,7 +7,9 @@ Usage: winnowr train [OPTIONS] --tables <TABLES>... --variant-type <VARIANT_TYPE
 
 Options:
   -t, --threads <THREADS>
-          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+          The number of threads to use in all, including htslib's compression and decompression (but
+          not htslib's I/O thread per file, which mostly waits on the disk) [default:
+          OMP_NUM_THREADS when set, else 4]
 
       --tables <TABLES>...
           Labelled feature tables (from `extract --happy`), one per training sample: at least two,

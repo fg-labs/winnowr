@@ -6,7 +6,9 @@ whether `--gvcf` is read, and whether `--alignments` is needed (see
 [Feature sources](../user-guide/feature-sources.md)).
 
 Without `--regions`, the region BEDs are found beside the models (`regions/NAME.bed.gz`,
-`.bed.bgz` or `.bed`), and each BED used is checked against the digest the models record: see
+`.bed.bgz` or `.bed`), and each BED used is checked against its recorded digest when available.
+Feature-region BEDs without an applicable recorded digest are used unchecked with a warning.
+Policy-only BEDs without a policy digest remain unchecked without that warning: see
 [Scoring](../user-guide/scoring.md).
 
 ```console
@@ -23,6 +25,11 @@ See [Alignment provenance](../user-guide/alignment-provenance.md).
 Regular evidence files are inspected before their rows are loaded, and each loaded file is checked against that effective provenance snapshot. Required FIFO or process-substitution inputs are opened only for their row read; their declarations contribute to the final model check before any calls are scored. An unknown-provenance error waits for a required stream that can supply it, but unrelated model checks still run early. Explicitly supplied regular sources can supply provenance even when no model needs their rows. If every model is legacy and records no provenance, otherwise unused sources are not inspected and required evidence skips provenance parsing and agreement while still validating its settings, column headers and rows.
 
 Incomplete alignment-option inference produces a warning, or an error with `--strict-provenance`, on either the models or the scoring reads, even when both record the same incomplete marker. Supply the intended read settings with `--alignment-tags` and `options-inference=explicit` to assert them; this is a user declaration, not recovery of the original arguments. Models carrying incomplete provenance must be regenerated from explicitly declared training provenance. Unrelated tag overrides do not resolve uncertainty. A comparison with no comparable tags is reported as such, not as agreement, and does not itself introduce a strict-mode error.
+
+`-t` is the total thread count, `--alignments` included: set it to the number of cores `score` may
+use (e.g. the CPU count). With `--alignments`, the reads are measured while the models that do not
+need them score, within `-t` threads; `-t 1` measures the reads, then scores. See
+[Performance tuning](../user-guide/performance.md#threads).
 
 ## Usage
 

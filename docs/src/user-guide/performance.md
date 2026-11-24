@@ -6,9 +6,20 @@ Every command runs on the number of threads given by `-t`; without `-t`, on `OMP
 it is set (its first value, when it lists several), else on 4. An `OMP_NUM_THREADS`
 that is not a positive number is ignored, with a warning.
 
-- Give `-t` at most the cores that are free. `score --alignments` measures the reads with `-t`
-  threads while the models that do not need them score with another `-t`, so it runs up to twice
-  `-t` threads.
+- Give `-t` at most the cores that are free: every command, `score --alignments` included, runs
+  within `-t` threads in all. `score --alignments` measures the reads while the models that do not
+  need them score, the two sharing the `-t` threads: a thread free of one takes up work of the
+  other, a stretch of the reads or a chunk of a model's calls at a time. With `-t 1`, or when
+  every model needs the reads, it measures the reads first, then scores. How long measuring the
+  reads took, and, when the two overlapped, how long scoring the models that do not need them
+  took, is logged at info level. `score` writes and indexes its VCF within `-t` threads too:
+  htslib's compression and decompression threads are counted in them (apart from an I/O thread
+  per file, which mostly waits on the disk).
+- Measured on a 16-core machine (an AWS c7a.4xlarge), `score --alignments` on a 30x whole-genome
+  CRAM with four models (two of them needing the reads) took 554 s with `-t 1`, 287 s with `-t 2`,
+  149 s with `-t 4`, 83 s with `-t 8` and 51 s with `-t 16`. The total CPU time stays about the
+  same at every `-t`; what keeps `-t 16` from being 16 times faster is about 13 s of setup,
+  deciding and writing that runs on few threads.
 - Training runs thousands of short parallel steps per tree, and loses far more from threads that
   wait for a core than it gains from extra threads. Past about 8-16 threads, more threads gain
   little.

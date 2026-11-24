@@ -22,7 +22,9 @@ Options:
           The model files: at most one genotype and one promote model per variant type
 
   -t, --threads <THREADS>
-          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+          The number of threads to use in all, including htslib's compression and decompression (but
+          not htslib's I/O thread per file, which mostly waits on the disk) [default:
+          OMP_NUM_THREADS when set, else 4]
 
       --truth-names <FIRST> <SECOND>
           The names of the two truth sets (e.g. v421 v5q), in the order of the options below

@@ -10,7 +10,9 @@ Usage: winnowr subset [OPTIONS] --table <TABLE> --happy <HAPPY> --output <OUTPUT
 
 Options:
   -t, --threads <THREADS>
-          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+          The number of threads to use in all, including htslib's compression and decompression (but
+          not htslib's I/O thread per file, which mostly waits on the disk) [default:
+          OMP_NUM_THREADS when set, else 4]
 
       --table <TABLE>
           The labelled feature table (from `extract --happy`)

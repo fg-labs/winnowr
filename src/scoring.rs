@@ -124,7 +124,9 @@ impl Applied {
 ///   tabix-indexed VCF, anything else plain-text VCF (with a warning unless it ends in `.vcf`);
 ///   suffixes match in any case.
 /// * `decisions` - the decisions by call (see [`crate::policy::decide_calls`]).
-/// * `threads` - the extra htslib threads for decompressing the input and compressing the output.
+/// * `threads` - the threads in all, the calling thread's included: the parallel write's rayon
+///   pool (see [`write_sharded`]), or the calling thread and htslib's workers for reading and
+///   writing (see [`htslib_workers`]) and indexing.
 /// * `protected_beds` - the identities of the regular region BEDs consumed: the output, and its
 ///   index, are checked not to be one of them on the handle opened, before it is truncated (see
 ///   [`crate::io::create_output`]).
@@ -205,7 +207,9 @@ pub fn write_scored_vcf(
                 drop(crate::io::create_output(&output_index, protected_beds)?);
             }
         }
-        index::build(output, None, 1, index_type)
+        // htslib's workers are in addition to the calling thread.
+        let workers = u32::try_from(threads.get() - 1).unwrap_or(u32::MAX);
+        index::build(output, None, workers, index_type)
             .map_err(|e| anyhow::anyhow!("failed to index {}: {e}", output.display()))?;
     }
     if applied.duplicates > 0 {
@@ -303,7 +307,10 @@ fn write_serial(
 ) -> Result<(Applied, usize)> {
     let mut reader =
         Reader::from_path(vcf).with_context(|| format!("failed to open {}", vcf.display()))?;
-    reader.set_threads(threads.get()).context("failed to set the htslib threads")?;
+    let (reading, writing) = htslib_workers(threads, !uncompressed);
+    if reading > 0 {
+        reader.set_threads(reading).context("failed to set the htslib threads")?;
+    }
     let header = scored_header(reader.header());
     // htslib opens what it writes by path: give it the checked handle's descriptor, so a path
     // redirected after the check cannot point it at a consumed BED.
@@ -315,8 +322,8 @@ fn write_serial(
     let target = checked.as_ref().map_or_else(|| output.to_path_buf(), checked_handle_path);
     let mut writer = Writer::from_path(&target, &header, uncompressed, format)
         .with_context(|| format!("failed to create {}", output.display()))?;
-    if !uncompressed {
-        writer.set_threads(threads.get()).context("failed to set the htslib threads")?;
+    if writing > 0 {
+        writer.set_threads(writing).context("failed to set the htslib threads")?;
     }
     let tags = AlleleTags::from_header(writer.header(), vcf)?;
     let mut applied_keys: HashSet<CallKey> = HashSet::new();
@@ -346,6 +353,27 @@ fn write_serial(
 fn checked_handle_path(file: &std::fs::File) -> PathBuf {
     use std::os::fd::AsRawFd;
     PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
+}
+
+/// The htslib worker threads for reading the input and for writing the output, within `threads`
+/// in all: htslib's workers are in addition to the calling thread, so the two get the other
+/// threads (none with one thread). The writer, whose compression is the most work, gets three
+/// quarters of them (all but the reader's quarter, rounded down), and the reader the rest; with
+/// an uncompressed output, the reader gets them all.
+///
+/// (htslib also runs an I/O thread for a file with workers, which mostly waits on reads and
+/// writes.)
+fn htslib_workers(threads: NonZeroUsize, compressed_output: bool) -> (usize, usize) {
+    let workers = threads.get() - 1;
+    if !compressed_output {
+        return (workers, 0);
+    }
+    // Only the serial write (a BCF or uncompressed output, or an input that cannot be read by
+    // region) reads and writes with htslib's workers. Within the strict budget, below 5 threads
+    // a compressed output's writer takes every worker and the reader none: compressing costs
+    // several times what decompressing does, so a worker is worth more to the writer.
+    let reading = workers / 4;
+    (reading, workers - reading)
 }
 
 /// The span of the shards a scored VCF is written in, in parallel.
@@ -1680,6 +1708,28 @@ mod tests {
         write_scored_vcf(&plain, &dir.path().join("plain.vcf.csi"), HashMap::new(), THREADS, &[])
             .unwrap();
         assert_eq!(std::fs::read(&plain).unwrap(), before);
+    }
+
+    /// htslib's workers are within the threads, the calling thread's included, mostly writing.
+    #[test]
+    fn htslib_workers_are_within_the_threads() {
+        let workers = |threads: usize, compressed: bool| {
+            htslib_workers(NonZeroUsize::new(threads).unwrap(), compressed)
+        };
+        assert_eq!(workers(1, true), (0, 0));
+        assert_eq!(workers(1, false), (0, 0));
+        assert_eq!(workers(2, true), (0, 1));
+        assert_eq!(workers(2, false), (1, 0));
+        assert_eq!(workers(5, true), (1, 3));
+        assert_eq!(workers(16, true), (3, 12));
+        assert_eq!(workers(16, false), (15, 0));
+        for threads in 1..=64 {
+            for compressed in [false, true] {
+                let (reading, writing) = workers(threads, compressed);
+                assert_eq!(reading + writing + 1, threads);
+                assert!(compressed || writing == 0);
+            }
+        }
     }
 
     #[test]

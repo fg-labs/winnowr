@@ -7,7 +7,13 @@
 //! Every booster is given an explicit thread count, which bounds the OpenMP threads XGBoost uses
 //! for training and prediction (XGBoost's own default is every core). The bound is per call: a
 //! caller that predicts from several threads at once (e.g. rayon workers, each with its own
-//! booster) uses up to their sum, so it should divide its thread budget between them.
+//! booster, or sharing one through [`Booster::shared_predictor`]) uses up to their sum, so it
+//! should divide its thread budget between them.
+//!
+//! A [`Booster`] is used from one thread at a time, except that a tree booster can predict from
+//! several at once through a [`SharedPredictor`]. XGBoost returns its outputs (predictions,
+//! strings, error messages) in buffers of the calling thread, valid until that thread's next
+//! XGBoost call; each is copied before then.
 //!
 //! ```
 //! use std::num::NonZeroUsize;
@@ -1080,8 +1086,51 @@ pub struct Booster {
 }
 
 // SAFETY: a Booster handle is owned exclusively by this value and is not tied to the creating
-// thread. It is not `Sync`: prediction writes into a buffer owned by the booster.
+// thread. It is not `Sync`, as some of XGBoost's calls on it (e.g. setting a parameter) must not
+// run while another is; prediction alone may (see [`SharedPredictor`]).
 unsafe impl Send for Booster {}
+
+/// A booster shared between threads to predict with: XGBoost's prediction is thread safe for
+/// tree boosters (`gbtree` and `dart`), each thread's output going to a buffer of its own. While
+/// it is borrowed the booster cannot be trained or have its parameters set. Each prediction uses
+/// the booster's threads (see [`Booster::set_threads`]), so threads predicting at once should
+/// each give it one.
+#[derive(Debug, Clone, Copy)]
+pub struct SharedPredictor<'a>(&'a Booster);
+
+// SAFETY: only `Booster::predict` is reachable through a `SharedPredictor`, and XGBoost documents
+// prediction as thread safe for tree boosters (`doc/prediction.rst`, "Thread Safety"), which
+// `Booster::shared_predictor` checks. `predict` makes these C API calls, each of which may run on
+// several threads at once on one booster:
+// * `XGBoosterGetNumFeature` and `XGBoosterGetStrFeatureInfo` (in `check_features`): the former
+//   reads the feature count; the latter copies the feature names into the calling thread's
+//   buffer (`Learner::GetThreadLocal`, a map from booster to buffers in thread-local storage).
+// * `XGBoosterPredictFromDMatrix`: predicts into the calling thread's buffer, with the prediction
+//   cache locked (`DMatrixCache`).
+// * `XGBoosterSaveJsonConfig` (in `outputs_per_row`, for a matrix of no rows): writes the config
+//   to the calling thread's buffer.
+// Each first calls `Learner::Configure`, which does nothing on a configured booster and otherwise
+// configures it under a lock (`config_lock_`); `shared_predictor` configures it beforehand.
+// Errors go to the calling thread's last-error message (`XGBGetLastError`). Nothing can set a
+// parameter of the booster, or train it, while it is borrowed.
+unsafe impl Sync for SharedPredictor<'_> {}
+
+impl SharedPredictor<'_> {
+    /// The threads each prediction uses (see [`Booster::threads`]).
+    #[must_use]
+    pub fn threads(&self) -> NonZeroUsize {
+        self.0.threads
+    }
+
+    /// Predicts on `data`, as [`Booster::predict`] does; any number of threads may at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error as [`Booster::predict`] does.
+    pub fn predict(&self, data: &DMatrix) -> Result<Prediction> {
+        self.0.predict(data)
+    }
+}
 
 impl Booster {
     /// A new, untrained booster using at most `threads` threads.
@@ -1184,6 +1233,46 @@ impl Booster {
         self.threads
     }
 
+    /// Lets this booster use at most `threads` threads from now on (e.g. to share the threads with
+    /// other work for a while). Its predictions do not change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the count is above what XGBoost takes (`c_int::MAX`), the booster then
+    /// unchanged, or XGBoost rejects it (see [`Booster::set_params`] for the threads then).
+    pub fn set_threads(&mut self, threads: NonZeroUsize) -> Result<()> {
+        self.set_param("nthread", &threads.to_string())
+    }
+
+    /// A handle to predict with from several threads at once (see [`SharedPredictor`]), if this
+    /// is a tree booster (`gbtree` or `dart`); `None` for another (e.g. `gblinear`), whose
+    /// prediction XGBoost does not document as thread safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if XGBoost fails.
+    pub fn shared_predictor(&self) -> Result<Option<SharedPredictor<'_>>> {
+        if !matches!(self.gradient_booster_name()?.as_str(), "gbtree" | "dart") {
+            return Ok(None);
+        }
+        // Configured now, before any thread predicts (XGBoost also locks it).
+        self.num_features()?;
+        Ok(Some(SharedPredictor(self)))
+    }
+
+    /// The name of the booster's kind (e.g. `gbtree`, `gblinear`), as its config records it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if XGBoost fails or its config has no booster name.
+    fn gradient_booster_name(&self) -> Result<String> {
+        let config = self.config()?;
+        let name = &config["learner"]["gradient_booster"]["name"];
+        name.as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::new(format!("the model config has no booster name: {name}")))
+    }
+
     /// Set a training or runtime parameter (e.g. `objective`, `max_depth`, `eta`): a batch of
     /// one (see [`Booster::set_params`]).
     ///
@@ -1202,15 +1291,32 @@ impl Booster {
     /// is an error here; set parameters that depend on each other in one batch. Unknown names
     /// are ignored with a warning.
     ///
+    /// An `nthread` changes the booster's threads, as [`Booster::set_threads`] does, so that
+    /// [`Booster::threads`] stays the count XGBoost uses. It must be a positive count: XGBoost
+    /// takes 0 or less for every thread it can, which [`Booster::threads`] cannot record. Its
+    /// alias `n_jobs` is refused (set `nthread`), leaving one name to track.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a string contains a NUL byte, or XGBoost rejects the parameters.
+    /// Returns an error if a string contains a NUL byte, an `nthread` is not a positive count of at
+    /// most `c_int::MAX` or `n_jobs` is set (the booster unchanged), or XGBoost rejects the parameters (the booster's
+    /// threads are then the larger of its count and the batch's `nthread`, as XGBoost may use
+    /// either).
     pub fn set_params(&mut self, params: &[(&str, &str)]) -> Result<()> {
+        // Checked before XGBoost sees the batch, so a refused count changes nothing.
+        let threads = threads_set_by(params)?;
         let pairs: Vec<[&str; 2]> = params.iter().map(|&(name, value)| [name, value]).collect();
         let config = serde_json::json!({ "params": pairs }).to_string();
         let config = c_string(&config)?;
         // SAFETY: the handle is live and the configuration is NUL-terminated for the call.
-        check(unsafe { ffi::XGBoosterSetParams(self.handle, config.as_ptr()) })
+        let set = check(unsafe { ffi::XGBoosterSetParams(self.handle, config.as_ptr()) });
+        if let Some(threads) = threads {
+            // XGBoost takes up the count before it configures the objective, booster and metrics,
+            // which can then fail: on a failure the booster may use either count, so it counts
+            // the larger.
+            self.threads = if set.is_ok() { threads } else { threads.max(self.threads) };
+        }
+        set
     }
 
     /// Train one boosting round (`iteration`, counting from 0) on `train`, which should have been
@@ -1238,7 +1344,8 @@ impl Booster {
         let mut name_pointers: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
         let mut result = ptr::null();
         // SAFETY: the handles are live, the names are NUL-terminated and outlive the call, and
-        // `result` receives a booster-owned string that is copied before the next call.
+        // `result` receives this thread's string for the booster, copied before the next XGBoost
+        // call on this thread.
         check(unsafe {
             ffi::XGBoosterEvalOneIter(
                 self.handle,
@@ -1277,7 +1384,8 @@ impl Booster {
         let field = c_string("feature_name")?;
         let (mut len, mut names) = (0, ptr::null());
         // SAFETY: the handle is live, `field` is NUL-terminated, and the out-pointers are valid;
-        // the returned strings live in a booster-owned buffer copied before any other call.
+        // the returned strings live in this thread's buffer for the booster, copied below before
+        // the next XGBoost call on this thread.
         check(unsafe {
             ffi::XGBoosterGetStrFeatureInfo(self.handle, field.as_ptr(), &mut len, &mut names)
         })?;
@@ -1320,8 +1428,9 @@ impl Booster {
         )?;
         let (mut shape, mut dims, mut result) = (ptr::null(), 0, ptr::null());
         // SAFETY: both handles are live, `config` is NUL-terminated, and the out-pointers are
-        // valid; the outputs point into a booster-owned buffer that is copied below before any
-        // other call on this booster.
+        // valid; the outputs point into this thread's buffer for the booster, copied below before
+        // the next XGBoost call on this thread (other threads predicting at once have their own;
+        // see `SharedPredictor`).
         check(unsafe {
             ffi::XGBoosterPredictFromDMatrix(
                 self.handle,
@@ -1374,8 +1483,8 @@ impl Booster {
     /// Returns an error if XGBoost fails or returns invalid JSON.
     fn config(&self) -> Result<serde_json::Value> {
         let (mut len, mut data) = (0, ptr::null());
-        // SAFETY: the handle is live and the outputs point to a booster-owned buffer that is
-        // copied immediately.
+        // SAFETY: the handle is live and the outputs point to this thread's buffer for the
+        // booster, copied immediately (before the next XGBoost call on this thread).
         check(unsafe { ffi::XGBoosterSaveJsonConfig(self.handle, &mut len, &mut data) })?;
         let len = from_bst_len(len, "config size")?;
         // SAFETY: on success `data` points to `len` bytes.
@@ -1391,8 +1500,8 @@ impl Booster {
     pub fn to_json(&self) -> Result<Vec<u8>> {
         let config = c_string(r#"{"format": "json"}"#)?;
         let (mut len, mut data) = (0, ptr::null());
-        // SAFETY: the handle is live, `config` is NUL-terminated, and the outputs point to a
-        // booster-owned buffer that is copied immediately.
+        // SAFETY: the handle is live, `config` is NUL-terminated, and the outputs point to this
+        // thread's buffer for the booster, copied immediately.
         check(unsafe {
             ffi::XGBoosterSaveModelToBuffer(self.handle, config.as_ptr(), &mut len, &mut data)
         })?;
@@ -1430,6 +1539,37 @@ impl Booster {
         check(unsafe { ffi::XGBoosterSlice(self.handle, 0, end, 1, &mut handle) })?;
         Self::with_threads(handle, self.threads)
     }
+}
+
+/// The threads a batch of booster parameters sets: its last `nthread` (the one XGBoost keeps),
+/// if any.
+///
+/// # Errors
+///
+/// Returns an error if an `nthread` is not a positive count XGBoost can take (it stores the count
+/// as a C `int`), or `n_jobs` is set.
+fn threads_set_by(params: &[(&str, &str)]) -> Result<Option<NonZeroUsize>> {
+    let mut threads = None;
+    for &(name, value) in params {
+        match name {
+            "nthread" => {
+                let count = value
+                    .parse::<NonZeroUsize>()
+                    .ok()
+                    .filter(|count| c_int::try_from(count.get()).is_ok())
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "nthread must be a positive count of threads, at most {}, not {value:?}",
+                            c_int::MAX
+                        ))
+                    })?;
+                threads = Some(count);
+            }
+            "n_jobs" => return Err(Error::new("set the threads with nthread, not n_jobs")),
+            _ => {}
+        }
+    }
+    Ok(threads)
 }
 
 impl Drop for Booster {
@@ -2113,6 +2253,180 @@ mod tests {
         assert_eq!(loaded.feature_names().unwrap(), ["signal", "noise"]);
         assert_eq!(loaded.num_features().unwrap(), 2);
         assert_eq!(loaded.predict(&train).unwrap(), booster.predict(&train).unwrap());
+    }
+
+    /// A shared predictor predicts from many threads at once on one booster, each prediction
+    /// that of the booster alone.
+    #[test]
+    fn shared_predictor_predicts_from_many_threads_at_once() {
+        let (mut booster, _) = trained_booster(8);
+        booster.set_threads(NonZeroUsize::MIN).unwrap();
+        let (features, _) = three_class_data(500);
+        let matrix = |values: &[f32]| {
+            let mut matrix = DMatrix::from_dense(values, 500, 2, f32::NAN).unwrap();
+            matrix.set_feature_names(&["signal", "noise"]).unwrap();
+            matrix
+        };
+        let cases: Vec<_> = (1..=8)
+            .map(|run_length| {
+                let mut values = features.clone();
+                for (row, values) in values.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    values[0] = ((row / run_length) % 3) as f32 * 10.0;
+                }
+                let expected = booster.predict(&matrix(&values)).unwrap();
+                (values, expected)
+            })
+            .collect();
+        for (i, (_, expected)) in cases.iter().enumerate() {
+            for (j, (_, other)) in cases[..i].iter().enumerate() {
+                assert_ne!(expected.values, other.values, "workers {i} and {j}");
+            }
+        }
+        let shared = booster.shared_predictor().unwrap().unwrap();
+        std::thread::scope(|scope| {
+            for (values, expected) in &cases {
+                let (shared, matrix) = (&shared, &matrix);
+                scope.spawn(move || {
+                    for _ in 0..25 {
+                        assert_eq!(&shared.predict(&matrix(values)).unwrap(), expected);
+                    }
+                });
+            }
+        });
+        // A matrix of other features fails on any thread.
+        let mut wrong = DMatrix::from_dense(&features, 250, 4, f32::NAN).unwrap();
+        wrong.set_feature_names(&["a", "b", "c", "d"]).unwrap();
+        let message = shared.predict(&wrong).unwrap_err().to_string();
+        assert!(message.contains("2 features but the matrix has 4 columns"), "{message}");
+    }
+
+    /// XGBoost's error messages are per thread, as `SharedPredictor` relies on: errors raised by
+    /// XGBoost on several threads at once, on one booster, while others predict with it, each
+    /// come back to the thread that raised it.
+    #[test]
+    fn xgboost_errors_are_per_thread() {
+        let (mut booster, _) = trained_booster(8);
+        booster.set_threads(NonZeroUsize::MIN).unwrap();
+        let (features, _) = three_class_data(100);
+        let matrix = || {
+            let mut matrix = DMatrix::from_dense(&features, 100, 2, f32::NAN).unwrap();
+            matrix.set_feature_names(&["signal", "noise"]).unwrap();
+            matrix
+        };
+        let expected = booster.predict(&matrix()).unwrap();
+        let shared = booster.shared_predictor().unwrap().unwrap();
+        // XGBoost fails on an unknown feature-info field, naming it.
+        fn fail(shared: &SharedPredictor<'_>, field: &str) -> String {
+            let field = c_string(field).unwrap();
+            let (mut len, mut names) = (0, ptr::null());
+            // SAFETY: the handle is live (borrowed by `shared`), `field` is NUL-terminated, and
+            // the out-pointers are valid; XGBoost writes nothing to them when it fails.
+            let code = unsafe {
+                ffi::XGBoosterGetStrFeatureInfo(
+                    shared.0.handle,
+                    field.as_ptr(),
+                    &mut len,
+                    &mut names,
+                )
+            };
+            check(code).unwrap_err().to_string()
+        }
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let (shared, matrix, expected) = (&shared, &matrix, &expected);
+                scope.spawn(move || {
+                    for round in 0..200 {
+                        if thread % 2 == 0 {
+                            let field = format!("field-of-thread-{thread}-round-{round}");
+                            let message = fail(shared, &field);
+                            assert!(message.ends_with(&field), "{field}: {message}");
+                        } else {
+                            assert_eq!(&shared.predict(&matrix()).unwrap(), expected);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Only a tree booster is shared to predict from several threads.
+    #[test]
+    fn only_a_tree_booster_is_shared() {
+        let train = train_matrix(60);
+        let mut booster = Booster::new(&[&train], TWO).unwrap();
+        booster
+            .set_params(&[
+                ("booster", "gblinear"),
+                ("objective", "multi:softprob"),
+                ("num_class", "3"),
+            ])
+            .unwrap();
+        booster.update(0, &train).unwrap();
+        assert!(booster.shared_predictor().unwrap().is_none());
+        let (tree, _) = trained_booster(5);
+        assert!(tree.shared_predictor().unwrap().is_some());
+    }
+
+    /// Setting a booster's threads sets XGBoost's `nthread`, and changes no prediction.
+    #[test]
+    fn set_threads_changes_the_threads_not_the_predictions() {
+        let (mut booster, train) = trained_booster(5);
+        let before = booster.predict(&train).unwrap();
+        let nthread = |booster: &Booster| {
+            booster.config().unwrap()["learner"]["generic_param"]["nthread"].clone()
+        };
+        let one = NonZeroUsize::new(1).unwrap();
+        booster.set_threads(one).unwrap();
+        assert_eq!(booster.threads(), one);
+        assert_eq!(nthread(&booster), "1");
+        assert_eq!(booster.predict(&train).unwrap(), before);
+        let three = NonZeroUsize::new(3).unwrap();
+        booster.set_threads(three).unwrap();
+        assert_eq!(booster.threads(), three);
+        assert_eq!(nthread(&booster), "3");
+        assert_eq!(booster.predict(&train).unwrap(), before);
+    }
+
+    /// Setting `nthread` among other parameters changes the booster's threads as `set_threads`
+    /// does, so [`Booster::threads`] (which a [`SharedPredictor`]'s callers check) is always the
+    /// count XGBoost uses; a value that is not a positive count, or the `n_jobs` alias, is
+    /// refused before XGBoost sees the batch.
+    #[test]
+    fn setting_nthread_changes_the_threads() {
+        let (mut booster, _) = trained_booster(5);
+        let nthread = |booster: &Booster| {
+            booster.config().unwrap()["learner"]["generic_param"]["nthread"].clone()
+        };
+        booster.set_threads(NonZeroUsize::MIN).unwrap();
+        booster.set_params(&[("nthread", "4")]).unwrap();
+        assert_eq!(booster.threads().get(), 4);
+        assert_eq!(nthread(&booster), "4");
+        // The last of a batch is the one XGBoost keeps.
+        booster.set_params(&[("nthread", "2"), ("eta", "0.2"), ("nthread", "3")]).unwrap();
+        assert_eq!(booster.threads().get(), 3);
+        assert_eq!(nthread(&booster), "3");
+        // XGBoost takes 0 or less for every thread, which `threads` cannot record.
+        for value in ["0", "-1", "all", "", "3000000000"] {
+            let error = booster.set_params(&[("eta", "0.1"), ("nthread", value)]).unwrap_err();
+            assert!(error.message().contains("nthread"), "{error}");
+            assert_eq!(booster.threads().get(), 3, "{value}");
+            assert_eq!(nthread(&booster), "3", "{value}");
+        }
+        // A count above what XGBoost stores (a C `int`) is refused before XGBoost sees it.
+        let huge = NonZeroUsize::new(usize::try_from(c_int::MAX).unwrap() + 1).unwrap();
+        assert!(booster.set_threads(huge).unwrap_err().message().contains("nthread"));
+        assert_eq!(booster.threads().get(), 3);
+        assert_eq!(nthread(&booster), "3");
+        let error = booster.set_params(&[("n_jobs", "4")]).unwrap_err();
+        assert!(error.message().contains("n_jobs"), "{error}");
+        assert_eq!(booster.threads().get(), 3);
+        assert_eq!(nthread(&booster), "3");
+        // XGBoost may take up a count before it rejects the rest of the batch: the booster then
+        // counts the larger of the two.
+        let mut failed = Booster::new(&[], NonZeroUsize::MIN).unwrap();
+        let multiclass_without_classes = [("nthread", "4"), ("objective", "multi:softprob")];
+        assert!(failed.set_params(&multiclass_without_classes).is_err());
+        assert_eq!(failed.threads().get(), 4);
     }
 
     #[rstest]

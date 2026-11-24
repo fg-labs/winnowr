@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use anyhow::{Context, Result, bail};
@@ -336,6 +337,11 @@ pub struct ReadInputs<'a> {
     pub expected_alignment: Option<AlignmentExpectation<'a>>,
     /// Retains the searches used by successful measurement readers for a later output audit.
     pub observed_indexes: Option<ReadIndexObservation>,
+    /// Caller cancellation: when given and set, the pass stops before its next shard with an
+    /// error (e.g. once its result is no longer wanted).
+    pub stop: Option<&'a AtomicBool>,
+    /// Independent scoring-error signal, added by shared scoring without replacing `stop`.
+    pub scoring_stop: Option<&'a AtomicBool>,
 }
 
 impl ReadInputs<'_> {
@@ -360,6 +366,37 @@ impl ReadInputs<'_> {
                 .with_context(open_error)?;
         observed.record(paths);
         Ok(reads)
+    }
+}
+
+impl<'a> ReadInputs<'a> {
+    /// The inputs of a pass that runs to its end.
+    #[must_use]
+    pub fn new(vcf: &'a Path, alignments: &'a Path, reference: &'a Path) -> Self {
+        Self {
+            observed_indexes: None,
+            vcf,
+            alignments,
+            reference,
+            expected_alignment: None,
+            stop: None,
+            scoring_stop: None,
+        }
+    }
+
+    /// Adds shared scoring's independent stop signal without losing caller cancellation.
+    /// Nested shared scoring is not supported: never silently replace an existing signal.
+    pub fn stopped_by_scoring(self, stop: &'a AtomicBool) -> Self {
+        assert!(self.scoring_stop.is_none(), "a scoring stop signal is already installed");
+        Self { scoring_stop: Some(stop), ..self }
+    }
+
+    /// Whether the caller or shared scoring has stopped the pass.
+    fn stopped(&self) -> bool {
+        [self.stop, self.scoring_stop]
+            .into_iter()
+            .flatten()
+            .any(|stop| stop.load(Ordering::Relaxed))
     }
 }
 
@@ -537,6 +574,10 @@ where
     F: Fn(&mut Shard<'_>) -> Result<T> + Sync,
 {
     use rayon::prelude::*;
+    // A pass already stopped reads nothing, not even the VCF's header to plan its shards.
+    if inputs.stopped() {
+        bail!("the pass over the reads was stopped");
+    }
     let summary = crate::vcf::VcfSummary::read(inputs.vcf)?;
     let shards = plan_shards(inputs, regions, &summary)?;
     // Reader sets are pooled, so at most one per worker thread is ever opened, and a shard takes
@@ -545,7 +586,15 @@ where
     let contigs = SharedContigs::default();
     shards
         .par_iter()
+        // Each shard is a job of its own, so that an idle thread can take any shard not yet
+        // started (e.g. a thread freed by other work on the pool, or one idle at the end).
+        .with_max_len(1)
         .map(|(chrom, start, end)| {
+            if inputs.stopped() {
+                bail!("the pass over the reads was stopped");
+            }
+            #[cfg(test)]
+            let _running = crate::model_evidence::work_observer::read_shard(inputs.vcf);
             let mut readers =
                 pool.take_preferring(|readers| readers.holds(chrom)).unwrap_or_default();
             let measured = readers.open(inputs, chrom, cram_fields, &contigs).and_then(
@@ -710,6 +759,8 @@ mod tests {
             reference: &reference,
             expected_alignment: None,
             observed_indexes: Some(observed.clone()),
+            stop: None,
+            scoring_stop: None,
         };
         let mut reads = inputs.open_alignments().unwrap();
         assert_eq!(observed.searches(), vec![candidates]);
@@ -734,6 +785,8 @@ mod tests {
             reference: &reference,
             expected_alignment: None,
             observed_indexes: Some(observed.clone()),
+            stop: None,
+            scoring_stop: None,
         };
         assert!(observed.searches().is_empty());
         drop(inputs.open_alignments().unwrap());
@@ -796,16 +849,13 @@ mod tests {
         std::fs::rename(replacement.with_extension(index), bam.with_extension(index)).unwrap();
         let tags = crate::alignment_provenance::AlignmentTags::parse(overrides).unwrap();
         let inputs = ReadInputs {
-            observed_indexes: None,
-            vcf: &vcf,
-            alignments: &bam,
-            reference: &fasta,
             expected_alignment: Some(AlignmentExpectation {
                 provenance: expected.provenance.as_ref(),
                 header_records: &expected.header_records,
                 tags: tags.as_ref(),
                 strict,
             }),
+            ..ReadInputs::new(&vcf, &bam, &fasta)
         };
         let mut readers = ShardReaders::default();
         let contigs = SharedContigs::default();
@@ -866,6 +916,7 @@ mod tests {
                 tags: tags.as_ref(),
                 strict,
             }),
+            ..ReadInputs::new(&vcf, &bam, &fasta)
         };
         let mut readers = ShardReaders::default();
         let contigs = SharedContigs::default();
@@ -888,13 +939,8 @@ mod tests {
     fn plans_shards_clamping_spans_to_the_contig() {
         let dir = tempfile::TempDir::new().unwrap();
         let reference = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(1000))]);
-        let inputs = ReadInputs {
-            observed_indexes: None,
-            vcf: Path::new("unused.vcf.gz"),
-            alignments: Path::new("unused.bam"),
-            reference: &reference,
-            expected_alignment: None,
-        };
+        let inputs =
+            ReadInputs::new(Path::new("unused.vcf.gz"), Path::new("unused.bam"), &reference);
         let summary = crate::vcf::VcfSummary {
             samples: vec!["S1".to_string()],
             contig_lengths: [("chr1".to_string(), Some(1000))].into_iter().collect(),
@@ -945,5 +991,140 @@ mod tests {
     fn rejects_bad_regions(#[case] text: &str) {
         let message = Region::parse(text, &["chr1"]).unwrap_err().to_string();
         assert!(message.starts_with("malformed region"), "{message}");
+    }
+
+    /// Empty calls and reads over a 1 kb contig, and 40 regions of 20 bp tiling it, one shard
+    /// each.
+    struct ShardFixture {
+        _dir: tempfile::TempDir,
+        files: crate::testing::ReadFiles,
+        regions: Vec<String>,
+    }
+
+    impl ShardFixture {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let reference = "ACGT".repeat(250);
+            let files =
+                crate::testing::ReadFiles::write(dir.path(), &[("chr1", &reference)], &[], &[]);
+            let regions = (0..40).map(|i| format!("chr1:{}-{}", i * 20 + 1, i * 20 + 20)).collect();
+            Self { _dir: dir, files, regions }
+        }
+
+        fn inputs(&self) -> ReadInputs<'_> {
+            self.files.inputs()
+        }
+    }
+
+    /// Shards run in any order on the pool, and their results are returned in shard order.
+    #[test]
+    fn runs_shards_returning_results_in_shard_order() {
+        let fixture = ShardFixture::new();
+        let (inputs, regions) = (fixture.inputs(), &fixture.regions);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let starts = pool
+            .install(|| {
+                run_shards(&inputs, regions, 0, |shard| {
+                    // Later shards finish first.
+                    let wait = 40 - shard.start / 20;
+                    std::thread::sleep(std::time::Duration::from_millis(wait));
+                    Ok(shard.start)
+                })
+            })
+            .unwrap();
+        let expected: Vec<u64> = (0..40).map(|i| i * 20 + 1).collect();
+        assert_eq!(starts, expected);
+
+        // Stopped, a pass measures no shard not yet started, and fails.
+        let stop = AtomicBool::new(true);
+        let stopped = ReadInputs { stop: Some(&stop), ..inputs };
+        let measured = std::sync::atomic::AtomicUsize::new(0);
+        let error = run_shards(&stopped, regions, 0, |_| {
+            measured.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "the pass over the reads was stopped");
+        assert_eq!(measured.into_inner(), 0);
+    }
+
+    /// Either independent signal stops admission of the next shard, even if set during a pass.
+    #[rstest]
+    fn cancellation_after_a_shard_preserves_both_signals(#[values(false, true)] caller: bool) {
+        use std::sync::atomic::AtomicUsize;
+        let fixture = ShardFixture::new();
+        let caller_stop = AtomicBool::new(false);
+        let scoring_stop = AtomicBool::new(false);
+        let inputs = ReadInputs { stop: Some(&caller_stop), ..fixture.inputs() }
+            .stopped_by_scoring(&scoring_stop);
+        let measured = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let result = pool.install(|| {
+            run_shards(&inputs, &fixture.regions, 0, |_| {
+                measured.fetch_add(1, Ordering::Relaxed);
+                if caller { &caller_stop } else { &scoring_stop }.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        assert_eq!(measured.into_inner(), 1, "a second shard started after cancellation");
+        assert_eq!(result.unwrap_err().to_string(), "the pass over the reads was stopped");
+    }
+
+    /// A pass stopped before it starts fails without reading the VCF: here there is none.
+    #[rstest]
+    fn a_stopped_pass_reads_nothing(#[values(false, true)] caller: bool) {
+        let fixture = ShardFixture::new();
+        let stop = AtomicBool::new(true);
+        let unread = ReadInputs { vcf: Path::new("missing.vcf.gz"), ..fixture.inputs() };
+        let inputs = if caller {
+            ReadInputs { stop: Some(&stop), ..unread }
+        } else {
+            unread.stopped_by_scoring(&stop)
+        };
+        let error = run_shards(&inputs, &fixture.regions, 0, |_| Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "the pass over the reads was stopped");
+    }
+
+    #[test]
+    #[should_panic(expected = "a scoring stop signal is already installed")]
+    fn a_second_scoring_signal_is_not_silently_substituted() {
+        let fixture = ShardFixture::new();
+        let first = AtomicBool::new(false);
+        let second = AtomicBool::new(false);
+        fixture.inputs().stopped_by_scoring(&first).stopped_by_scoring(&second);
+    }
+
+    /// Each shard is a job of its own: while a thread is held in the first shard, another thread
+    /// runs the second (with shards run in batches, the batch of the first would hold the
+    /// second back).
+    #[test]
+    fn each_shard_is_a_job_of_its_own() {
+        use std::time::{Duration, Instant};
+        let fixture = ShardFixture::new();
+        let second_ran = AtomicBool::new(false);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let ran_while_held = pool
+            .install(|| {
+                run_shards(&fixture.inputs(), &fixture.regions, 0, |shard| {
+                    match shard.start {
+                        // The first shard waits (for a while, so that a failure does not hang)
+                        // for the second.
+                        1 => {
+                            let deadline = Instant::now() + Duration::from_secs(10);
+                            while !second_ran.load(Ordering::Acquire) && Instant::now() < deadline {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Ok(second_ran.load(Ordering::Acquire))
+                        }
+                        21 => {
+                            second_ran.store(true, Ordering::Release);
+                            Ok(true)
+                        }
+                        _ => Ok(true),
+                    }
+                })
+            })
+            .unwrap();
+        assert!(ran_while_held[0], "the second shard waited for the first");
     }
 }

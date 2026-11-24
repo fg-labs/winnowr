@@ -47,13 +47,14 @@ models/
 
 Models record a digest of each region BED they were trained with (see [Model
 files](model-files.md)), and `score` checks the BED it uses, given or found, against it: a different
-BED is an error naming it (`--allow-region-mismatch` makes it a warning), and a BED no model records
-a digest of is used with a warning. Models that record different digests of one region are an error
-even with `--allow-region-mismatch`: no BED is the one all of them were trained with. A model's
+BED is an error naming it (`--allow-region-mismatch` makes it a warning). Feature-region BEDs with no
+applicable recorded digest are used unchecked with a warning. Models that record different digests of
+one region are an error even with `--allow-region-mismatch`: no BED is the one all of them were trained with. A model's
 region name that is not a file name (e.g. holds a `/`) is not looked for beside the models. The
 not-difficult regions used for the policy are checked against the policy digest recorded by
-`train --policy-regions`; without it, their policy use is unchecked. If a model also uses them as a
-feature, their feature use is checked against its recorded feature digest independently of the
+`train --policy-regions`; without it, their policy use is unchecked and policy-only use does not emit
+the feature-region warning. If a model also uses them as a feature, their feature use is checked
+against its recorded feature digest independently of the
 policy record. A region a model uses as a feature that is neither given nor found is an
 error naming the directories looked in. The not-difficult regions are optional unless a model uses
 them as a feature: without them, withholding actions is an error, found before any reads are
@@ -170,5 +171,14 @@ the new allele.
 
 ## Threads
 
-`score` runs on `-t` threads, or up to twice that with `--alignments`; see
+`score` runs within `-t` threads in all, `--alignments` included (apart from htslib's I/O thread
+per file, which mostly waits on the disk), so set `-t` to the number of cores it may use (e.g. the
+CPU count on a machine of its own). With `--alignments`, the reads are measured
+while the models that do not need them score, the threads shared between the two, and the models
+that need them score once they have been measured; with `-t 1`, or when every model needs the reads,
+the reads are measured first, then the models score. A model that cannot score the calls (e.g. one
+of a feature the table lacks) fails while the reads are measured, stopping the measurement, only if
+it scores while they are measured: a model that does not need the reads, with more than one thread.
+Any other model fails only once the reads have been measured, including a model that needs them,
+whether alone or among models that do not. See
 [Performance tuning](performance.md#threads).

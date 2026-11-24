@@ -9,7 +9,7 @@ use log::info;
 use rayon::prelude::*;
 
 use crate::common::{PASS, PhaseTimer, Task, VariantType};
-use crate::model::{ModelInfo, WinnowrModel};
+use crate::model::{ModelInfo, Predicting, WinnowrModel};
 use crate::promote_labels::promote_eligible;
 use crate::regenotype::{
     RegenotypeTarget, regenotype_targets, with_regenotype_columns, without_regenotype,
@@ -204,7 +204,7 @@ pub fn decide_calls(
     check_model_kinds(models.iter().map(|model| &model.info))?;
     let per_model = models
         .iter()
-        .map(|model| decide_model_calls(table, model, policy))
+        .map(|model| decide_model_calls(table, model, policy, Predicting::Whole))
         .collect::<Result<Vec<_>>>()?;
     Ok(merge_decisions(per_model))
 }
@@ -275,7 +275,8 @@ pub struct ModelRowDecisions {
     pub regenotype: Vec<bool>,
 }
 
-/// Scores the rows of a table that a model scores and decides their actions, as `score` does.
+/// Scores the rows of a table that a model scores and decides their actions, as `score` does,
+/// `predicting` the probabilities as asked (see [`Predicting`]).
 ///
 /// # Errors
 ///
@@ -284,6 +285,7 @@ pub fn decide_model_rows(
     table: &FeatureTable,
     model: &WinnowrModel,
     policy: &Policy,
+    predicting: Predicting,
     timer: &mut PhaseTimer,
 ) -> Result<ModelRowDecisions> {
     let mask = scored_mask(table, model)?;
@@ -295,7 +297,7 @@ pub fn decide_model_rows(
     };
     let what = format!("{} {}", model.info.task, model.info.variant_type);
     timer.lap(&format!("{what}: selecting the calls"));
-    let probabilities = model.predict(&calls)?;
+    let probabilities = model.predict_with(&calls, predicting)?;
     timer.lap(&format!("{what}: predicting"));
     let n = calls.num_rows();
     let flippable = calls.bool_column("flippable")?;
@@ -343,7 +345,8 @@ pub fn withhold_promotions(promotions: &mut Promotions, withheld: &[bool]) {
     }
 }
 
-/// The [`decide_calls`] decisions of one model, in table order.
+/// The [`decide_calls`] decisions of one model, in table order, `predicting` its probabilities
+/// as asked (see [`Predicting`]).
 ///
 /// # Errors
 ///
@@ -352,10 +355,11 @@ pub fn decide_model_calls(
     table: &FeatureTable,
     model: &WinnowrModel,
     policy: &Policy,
+    predicting: Predicting,
 ) -> Result<Vec<(CallKey, Decision)>> {
     let mut timer = PhaseTimer::start();
     let ModelRowDecisions { calls, probabilities, drop, promote, flip, regenotype, .. } =
-        decide_model_rows(table, model, policy, &mut timer)?;
+        decide_model_rows(table, model, policy, predicting, &mut timer)?;
     let what = format!("{} {}", model.info.task, model.info.variant_type);
     let n = calls.num_rows();
     let targets: Vec<Option<RegenotypeTarget>> =
@@ -498,8 +502,13 @@ mod tests {
         let promoted = &decisions[&key(400, "A", "C", "LowQual")];
         assert_eq!(promoted.task, Task::Promote);
         // One decision per key from each model, the first call's.
-        let genotype =
-            decide_model_calls(&table(), &models()[0], &Policy::new(Mode::Genotyper)).unwrap();
+        let genotype = decide_model_calls(
+            &table(),
+            &models()[0],
+            &Policy::new(Mode::Genotyper),
+            Predicting::Whole,
+        )
+        .unwrap();
         let got: Vec<(u64, (bool, bool, bool))> =
             genotype.iter().map(|(key, d)| (key.1, actions(d))).collect();
         assert_eq!(got, expected[..3]);

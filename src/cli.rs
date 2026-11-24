@@ -104,7 +104,9 @@ pub struct Cli {
 /// Options shared by every subcommand.
 #[derive(Debug, Args)]
 pub(crate) struct GlobalOptions {
-    /// The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4].
+    /// The number of threads to use in all, including htslib's compression and decompression
+    /// (but not htslib's I/O thread per file, which mostly waits on the disk) [default:
+    /// OMP_NUM_THREADS when set, else 4].
     #[arg(long, short = 't', global = true)]
     pub(crate) threads: Option<NonZeroUsize>,
 }
@@ -1053,8 +1055,10 @@ pub(crate) struct ScoreArgs {
     /// models were trained with. Models trained on features measured from the reads (`extract
     /// --alignments`) need it: each call's mapping qualities and depth are measured from it
     /// before any model scores. Needs --reference. Otherwise the reads are measured while the
-    /// models that do not need them score, each with its own -t threads, so up to twice -t
-    /// threads run.
+    /// models that do not need them score, the two sharing -t threads (score runs within -t
+    /// threads in all, apart from htslib's I/O thread per file, so set -t to the number of cores
+    /// it may use). With -t 1, or when every
+    /// model needs the evidence, the reads are measured first, then the models score.
     #[arg(long, requires = "reference")]
     pub(crate) alignments: Option<PathBuf>,
 
@@ -1251,11 +1255,8 @@ fn pileup(args: &PileupArgs) -> Result<()> {
     let tags = args.alignment_tags.tags()?;
     let alignment = recorded_alignment(tags.as_ref(), Some(&args.alignments), Vec::new())?;
     let inputs = ReadInputs {
-        observed_indexes: None,
-        vcf: &args.vcf,
-        alignments: &args.alignments,
-        reference: &args.reference,
         expected_alignment: alignment_expectation(&alignment, tags.as_ref(), true),
+        ..ReadInputs::new(&args.vcf, &args.alignments, &args.reference)
     };
     let rows = measure_pileup(&inputs, &args.regions, &args.settings)?;
     let n = write_pileup_table(&args.output, &rows, args.settings, alignment.provenance.as_ref())?;
@@ -1275,11 +1276,8 @@ fn strlen(args: &StrlenArgs) -> Result<()> {
     let tags = args.alignment_tags.tags()?;
     let alignment = recorded_alignment(tags.as_ref(), Some(&args.alignments), Vec::new())?;
     let inputs = ReadInputs {
-        observed_indexes: None,
-        vcf: &args.vcf,
-        alignments: &args.alignments,
-        reference: &args.reference,
         expected_alignment: alignment_expectation(&alignment, tags.as_ref(), true),
+        ..ReadInputs::new(&args.vcf, &args.alignments, &args.reference)
     };
     let sites = measure_regions(&inputs, &args.regions, &args.reads)?;
     let n_sites = sites.len();
@@ -1462,13 +1460,7 @@ fn read_inputs<'a>(
     alignments: Option<&'a Path>,
     reference: Option<&'a Path>,
 ) -> Option<ReadInputs<'a>> {
-    Some(ReadInputs {
-        observed_indexes: None,
-        vcf,
-        alignments: alignments?,
-        reference: reference?,
-        expected_alignment: None,
-    })
+    Some(ReadInputs::new(vcf, alignments?, reference?))
 }
 
 /// The inputs of a feature source, with the reads of the alignments source measured.
@@ -2196,6 +2188,7 @@ fn evaluate_with<F: FnOnce()>(
         write_policy_metrics_protecting,
     };
     args.policy.validate()?;
+    check_policy_region_names(&args.regions)?;
     check_output_dir("--output", &args.output)?;
     // The output is none of the inputs: checked now, and against the not-difficult regions BED
     // once it is found, before it is read.
@@ -2433,6 +2426,9 @@ fn check_table_region_digests(
     let mut unchecked: Vec<&str> = Vec::new();
     for (path, model) in paths.iter().zip(models) {
         for (name, trained) in &model.info.region_digests {
+            if !model.info.uses_region(name) {
+                continue;
+            }
             let Some(extracted) = info.region_digests.get(name) else {
                 if !unchecked.contains(&name.as_str()) {
                     unchecked.push(name);
@@ -2693,6 +2689,7 @@ fn stratify_with<F: FnOnce()>(
         labelled_calls_path, stratify,
     };
     args.policy.validate()?;
+    check_policy_region_names(&args.regions)?;
     check_output_dir("--output", &args.output)?;
     if let Some(calls) = &args.calls {
         check_output_dir("--calls", calls)?;
@@ -3062,6 +3059,7 @@ fn score_with<F: FnOnce()>(
     before_output_check: F,
 ) -> Result<()> {
     args.policy.validate()?;
+    check_policy_region_names(&args.regions)?;
     check_output_dir("--output", &args.output)?;
     // Checked again (for the VCF) as it is written, but now too, before any pass over the reads.
     // Optional inputs are checked once the models say whether they are read.
@@ -3212,7 +3210,7 @@ fn score_with<F: FnOnce()>(
             prospective_beds.iter().map(|path| ("region BED", path.as_path())),
         )?;
     }
-    let models: Vec<WinnowrModel> = args
+    let mut models: Vec<WinnowrModel> = args
         .models
         .iter()
         .zip(parts)
@@ -3343,10 +3341,8 @@ fn score_with<F: FnOnce()>(
             (strlen.is_some() || pileup.is_some()).then_some((
                 ReadInputs {
                     observed_indexes: Some(observed_indexes.clone()),
-                    vcf: &args.vcf,
-                    alignments,
-                    reference,
                     expected_alignment,
+                    ..ReadInputs::new(&args.vcf, alignments, reference)
                 },
                 strlen,
                 pileup,
@@ -3356,7 +3352,7 @@ fn score_with<F: FnOnce()>(
     };
     // The models' contigs are the same, perhaps in different orders; the first model's order is
     // the order the calls are extracted in.
-    let contigs = &models[0].info.contigs;
+    let contigs = models[0].info.contigs.clone();
     let sample = summary.sample_name(&args.vcf);
     // The alignments feature source's annotations are measured before the table is built, as
     // dp_norm needs every call's depth; so is the pileup evidence, in the same pass when it
@@ -3371,7 +3367,7 @@ fn score_with<F: FnOnce()>(
     let truth = TruthInputs::default();
     let checks = TableChecks {
         vcf: &args.vcf,
-        contigs,
+        contigs: &contigs,
         regions: &regions,
         truth: &truth,
         dp_median: args.dp_median,
@@ -3384,16 +3380,16 @@ fn score_with<F: FnOnce()>(
     let mut inputs =
         score_table_inputs(args, source.annotations(), &regions, strlen.as_ref(), pileup);
     inputs.outputs = &outputs;
-    let table = build_feature_table(&sample, &args.vcf, contigs, &summary, &inputs)?;
+    let table = build_feature_table(&sample, &args.vcf, &contigs, &summary, &inputs)?;
     let not_difficult =
         not_difficult.or_else(|| not_difficult_feature.map(|index| regions.swap_remove(index)));
     let mut timer = PhaseTimer::start();
-    let policy = args.policy.policy(args.mode, contigs, not_difficult, indel_genotype)?;
+    let policy = args.policy.policy(args.mode, &contigs, not_difficult, indel_genotype)?;
     let decisions = match measure {
         None => decide_calls(&table, &models, &policy)?,
         Some((measure, strlen, pileup)) => {
-            let measuring = Measuring { inputs: &measure, strlen, pileup, contigs };
-            measure_and_decide(table, &models, &policy, &measuring, threads, &mut timer)?
+            let measuring = Measuring { inputs: &measure, strlen, pileup, contigs: &contigs };
+            measure_and_decide(table, &mut models, &policy, &measuring, &mut timer)?
         }
     };
     timer.lap("scoring");
@@ -3417,6 +3413,7 @@ fn score_with<F: FnOnce()>(
             .iter()
             .chain(&resolved)
             .map(|path| ("model", path.as_path()))
+            .chain(files.iter().map(|file| ("model", file.resolved.as_path())))
             .chain(header.map(|path| ("alignment header", path)))
             .chain(protected_beds.iter().map(|path| ("region BED", path.as_path())))
             .chain(checked_tables.iter().map(|(path, _)| ("provenance table", path.as_path())));
@@ -3477,6 +3474,14 @@ fn checked_regions(
     Ok(resolved)
 }
 
+/// Rejects repeated policy BED names before a one-shot region input can be consumed.
+fn check_policy_region_names(given: &[NamedBed]) -> Result<()> {
+    if given.iter().filter(|bed| bed.name == NOT_DIFFICULT_REGIONS).count() > 1 {
+        bail!("--regions gives {NOT_DIFFICULT_REGIONS} more than once");
+    }
+    Ok(())
+}
+
 /// The not-difficult regions `evaluate` and `stratify` give the policy when it reads them
 /// (`policy`): the `--regions` BED (`given`), else the one beside the models (`infos`, read from
 /// `files`), checked against the digests the models record (see
@@ -3486,8 +3491,8 @@ fn checked_regions(
 ///
 /// # Errors
 ///
-/// Returns an error if an output is the BED, or the BED cannot be read or is not the models'
-/// (unless `allow_mismatch`).
+/// Returns an error if a policy BED name is repeated, an output is the BED, or the BED cannot be
+/// read or is not the models' (unless `allow_mismatch`).
 fn policy_not_difficult(
     infos: &[&ModelInfo],
     files: &[ModelFile],
@@ -3496,6 +3501,7 @@ fn policy_not_difficult(
     allow_mismatch: bool,
     outputs: &[PathBuf],
 ) -> Result<(Option<RegionSet>, Vec<crate::io::FileIdentity>)> {
+    check_policy_region_names(given)?;
     let paths: Vec<PathBuf> = files.iter().map(|file| file.path.clone()).collect();
     let resolved: Vec<PathBuf> = files.iter().map(|file| file.resolved.clone()).collect();
     let given_dirs: Vec<PathBuf> = files.iter().map(|file| file.given_dir.clone()).collect();
@@ -5078,6 +5084,8 @@ mod tests {
                 reference: &reference,
                 expected_alignment: None,
                 observed_indexes: Some(observed),
+                stop: None,
+                scoring_stop: None,
             };
             drop(measuring.open_alignments().unwrap());
             let index = dir.path().join(index_name);
@@ -5884,6 +5892,96 @@ mod tests {
                 .collect();
             assert!(!dropped.is_empty(), "{scored}");
             assert!(dropped.iter().all(|&i| !is_true(i)), "{dropped:?}");
+        }
+
+        /// Set, to the test's name, in the process a test runs in on its own (see
+        /// [`in_own_process`]): a value set outside for another purpose does not match.
+        const OWN_PROCESS: &str = "WINNOWR_TEST_IN_OWN_PROCESS";
+
+        /// Whether the calling test, `name` (in this module), runs in a process of its own: if
+        /// not, runs it in one (the test binary run again for it alone), and fails unless it
+        /// passes there. For a test that sets up the global rayon pool, which a process can set
+        /// up only once, before anything uses it.
+        fn in_own_process(name: &str) -> bool {
+            if std::env::var_os(OWN_PROCESS).is_some_and(|value| value == name) {
+                return true;
+            }
+            // The test's path from the crate root, as the test binary names it.
+            let module = module_path!().split_once("::").unwrap().1;
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut processes = crate::testing::TestProcesses::default();
+            processes.spawn_test(
+                &format!("{module}::{name}"),
+                [(OWN_PROCESS, name)],
+                &dir.path().join("child.log"),
+            );
+            processes.wait_for_success(std::time::Duration::from_secs(30));
+            false
+        }
+
+        /// `score --alignments` with more than one thread, called as `run` calls it (from outside
+        /// the global pool, of -t threads), measures the reads while a model that does not need
+        /// them scores, and writes the calls as with one thread.
+        #[test]
+        fn scoring_from_the_reads_on_threads_shared_writes_as_on_one() {
+            if !in_own_process("scoring_from_the_reads_on_threads_shared_writes_as_on_one") {
+                return;
+            }
+            // The global pool, of -t threads as `run` sizes it.
+            configure_threads(NonZeroUsize::new(4).unwrap()).unwrap();
+            let threads = rayon::current_num_threads();
+            assert_eq!(threads, 4);
+            let setup = AlignmentsModel::new();
+            let vcf = setup.path("default.vcf.gz");
+            // Tables of the VCF feature source with pileup evidence, whose models' pileup
+            // evidence `score` counts from the reads while scoring (not before the table is
+            // built, as for the alignments feature source).
+            let tables: Vec<String> = ["S1", "S2"]
+                .iter()
+                .map(|sample| {
+                    let table = setup.path(&format!("{sample}.vcf.parquet"));
+                    let (happy, pileup) = (setup.path("happy.vcf"), setup.path("pileup.tsv.gz"));
+                    let base = ["extract", "--vcf", &vcf, "--happy", &happy, "--contigs", "chr1"];
+                    let rest = ["--sample", sample, "--feature-source", "vcf", "--pileup", &pileup];
+                    run(&[&base[..], &rest, &["-o", &table]].concat());
+                    table
+                })
+                .collect();
+            let train = |output: &str, extra: &[&str]| {
+                let base = ["train", "--variant-type", "snp", "--max-rounds", "10", "-o", output];
+                let tables = ["--tables", &tables[0], &tables[1]];
+                run(&[&base[..], &tables, extra].concat());
+                format!("{output}.winnowr.json")
+            };
+            // A model that does not need the reads' evidence (no pileup features)...
+            let plain = train(&setup.path("plain"), &[]);
+            // ... and one that does, of another variant type (scoring none of the calls).
+            let snp = train(&setup.path("pileup"), &["--pileup-features"]);
+            let mut needing = WinnowrModel::load(&snp, NonZeroUsize::MIN).unwrap();
+            assert!(needing.info.pileup_settings.is_some());
+            needing.info.variant_type = VariantType::Indel;
+            let needing_path = setup.path("indel.winnowr.json");
+            needing.save(&needing_path).unwrap();
+            let reads = setup.reads();
+            let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+            let score = |output: &str| {
+                let output = setup.path(output);
+                let base =
+                    ["score", "--vcf", &vcf, "--models", &plain, &needing_path, "-o", &output];
+                parse(&[&base[..], &reads].concat()).unwrap().command
+            };
+            let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+            let command = score("one.vcf.gz");
+            one.install(|| dispatch(&command, NonZeroUsize::MIN)).unwrap();
+            dispatch(&score("shared.vcf.gz"), NonZeroUsize::new(threads).unwrap()).unwrap();
+            let records = |name: &str| -> Vec<String> {
+                let text = read_gzip(&setup.dir.path().join(name));
+                text.lines().filter(|line| !line.starts_with('#')).map(str::to_string).collect()
+            };
+            let shared = records("shared.vcf.gz");
+            assert_eq!(shared, records("one.vcf.gz"));
+            assert_eq!(shared.iter().filter(|r| r.contains("WINNOWR_P=")).count(), CALLS);
+            crate::testing::child_body_ran();
         }
 
         /// An output that is an input of `score` or `extract` (the VCF, the reads, the
@@ -7896,6 +7994,55 @@ mod tests {
         }
 
         #[cfg(unix)]
+        #[rstest]
+        fn review_final_model_guard_keeps_the_resolved_path(
+            #[values(false, true)] sidecar: bool,
+            #[values(false, true)] collision: bool,
+        ) {
+            let setup = VcfSourceModel::new();
+            let model = PathBuf::from(setup.model());
+            let original = std::fs::read(&model).unwrap();
+            let other = setup.path("other.winnowr.json");
+            std::fs::write(&other, &original).unwrap();
+            let alias = setup.path("staged.winnowr.json");
+            std::os::unix::fs::symlink(&model, &alias).unwrap();
+            let output = setup.path("retargeted-output.vcf.gz");
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                &setup.path("default.vcf.gz"),
+                "--models",
+                &alias,
+                "-o",
+                &output,
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let called = std::cell::Cell::new(false);
+            let result = score_with(&args, NonZeroUsize::MIN, || {
+                called.set(true);
+                std::fs::remove_file(&alias).unwrap();
+                std::os::unix::fs::symlink(&other, &alias).unwrap();
+                if collision {
+                    let destination =
+                        if sidecar { format!("{output}.tbi") } else { output.clone() };
+                    std::os::unix::fs::symlink(&model, destination).unwrap();
+                }
+            });
+            assert!(called.get());
+            if collision {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("is the input model; write to another path"), "{error}");
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(std::fs::read(&model).unwrap(), original);
+        }
+
+        #[cfg(unix)]
         #[test]
         fn review_final_bed_guard_uses_the_identity_actually_read() {
             let setup = VcfSourceModel::new();
@@ -8916,13 +9063,7 @@ mod tests {
                 &table.display().to_string(),
             ]);
             let options: StrlenOptions = "mapq0,mates".parse().unwrap();
-            let inputs = ReadInputs {
-                observed_indexes: None,
-                vcf: Path::new(&vcf),
-                alignments: Path::new(&bam),
-                reference: Path::new(&fasta),
-                expected_alignment: None,
-            };
+            let inputs = ReadInputs::new(Path::new(&vcf), Path::new(&bam), Path::new(&fasta));
             let measured =
                 |options| sites_to_rows(&measure_regions(&inputs, &["chr1"], options).unwrap());
             let rows = measured(&options);
@@ -8956,6 +9097,7 @@ mod tests {
         let digest = |sha: &str| RegionDigest { sha256: sha.repeat(64), intervals: 1, bases: 10 };
         let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
         model.info.region_digests = [("segdups".to_string(), digest("a"))].into_iter().collect();
+        model.info.region_names = vec!["segdups".to_string()];
         let paths = [PathBuf::from("m.winnowr.json")];
         let models = std::slice::from_ref(&model);
         let table = Path::new("t.parquet");
@@ -8977,6 +9119,70 @@ mod tests {
         model.info.region_digests.clear();
         let models = std::slice::from_ref(&model);
         assert!(check_table_region_digests(table, &info, models, &paths, false).is_ok());
+    }
+
+    #[rstest]
+    fn review_region_digest_checks_only_active_features(
+        #[values(false, true)] active: bool,
+        #[values(false, true)] missing: bool,
+    ) {
+        let digest = |value: char| RegionDigest {
+            sha256: value.to_string().repeat(64),
+            intervals: 1,
+            bases: 10,
+        };
+        let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+        model.info.region_names = if active { vec!["segdups".to_string()] } else { Vec::new() };
+        model.info.region_digests = BTreeMap::from([("segdups".to_string(), digest('a'))]);
+        let mut info = crate::testing::call_table(&[]).info().clone();
+        if !missing {
+            info.region_digests.insert("segdups".to_string(), digest('b'));
+        }
+        let (result, logs) = captured_logs::capture(|| {
+            check_table_region_digests(
+                Path::new("table.parquet"),
+                &info,
+                &[model],
+                &[PathBuf::from("model.winnowr.json")],
+                false,
+            )
+        });
+        assert_eq!(result.is_err(), active && !missing, "{result:?}");
+        let warnings: Vec<_> =
+            logs.iter().filter(|(_, message)| message.contains("records no digest")).collect();
+        assert_eq!(warnings.len(), usize::from(active && missing), "{logs:?}");
+    }
+
+    #[rstest]
+    fn review_policy_bed_names_are_unique_for_table_commands(
+        #[values(false, true)] policy: bool,
+        #[values(false, true)] reverse: bool,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Indel);
+        model.info.contigs = vec!["chr1".to_string()];
+        let files = [ModelFile::resolve(&dir.path().join("model.winnowr.json"))];
+        let mut given: Vec<NamedBed> = [100, 200]
+            .iter()
+            .map(|end| {
+                let path = dir.path().join(format!("{end}.bed"));
+                std::fs::write(&path, format!("chr1\t0\t{end}\n")).unwrap();
+                NamedBed { name: NOT_DIFFICULT_REGIONS.to_string(), path }
+            })
+            .collect();
+        if reverse {
+            given.reverse();
+        }
+        let error = policy_not_difficult(&[&model.info], &files, &given, policy, false, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--regions gives notinalldifficultregions more than once"),
+            "{error}"
+        );
+        let (one, _) =
+            policy_not_difficult(&[&model.info], &files, &given[..1], policy, false, &[]).unwrap();
+        assert_eq!(one.is_some(), policy);
     }
 
     /// Models that record different digests of one region are an error, as no labelled table can

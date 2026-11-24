@@ -4,7 +4,9 @@ Usage: winnowr strlen [OPTIONS] --vcf <VCF> --alignments <ALIGNMENTS> --referenc
 
 Options:
   -t, --threads <THREADS>
-          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+          The number of threads to use in all, including htslib's compression and decompression (but
+          not htslib's I/O thread per file, which mostly waits on the disk) [default:
+          OMP_NUM_THREADS when set, else 4]
       --vcf <VCF>
           The indexed VCF of the calls (the VCF given to `extract` or `score`)
       --alignments <ALIGNMENTS>
