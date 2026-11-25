@@ -17,10 +17,16 @@ use crate::extraction::{TableInputs, TruthInputs, build_feature_table, check_tab
 use crate::feature_source::FeatureSource;
 use crate::features::feature_names;
 use crate::labels::{HappyPassOnly, UnfixableFlips};
-use crate::model::{CvFolds, MODEL_SUFFIX, TrainingParams, WinnowrModel, check_reference};
+use crate::model::{
+    CvFolds, MODEL_SUFFIX, ModelInfo, ReferenceContigs, TrainingParams, WinnowrModel,
+    check_reference, read_model_file,
+};
 use crate::model_evidence::{
     Measuring, check_supplied, check_table, measure_and_decide, models_options, models_using,
     read_for_models, shared_options,
+};
+use crate::model_set::{
+    ModelSet, SetInputs, Severity, check_model_set, error_message, models_feature_source,
 };
 use crate::pileup::{
     MeasuredSite, PileupOptions, PileupTables, measure_annotations_and_pileup, measure_pileup,
@@ -29,7 +35,7 @@ use crate::pileup::{
 use crate::pileup_features::PILEUP_FEATURES;
 use crate::policy::{
     Abstention, DEFAULT_KEEP_FALLBACK, DEFAULT_OUTSIDE_INDEL_T_DROP, NOT_DIFFICULT_REGIONS, Policy,
-    decide_calls,
+    decide_calls, is_indel_genotype,
 };
 use crate::raw_records::AnnotationInputs;
 use crate::read_annotations::{ReadAnnotationOptions, summarise};
@@ -163,6 +169,18 @@ pub(crate) enum Command {
     /// <output>.regions.calibration.tsv and <output>.regions.rates.tsv (action rates per region
     /// and benchmark stratum, including the parts outside the truth sets).
     Stratify(StratifyArgs),
+    /// Check a set of models before a run, and report what they need.
+    ///
+    /// Reads each model's information, but not its booster (which `score` loads, and this does
+    /// not check), and runs the model-set checks `score` runs at startup, and more, reporting
+    /// every problem: that the models can be scored together (one model per task and variant
+    /// type, the same contigs and reference, one feature source, one setting of each evidence),
+    /// that --regions has a BED for every region a model uses (each BED is read, and must have
+    /// intervals on the models' contigs; for a BED `score` does not read, a problem is only a
+    /// warning), and that the models' reference is that of --reference or --vcf. Warnings (e.g.
+    /// a model trained by another winnowr version) do not fail it; errors do. With --json, prints
+    /// a JSON summary (schema version 1) on stdout, also when it fails.
+    CheckModels(CheckModelsArgs),
     /// Score a sample's calls and write a VCF with drops, promotions, flips and re-genotypes.
     ///
     /// Each model acts at its cross-validated thresholds. Indel genotype models also drop the
@@ -196,6 +214,7 @@ impl Command {
             Self::Train(_) => "train",
             Self::Evaluate(_) => "evaluate",
             Self::Stratify(_) => "stratify",
+            Self::CheckModels(_) => "check-models",
             Self::Score(_) => "score",
             Self::Strlen(_) => "strlen",
             Self::Pileup(_) => "pileup",
@@ -768,13 +787,6 @@ fn without_none<T: clap::ValueEnum + Copy + PartialEq>(
     Ok(values.iter().copied().filter(|&value| value != none).collect())
 }
 
-/// Whether any of the models is an indel genotype model.
-fn has_indel_genotype(models: &[WinnowrModel]) -> bool {
-    models
-        .iter()
-        .any(|m| m.info.task == Task::Genotype && m.info.variant_type == VariantType::Indel)
-}
-
 /// The options of `winnowr stratify`.
 #[derive(Debug, Args)]
 pub(crate) struct StratifyArgs {
@@ -946,6 +958,33 @@ pub(crate) struct ScoreArgs {
     /// The indexed, uncompressed reference FASTA, for --alignments (also used to decode CRAM).
     #[arg(long, requires = "alignments")]
     pub(crate) reference: Option<PathBuf>,
+}
+
+/// The options of `winnowr check-models`.
+#[derive(Debug, Args)]
+pub(crate) struct CheckModelsArgs {
+    /// The model files (`<name>.winnowr.json`), as given to `score --models`.
+    #[arg(long, required = true, num_args = 1..)]
+    pub(crate) models: Vec<PathBuf>,
+
+    /// Region BEDs as NAME=PATH, as given to `score --regions`; each is read and checked (a
+    /// problem of one `score` does not read is a warning).
+    #[arg(long, value_name = "NAME=PATH", num_args = 1..)]
+    pub(crate) regions: Vec<NamedBed>,
+
+    /// The reference FASTA with its `.fai` beside it, or the `.fai` itself: only the index is
+    /// read, and the models' reference contigs are checked against its lengths.
+    #[arg(long)]
+    pub(crate) reference: Option<PathBuf>,
+
+    /// The VCF to be scored: only its header is read, and the models' reference contigs are
+    /// checked against its contigs.
+    #[arg(long)]
+    pub(crate) vcf: Option<PathBuf>,
+
+    /// Print the summary as JSON on stdout (schema version 1), with every problem.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 /// The options of `winnowr strlen`.
@@ -1349,20 +1388,13 @@ where
     F: Fn(&T) -> FeatureSource,
     E: FnOnce(&T, &T) -> anyhow::Error,
 {
-    let mut items = items.into_iter();
-    let Some(first) = items.next() else { return Ok(None) };
-    let shared = source(&first);
-    if let Some(other) = items.find(|item| source(item) != shared) {
-        return Err(differ(&first, &other));
-    }
-    if !shared.is_default() {
+    let shared = crate::feature_source::shared_source(items, source)
+        .map_err(|(first, other)| differ(&first, &other))?;
+    if let Some(shared) = shared.filter(|shared| !shared.is_default()) {
         info!("{whose} features come from feature source {shared}");
     }
-    Ok(Some(shared))
+    Ok(shared)
 }
-
-/// The reference contigs a model records: each contig's length (`None` where unknown).
-type ReferenceContigs = indexmap::IndexMap<String, Option<u64>>;
 
 /// The training tables' metadata, as [`read_training_infos`] checks and merges it.
 struct TrainingInfos {
@@ -1909,13 +1941,20 @@ fn evaluate(args: &EvaluateArgs, threads: NonZeroUsize) -> Result<()> {
     write_policy_metrics(&args.output, &metrics)
 }
 
-/// Loads model files.
+/// Loads model files, logging their warnings (see [`crate::model::ModelInfo::warnings`]).
 ///
 /// # Errors
 ///
 /// Returns an error if a model cannot be loaded.
 fn load_models(paths: &[PathBuf], threads: NonZeroUsize) -> Result<Vec<WinnowrModel>> {
-    paths.iter().map(|path| WinnowrModel::load(path, threads)).collect()
+    paths
+        .iter()
+        .map(|path| {
+            let model = WinnowrModel::load(path, threads)?;
+            model.info.warnings(path).log();
+            Ok(model)
+        })
+        .collect()
 }
 
 /// Checks that a labelled feature table (of `evaluate` or `stratify`) suits the models: that it is
@@ -1991,30 +2030,6 @@ fn check_table_feature_source(
         "The feature table's",
     )?;
     Ok(())
-}
-
-/// The feature source of the features the models were trained on, which `score` derives the
-/// calls' features from.
-///
-/// # Errors
-///
-/// Returns an error naming each model's source if two models' differ.
-fn models_feature_source(models: &[WinnowrModel], paths: &[PathBuf]) -> Result<FeatureSource> {
-    let differ = |_: &&WinnowrModel, _: &&WinnowrModel| {
-        let described: Vec<String> = paths
-            .iter()
-            .zip(models)
-            .map(|(path, m)| format!("{}: {}", path.display(), m.info.feature_source))
-            .collect();
-        anyhow::anyhow!(
-            "--models were trained on features from different sources ({}): score with models \
-             trained on tables of one --feature-source (and, with --alignments, the same \
-             --alignment-settings)",
-            described.join("; ")
-        )
-    };
-    let shared = shared_feature_source(models, |m| m.info.feature_source, differ, "The models'")?;
-    Ok(shared.unwrap_or_default())
 }
 
 /// Checks a feature table's reference contigs against each model's, warning if the table does
@@ -2095,28 +2110,6 @@ fn score_table_inputs<'a>(
         dp_median: args.dp_median,
         ..TableInputs::default()
     }
-}
-
-/// Checks that the models (`paths`) were trained on the same contigs (`contigs`, each model's),
-/// in any order: a model's contig order is only the order its training merged them in.
-///
-/// # Errors
-///
-/// Returns an error naming each model's contigs if two models' contigs differ.
-fn check_same_contigs(paths: &[PathBuf], contigs: &[&[String]]) -> Result<()> {
-    let set = |contigs: &[String]| -> std::collections::BTreeSet<String> {
-        contigs.iter().cloned().collect()
-    };
-    let first = set(contigs[0]);
-    if contigs.iter().all(|model| set(model) == first) {
-        return Ok(());
-    }
-    let described: Vec<String> = paths
-        .iter()
-        .zip(contigs)
-        .map(|(path, contigs)| format!("{}: {}", path.display(), contigs.join(",")))
-        .collect();
-    bail!("--models were trained on different contigs: {}", described.join("; "))
 }
 
 /// Runs `winnowr stratify`.
@@ -2204,8 +2197,12 @@ fn stratify(args: &StratifyArgs, threads: NonZeroUsize) -> Result<()> {
              --regions {NOT_DIFFICULT_REGIONS}=PATH to decide calls as score does with it"
         );
     }
-    let policy =
-        args.policy.policy(args.mode, &extracted, &args.regions, has_indel_genotype(&models))?;
+    let policy = args.policy.policy(
+        args.mode,
+        &extracted,
+        &args.regions,
+        models.iter().any(|model| is_indel_genotype(&model.info)),
+    )?;
     let outputs =
         CallOutputs { calls: args.calls.as_deref(), labelled_dir: args.labelled_calls.as_deref() };
     let (report, by_region) =
@@ -2351,44 +2348,52 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
             [("scored VCF", args.output.as_path())],
         )?;
     }
-    let models = load_models(&args.models, threads)?;
-    let supplied: Vec<&str> = args.regions.iter().map(|r| r.name.as_str()).collect();
-    for (path, model) in args.models.iter().zip(&models) {
-        let mut missing: Vec<&str> = model
-            .info
-            .region_names
-            .iter()
-            .map(String::as_str)
-            .filter(|name| !supplied.contains(name))
-            .collect();
-        if !missing.is_empty() {
-            missing.sort_unstable();
-            bail!(
-                "model {} ({} {}) needs region BEDs (--regions NAME=PATH) for: {}",
-                path.display(),
-                model.info.task,
-                model.info.variant_type,
-                missing.join(", ")
-            );
-        }
-    }
-    let mut unused: Vec<&str> = supplied
+    // Each model file is read once: its information is checked before its booster is parsed, so
+    // a set that cannot be scored never pays for parsing the boosters.
+    let texts: Vec<String> =
+        args.models.iter().map(|path| read_model_file(path)).collect::<Result<_>>()?;
+    let load_error = |path: &Path| format!("failed to load model {}", path.display());
+    let parts: Vec<(ModelInfo, &str)> = args
+        .models
         .iter()
-        .copied()
-        .filter(|name| {
-            *name != NOT_DIFFICULT_REGIONS
-                && !models.iter().any(|m| m.info.region_names.iter().any(|n| n == name))
-        })
-        .collect();
-    if !unused.is_empty() {
-        unused.sort_unstable();
-        log::warn!("no model uses the --regions {}; they are ignored", unused.join(", "));
+        .zip(&texts)
+        .map(|(path, text)| ModelInfo::from_model_json(text).with_context(|| load_error(path)))
+        .collect::<Result<_>>()?;
+    let summary = VcfSummary::read(&args.vcf)?;
+    // Every problem of the model set is reported at once (see `winnowr check-models`). The
+    // region BEDs are read later, those a model uses only.
+    let set_inputs = SetInputs {
+        regions: &args.regions,
+        contigs: vec![(format!("VCF {}", args.vcf.display()), &summary.contig_lengths)],
+        ..SetInputs::default()
+    };
+    let infos: Vec<&ModelInfo> = parts.iter().map(|(info, _)| info).collect();
+    let problems = check_model_set(&ModelSet { paths: &args.models, infos: &infos }, &set_inputs);
+    for problem in problems.iter().filter(|problem| problem.severity == Severity::Warning) {
+        log::warn!("{}", problem.message);
     }
-    let feature_source = models_feature_source(&models, &args.models)?;
+    if let Some(message) = error_message(&problems) {
+        bail!("{message}");
+    }
+    let models: Vec<WinnowrModel> = args
+        .models
+        .iter()
+        .zip(parts)
+        .map(|(path, (info, booster))| {
+            WinnowrModel::from_parts(info, booster, threads).with_context(|| load_error(path))
+        })
+        .collect::<Result<_>>()?;
+    // The model files' text (each with its serialized booster) is not needed past here.
+    drop(texts);
+    let infos: Vec<&ModelInfo> = models.iter().map(|model| &model.info).collect();
+    let feature_source = models_feature_source(&infos).unwrap_or_default();
+    if !feature_source.is_default() {
+        info!("The models' features come from feature source {feature_source}");
+    }
     check_unread_gvcf(feature_source, args.gvcf.as_deref(), UnreadGvcf::Warn)?;
     let read_annotations = models_read_annotations(feature_source, args)?;
-    let needs_strlen = models_using::<StrlenOptions>(&models, &args.models);
-    let needs_pileup = models_using::<PileupOptions>(&models, &args.models);
+    let needs_strlen = models_using::<StrlenOptions>(&infos, &args.models);
+    let needs_pileup = models_using::<PileupOptions>(&infos, &args.models);
     let uses_reads =
         read_annotations.is_some() || !needs_strlen.is_empty() || !needs_pileup.is_empty();
     let inputs = [
@@ -2410,9 +2415,9 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         log::warn!("no model uses repeat-length or pileup features; --alignments is ignored");
     }
     // The settings the models' evidence must be measured with.
-    let strlen_options = models_options::<StrlenOptions>(&models, &args.models)?;
+    let strlen_options = models_options::<StrlenOptions>(&infos, &args.models)?;
     let strlen = read_for_models::<StrlenOptions>(&args.strlen, &models, &args.models)?;
-    let pileup_options = models_options::<PileupOptions>(&models, &args.models)?;
+    let pileup_options = models_options::<PileupOptions>(&infos, &args.models)?;
     let pileup = read_for_models::<PileupOptions>(&args.pileup, &models, &args.models)?;
     // Evidence measured from the reads while scoring, as the models need it (--alignments
     // conflicts with --strlen and --pileup, so nothing is both read and measured).
@@ -2438,16 +2443,9 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         }
         _ => None,
     };
-    let model_contigs: Vec<&[String]> = models.iter().map(|m| m.info.contigs.as_slice()).collect();
-    check_same_contigs(&args.models, &model_contigs)?;
     // The models' contigs are the same, perhaps in different orders; the first model's order is
     // the order the calls are extracted in.
     let contigs = &models[0].info.contigs;
-    let summary = VcfSummary::read(&args.vcf)?;
-    let source = format!("VCF {}", args.vcf.display());
-    for (path, model) in args.models.iter().zip(&models) {
-        check_reference(path, &model.info, &summary.contig_lengths, &source, true)?;
-    }
     // Only the region BEDs a model uses are read, so an unused one cannot fail the run.
     let used: Vec<NamedBed> = args
         .regions
@@ -2457,8 +2455,12 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         .collect();
     let regions = read_region_sets(&used)?;
     // The policy, and the BEDs only it reads, are checked before any pass over the reads.
-    let policy =
-        args.policy.policy(args.mode, contigs, &args.regions, has_indel_genotype(&models))?;
+    let policy = args.policy.policy(
+        args.mode,
+        contigs,
+        &args.regions,
+        models.iter().any(|model| is_indel_genotype(&model.info)),
+    )?;
     // Unused BED arguments are ignored, including ones naming an existing output on a rerun.
     let policy_bed = args.regions.iter().find(|r| r.name == NOT_DIFFICULT_REGIONS);
     let protected_beds = used.iter().chain(policy_bed.filter(|_| policy.abstain.is_some()));
@@ -2501,6 +2503,31 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
     timer.lap("scoring");
     write_scored_vcf(&args.vcf, &args.output, decisions, threads)?;
     timer.lap("writing the VCF");
+    Ok(())
+}
+
+/// Runs `winnowr check-models`.
+///
+/// # Errors
+///
+/// Returns an error if a problem of the models is an error, or the summary cannot be written.
+fn check_models(args: &CheckModelsArgs) -> Result<()> {
+    use crate::check_models::{CheckInputs, check_models, write_json, write_text};
+    let report = check_models(&CheckInputs {
+        models: &args.models,
+        regions: &args.regions,
+        reference: args.reference.as_deref(),
+        vcf: args.vcf.as_deref(),
+    });
+    if args.json {
+        write_json(&report, std::io::stdout().lock())?;
+    } else {
+        write_text(&report, std::io::stdout().lock(), std::io::stderr().lock())?;
+    }
+    if !report.ok {
+        let errors = report.problems.iter().filter(|p| p.severity == Severity::Error).count();
+        bail!("the models have {errors} error(s); see the problems reported");
+    }
     Ok(())
 }
 
@@ -2562,6 +2589,7 @@ fn command_line<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> String {
 fn dispatch(command: &Command, threads: NonZeroUsize) -> Result<()> {
     match command {
         Command::Extract(args) => extract(args),
+        Command::CheckModels(args) => check_models(args),
         Command::Score(args) => score(args, threads),
         Command::Strlen(args) => strlen(args),
         Command::Pileup(args) => pileup(args),
@@ -4578,39 +4606,161 @@ mod tests {
     /// `score` takes the models' feature source, and rejects models of different sources.
     #[test]
     fn score_takes_the_feature_source_of_the_models() {
-        let model = |source: FeatureSource| {
-            let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
-            model.info.feature_source = source;
-            model
+        let info = |task: Task, source: FeatureSource| {
+            let mut info = crate::testing::separable_model(task, VariantType::Snp).info;
+            info.feature_source = source;
+            info
         };
         let paths = [PathBuf::from("g.winnowr.json"), PathBuf::from("v.winnowr.json")];
         let (gvcf, vcf) = (FeatureSource::Gvcf, FeatureSource::Vcf);
-        assert_eq!(models_feature_source(&[model(vcf), model(vcf)], &paths).unwrap(), vcf);
-        assert_eq!(models_feature_source(&[model(gvcf), model(gvcf)], &paths).unwrap(), gvcf);
-        let error =
-            models_feature_source(&[model(gvcf), model(vcf)], &paths).unwrap_err().to_string();
+        let (a, b) = (info(Task::Genotype, vcf), info(Task::Promote, vcf));
+        assert_eq!(models_feature_source(&[&a, &b]), Some(vcf));
+        let (a, b) = (info(Task::Genotype, gvcf), info(Task::Promote, vcf));
+        assert_eq!(models_feature_source(&[&a, &b]), None);
+        let problems =
+            check_model_set(&ModelSet { paths: &paths, infos: &[&a, &b] }, &SetInputs::default());
         assert_eq!(
-            error,
+            error_message(&problems).unwrap(),
             "--models were trained on features from different sources (g.winnowr.json: gvcf; \
              v.winnowr.json: vcf): score with models trained on tables of one --feature-source \
              (and, with --alignments, the same --alignment-settings)"
         );
     }
 
+    /// Saves a genotype model of `variant_type` using the regions `region_names` as `name`,
+    /// trained on chr1 of `chr1_length` bp.
+    fn save_model(
+        dir: &Path,
+        name: &str,
+        variant_type: VariantType,
+        region_names: &[&str],
+        chr1_length: u64,
+    ) -> String {
+        let mut model = crate::testing::separable_model(Task::Genotype, variant_type);
+        model.info.region_names = region_names.iter().map(ToString::to_string).collect();
+        model.info.reference_contigs =
+            Some([("chr1".to_string(), Some(chr1_length))].into_iter().collect());
+        let path = dir.join(name);
+        model.save(&path).unwrap();
+        path.display().to_string()
+    }
+
+    /// Runs a command line.
+    fn run_command(args: &[&str]) -> Result<()> {
+        dispatch(&parse(args).unwrap().command, NonZeroUsize::new(1).unwrap())
+    }
+
+    /// `check-models` succeeds on a good set, and fails on a bad one; `score` reports every
+    /// problem of its models at once.
     #[test]
-    fn models_of_the_same_contigs_in_any_order_score_together() {
-        let paths = [PathBuf::from("snp.winnowr.json"), PathBuf::from("indel.winnowr.json")];
-        let (ordered, reordered, other) = (
-            ["chr1".to_string(), "chr2".to_string()],
-            ["chr2".to_string(), "chr1".to_string()],
-            ["chr1".to_string()],
-        );
-        check_same_contigs(&paths, &[&ordered, &reordered]).unwrap();
-        let message = check_same_contigs(&paths, &[&ordered, &other]).unwrap_err().to_string();
+    fn check_models_and_score_report_every_problem() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = run_command;
+        // The test VCF's chr1 is 100000 bp.
+        let save = |name: &str, variant_type: VariantType, regions: &[&str]| {
+            save_model(dir.path(), name, variant_type, regions, 100_000)
+        };
+        let snp = save("snp.winnowr.json", VariantType::Snp, &["segdups"]);
+        let indel = save("indel.winnowr.json", VariantType::Indel, &[]);
+        let other_snp = save("other.winnowr.json", VariantType::Snp, &[]);
+        let bed = dir.path().join("segdups.bed");
+        std::fs::write(&bed, "chr1\t0\t100\n").unwrap();
+        let segdups = format!("segdups={}", bed.display());
+        let fai = dir.path().join("ref.fa.fai");
+        std::fs::write(&fai, "chr1\t100000\t6\t60\t61\n").unwrap();
+        let fai = fai.display().to_string();
+        let good =
+            ["check-models", "--models", &snp, &indel, "--regions", &segdups, "--reference", &fai];
+        run(&good).unwrap();
+        run(&[&good[..], &["--json"]].concat()).unwrap();
+        // The reference is compared: another length of chr1 fails.
+        std::fs::write(&fai, "chr1\t99999\t6\t60\t61\n").unwrap();
+        let error = run(&good).unwrap_err().to_string();
+        assert_eq!(error, "the models have 2 error(s); see the problems reported");
+        let bad = ["check-models", "--models", &snp, &other_snp, "--json"];
+        let error = run(&bad).unwrap_err().to_string();
+        assert_eq!(error, "the models have 2 error(s); see the problems reported");
+
+        let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
+        let vcf = crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[]);
+        let vcf = vcf.display().to_string();
+        let out = dir.path().join("out.vcf.gz").display().to_string();
+        let error = run(&["score", "--vcf", &vcf, "--models", &snp, &other_snp, "-o", &out])
+            .unwrap_err()
+            .to_string();
         assert_eq!(
-            message,
-            "--models were trained on different contigs: snp.winnowr.json: chr1,chr2; \
-             indel.winnowr.json: chr1"
+            error,
+            format!(
+                "2 problems with the models and their inputs:\n  model_kinds: expected at most \
+                 one model per task and variant type, got two genotype snp models\n  \
+                 region_missing: model {snp} (genotype snp) needs region BEDs (--regions \
+                 NAME=PATH) for: segdups"
+            )
+        );
+        // One problem: its message alone, as before.
+        let error =
+            run(&["score", "--vcf", &vcf, "--models", &snp, "-o", &out]).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "model {snp} (genotype snp) needs region BEDs (--regions NAME=PATH) for: segdups"
+            )
+        );
+    }
+
+    /// `score` checks the model set before it parses the boosters: a set that cannot be scored
+    /// fails on its problems, even with a booster XGBoost cannot load.
+    #[test]
+    fn score_checks_the_set_before_parsing_the_boosters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
+        let vcf = crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[]);
+        let vcf = vcf.display().to_string();
+        let out = dir.path().join("out.vcf.gz").display().to_string();
+        let a = save_model(dir.path(), "a.winnowr.json", VariantType::Snp, &[], 100_000);
+        let b = save_model(dir.path(), "b.winnowr.json", VariantType::Snp, &[], 100_000);
+        let text = std::fs::read_to_string(&b).unwrap();
+        let start = text.find("\"booster\"").unwrap();
+        std::fs::write(&b, format!("{}\"booster\":{{\"x\":[NaN]}}}}", &text[..start])).unwrap();
+        let score = |models: &[&str]| {
+            run_command(&[&["score", "--vcf", &vcf, "-o", &out, "--models"], models].concat())
+                .unwrap_err()
+        };
+        let error = score(&[&a, &b]).to_string();
+        assert!(error.ends_with("got two genotype snp models"), "{error}");
+        let error = format!("{:#}", score(&[&b]));
+        assert!(error.starts_with(&format!("failed to load model {b}: ")), "{error}");
+    }
+
+    /// `score` rejects a repeated --regions name, even one no model uses, and a VCF that is not on
+    /// the models' reference.
+    #[test]
+    fn score_checks_the_region_names_and_the_vcf_reference() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
+        let vcf = crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[]);
+        let vcf = vcf.display().to_string();
+        let out = dir.path().join("out.vcf.gz").display().to_string();
+        let snp = save_model(dir.path(), "snp.winnowr.json", VariantType::Snp, &[], 100_000);
+        let bed = dir.path().join("unused.bed");
+        std::fs::write(&bed, "chr1\t0\t100\n").unwrap();
+        let unused = format!("unused={}", bed.display());
+        let score = ["score", "--vcf", &vcf, "--models", &snp, "-o", &out];
+        let error = run_command(&[&score[..], &["--regions", &unused, &unused]].concat())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "region names must be unique; repeated: unused");
+
+        let short = save_model(dir.path(), "short.winnowr.json", VariantType::Snp, &[], 1000);
+        let error = run_command(&["score", "--vcf", &vcf, "--models", &short, "-o", &out])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "VCF {vcf} is not on the reference model {short} was trained on: other lengths: \
+                 chr1 (100000 bp, model 1000 bp)"
+            )
         );
     }
 

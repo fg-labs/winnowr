@@ -27,5 +27,6 @@
   - [train](tools/train.md)
   - [evaluate](tools/evaluate.md)
   - [stratify](tools/stratify.md)
+  - [check-models](tools/check-models.md)
   - [score](tools/score.md)
 - [Developer docs](developers.md)

@@ -46,6 +46,28 @@ impl FeatureSource {
     }
 }
 
+/// The feature source every one of `items` has (by `source`), or `None` if there are none.
+///
+/// # Errors
+///
+/// Returns the first item and the first with another source, if there is one.
+pub fn shared_source<T, I, F>(
+    items: I,
+    source: F,
+) -> std::result::Result<Option<FeatureSource>, (T, T)>
+where
+    I: IntoIterator<Item = T>,
+    F: Fn(&T) -> FeatureSource,
+{
+    let mut items = items.into_iter();
+    let Some(first) = items.next() else { return Ok(None) };
+    let shared = source(&first);
+    match items.find(|item| source(item) != shared) {
+        Some(other) => Err((first, other)),
+        None => Ok(Some(shared)),
+    }
+}
+
 impl fmt::Display for FeatureSource {
     /// The source as [`std::str::FromStr`] parses it back: `gvcf`, `vcf`, or `alignments:`
     /// and the read settings (e.g. `alignments:mapq20,bq10,flank5`).
@@ -138,6 +160,20 @@ mod tests {
         let json = format!("\"{text}\"");
         let error = serde_json::from_str::<FeatureSource>(&json).unwrap_err().to_string();
         assert!(error.starts_with("unknown feature source"), "{error}");
+    }
+
+    /// The shared source of no items is none; of items that differ, the first and the first
+    /// that differs from it.
+    #[test]
+    fn items_share_a_source_or_name_the_first_that_differs() {
+        let source = |&(_, source): &(usize, FeatureSource)| source;
+        let (gvcf, vcf) = (FeatureSource::Gvcf, FeatureSource::Vcf);
+        assert_eq!(shared_source(Vec::<(usize, FeatureSource)>::new(), source), Ok(None));
+        assert_eq!(shared_source([(0, vcf), (1, vcf)], source), Ok(Some(vcf)));
+        assert_eq!(
+            shared_source([(0, vcf), (1, vcf), (2, gvcf), (3, gvcf)], source),
+            Err(((0, vcf), (2, gvcf)))
+        );
     }
 
     /// Only the gVCF source is the default, which tables and models do not record.

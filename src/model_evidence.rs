@@ -162,11 +162,11 @@ pub fn check_table<E: ModelEvidence>(
 }
 
 /// The models (by path) that use the evidence.
-pub fn models_using<E: ModelEvidence>(models: &[WinnowrModel], paths: &[PathBuf]) -> Vec<String> {
+pub fn models_using<E: ModelEvidence>(models: &[&ModelInfo], paths: &[PathBuf]) -> Vec<String> {
     paths
         .iter()
         .zip(models)
-        .filter(|(_, model)| E::of_model(&model.info).is_some())
+        .filter(|(_, info)| E::of_model(info).is_some())
         .map(|(path, _)| path.display().to_string())
         .collect()
 }
@@ -203,12 +203,12 @@ pub fn check_supplied<E: ModelEvidence>(
 ///
 /// Returns an error if two models need it measured differently.
 pub fn models_options<E: ModelEvidence>(
-    models: &[WinnowrModel],
+    models: &[&ModelInfo],
     paths: &[PathBuf],
 ) -> Result<Option<E>> {
     let mut options: Option<E> = None;
-    for (path, model) in paths.iter().zip(models) {
-        match (options, E::of_model(&model.info)) {
+    for (path, info) in paths.iter().zip(models) {
+        match (options, E::of_model(info)) {
             (None, trained) => options = trained,
             (Some(first), Some(trained)) if first != trained => bail!(
                 "--models need {} evidence measured with different {}: {} needs {trained}, \
@@ -287,7 +287,7 @@ pub fn measure_and_decide(
     timer: &mut PhaseTimer,
 ) -> Result<HashMap<CallKey, Decision>> {
     type Measured = (Option<Vec<StrlenRow>>, Option<PileupTables>);
-    check_model_kinds(models)?;
+    check_model_kinds(models.iter().map(|model| &model.info))?;
     let mut per_model: Vec<Option<Vec<(CallKey, Decision)>>> = vec![None; models.len()];
     // The measurement gets its own pool, so that neither it nor the scoring waits for the other's
     // queued work. Both have -t threads, so up to twice -t run at once (as the --alignments help
@@ -454,20 +454,21 @@ mod tests {
         let models = [model(new, Some("default")), model(None, None), model(new, Some("mapq30"))];
         let paths: Vec<PathBuf> =
             ["a", "b", "c"].iter().map(|name| PathBuf::from(format!("{name}.json"))).collect();
-        assert_eq!(models_using::<StrlenOptions>(&models, &paths), ["a.json", "c.json"]);
-        assert_eq!(models_options::<StrlenOptions>(&models, &paths).unwrap(), new);
+        let infos: Vec<&ModelInfo> = models.iter().map(|model| &model.info).collect();
+        assert_eq!(models_using::<StrlenOptions>(&infos, &paths), ["a.json", "c.json"]);
+        assert_eq!(models_options::<StrlenOptions>(&infos, &paths).unwrap(), new);
         assert_eq!(
-            models_options::<PileupOptions>(&models[..2], &paths).unwrap(),
+            models_options::<PileupOptions>(&infos[..2], &paths).unwrap(),
             Some(PileupOptions::default())
         );
-        let message = models_options::<PileupOptions>(&models, &paths).unwrap_err().to_string();
+        let message = models_options::<PileupOptions>(&infos, &paths).unwrap_err().to_string();
         assert!(
             message.contains("c.json needs mapq30,bq10,flank5, another model mapq20,bq10,flank5"),
             "{message}"
         );
-        assert_eq!(models_options::<PileupOptions>(&models[1..2], &paths).unwrap(), None);
+        assert_eq!(models_options::<PileupOptions>(&infos[1..2], &paths).unwrap(), None);
 
-        let users = models_using::<PileupOptions>(&models, &paths);
+        let users = models_using::<PileupOptions>(&infos, &paths);
         let tables = [PathBuf::from("p.tsv")];
         assert!(check_supplied::<PileupOptions>(&users, &tables, false).is_ok());
         assert!(check_supplied::<PileupOptions>(&users, &[], true).is_ok());

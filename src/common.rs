@@ -5,10 +5,6 @@
 //! of `--help` (the options describe them); `cli.rs` has its own enums for options whose values
 //! differ (e.g. add `none`).
 
-use std::fmt;
-use std::str::FromStr;
-
-use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
 /// The contigs extracted by default: the GRCh38 autosomes.
@@ -101,7 +97,7 @@ macro_rules! named_enum {
             /// Every variant, in declaration order.
             pub const ALL: &'static [$type] = &[$($type::$variant),+];
 
-            /// The lowercase name, as written in model files and on the command line.
+            /// The lowercase name, as written in files and on the command line.
             #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self {
@@ -110,13 +106,13 @@ macro_rules! named_enum {
             }
         }
 
-        impl fmt::Display for $type {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl ::std::fmt::Display for $type {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.write_str(self.as_str())
             }
         }
 
-        impl FromStr for $type {
+        impl ::std::str::FromStr for $type {
             type Err = anyhow::Error;
 
             fn from_str(s: &str) -> anyhow::Result<Self> {
@@ -124,13 +120,15 @@ macro_rules! named_enum {
                     $($name => Ok($type::$variant),)+
                     _ => {
                         let names: Vec<&str> = Self::ALL.iter().map(|v| v.as_str()).collect();
-                        bail!("unknown {} '{s}' (expected one of: {})", $what, names.join(", "))
+                        ::anyhow::bail!("unknown {} '{s}' (expected one of: {})", $what, names.join(", "))
                     }
                 }
             }
         }
     };
 }
+
+pub(crate) use named_enum;
 
 named_enum!(Task, "task", { Genotype => "genotype", Promote => "promote" });
 named_enum!(VariantType, "variant type", { Snp => "snp", Indel => "indel" });

@@ -1,0 +1,130 @@
+# check-models
+
+Checks a set of models before a run, without scoring anything, and reports what they need. It
+reads each model's information but never its booster (the XGBoost trees), so it is fast even for
+large models, and it runs the model-set checks `score` runs at startup, and more, reporting every
+problem at once:
+
+- the models can be scored together: at most one model per task and variant type, trained on
+  the same contigs and reference, on features from one feature source (`gvcf`, `vcf`, or
+  `alignments` with its read settings), and needing the repeat-length and pileup evidence
+  measured one way;
+- `--regions` has a BED for every region a model uses, and no name twice; each BED given is
+  read, and must have intervals on the models' contigs. A BED that `score` does not read (one no
+  model uses, or the not-difficult regions without an indel genotype model) only warns: `score`
+  still reads the not-difficult regions with `--abstain-actions`, which `check-models` is not
+  given. While a model cannot be read, every BED counts as used;
+- the models' reference is that of `--reference` (a FASTA with its `.fai`, or the `.fai`
+  itself; only the index is read) and of `--vcf` (only its header is read, so it need not be
+  indexed or compressed, though `score` needs it bgzipped and indexed).
+
+It does not check that a booster loads, has the model's features or its classes (`score` checks
+that when it loads the boosters, after the model-set checks), nor the sample's evidence (the VCF's fields, the reads, or the
+`--strlen` and `--pileup` tables): the summary says what the models need instead.
+
+Errors make it fail (a non-zero exit status); warnings, such as a model trained by another
+winnowr version, do not.
+
+`score` runs the model-set checks at startup, before it reads any calls, and reports their
+problems together: one model per task and variant type, the same contigs and reference, one
+feature source and evidence settings, the region names (a BED for every region a model uses, and
+no name twice), and the VCF's contigs against the models' reference. It differs in what comes
+before and after them: it stops at the first model whose information it cannot read and at an
+unreadable VCF before the checks, and after them loads the boosters (stopping at the first that
+does not load) and reads the region BEDs (those a model uses), stopping at the first it cannot
+read or that has no interval on the models' contigs. `model_unreadable`,
+`input_unreadable`, `reference_not_checked` and `not_difficult_missing` are `check-models`' own,
+and so is reading every BED given.
+
+## Usage
+
+```console
+winnowr check-models --models snp.winnowr.json indel.winnowr.json \
+  --regions segdups=segdups.bed.gz notinalldifficultregions=GRCh38_notinalldifficultregions.bed.gz \
+  --reference GRCh38.fa
+# A JSON summary, for a pipeline to read
+winnowr check-models --models snp.winnowr.json indel.winnowr.json --vcf sample.vcf.gz --json
+```
+
+Without `--json`, it prints a line per model (its task and variant type, feature source, what it
+needs and the regions it uses) on standard output, and each problem on standard error as
+`error: [check] message` or `warning: [check] message`.
+
+## Checks
+
+Each problem has a stable check id. New ids may be added; a caller should ignore ids it does not
+know.
+
+| check | severity | what |
+|-------|----------|------|
+| `model_unreadable` | error | a model file cannot be read: its name, its JSON, its fields, or its information's own checks |
+| `format_version` | error | a model file is of a format version this winnowr does not read |
+| `duplicate_model` | error | a model file is given twice |
+| `model_kinds` | error | more than one model of a task and variant type |
+| `contigs_differ` | error | the models were trained on different contigs |
+| `reference_differs` | error | the models record different lengths of a contig |
+| `reference_mismatch` | error | a model's contigs are missing from, or of other lengths in, `--reference` or `--vcf` |
+| `feature_source_differs` | error | the models' features come from different feature sources (read settings included) |
+| `strlen_settings_differ` | error | the models need repeat-length evidence measured with different settings |
+| `pileup_settings_differ` | error | the models need pileup evidence measured with different settings |
+| `region_missing` | error | a region a model uses has no `--regions` BED |
+| `region_repeated` | error | a `--regions` name is given twice |
+| `region_unreadable` | error, or warning | a region BED cannot be read; a warning for a BED `score` does not read |
+| `region_contigs` | error, or warning | a region BED has no interval on the models' contigs; a warning for a BED `score` does not read |
+| `input_unreadable` | error | `--reference` or `--vcf` cannot be read |
+| `pileup_alignment_passes` | warning | a model of the `alignments` source counts its pileup with another base quality or flank than its alignment settings, so `score` reads the reads twice |
+| `region_unused` | warning | a `--regions` BED no model uses (other than the not-difficult regions) |
+| `not_difficult_missing` | warning | an indel genotype model, and no `notinalldifficultregions` BED, which `score`'s default policy uses |
+| `other_winnowr_version` | warning | a model was trained by another winnowr version |
+| `no_reference_contigs` | warning | a model records no reference contigs, so its reference cannot be checked |
+| `reference_not_checked` | warning | neither `--reference` nor `--vcf` was given |
+
+## JSON summary
+
+With `--json`, the summary is printed on standard output as one JSON object, also when the
+command fails (read the exit status, or `ok`). Its schema is versioned by `schema_version`, now
+1. The version changes only when a key is removed or renamed, or changes meaning: new keys, check
+ids and values do not change it, and a caller should ignore those it does not know.
+
+| key | what it holds |
+|-----|---------------|
+| `schema_version` | 1 |
+| `winnowr_version` | the winnowr that checked the models |
+| `ok` | `true` if no problem is an error |
+| `booster_checked` | always `false`: the boosters are not read |
+| `models` | each model, in the order given (below) |
+| `set` | what the models share (below); a value is `null` where they disagree |
+| `inputs` | `reference` and `vcf` as given (or `null`), and `regions`: each `name`, `path` and the models that use it (`used_by`) |
+| `problems` | every problem: `check`, `severity` (`error` or `warning`), `model` (its path, or `null` for a problem of the set) and `message` |
+
+Each entry of `models` has its `path` and `readable`. A model that cannot be read has only
+those two keys; a readable one also has:
+
+| key | what it holds |
+|-----|---------------|
+| `format_version` | the model format version |
+| `task`, `variant_type` | `genotype` or `promote`; `snp` or `indel` |
+| `regenotype` | whether it has the re-genotype class |
+| `n_features` | the number of features |
+| `contigs` | the contigs its training calls came from |
+| `reference_contigs` | those contigs' lengths in its reference (`null` if it records none) |
+| `region_names` | the region sets its features use |
+| `training_samples` | the training samples |
+| `feature_source` | `gvcf`, `vcf`, or `alignments:` and the read settings (e.g. `alignments:mapq20,bq10,flank5`) |
+| `alignment_settings` | the read settings of the `alignments` source, else `null` |
+| `strlen_settings` | the read settings its repeat-length evidence must be measured with (the legacy `mapq0,flank2` for a model that records none), or `null` |
+| `pileup_settings` | the settings its pileup evidence must be measured with, or `null` |
+| `needs` | what scoring with it needs: `strlen` and `pileup` (tables, or `--alignments`), `alignments` (the reads, for the `alignments` source) and `gvcf` (the raw annotations, in the VCF or a gVCF, for the `gvcf` source) |
+| `trained_with` | the `winnowr` and `xgboost` versions that trained it |
+
+`set` has `contigs` (the first model's), `reference_contigs` (the models', merged: `null` if any
+model records none, or two models record different lengths of a contig), `region_names`
+(any model's), `feature_source`, `alignment_settings`, `strlen_settings`, `pileup_settings`,
+`needs` (what any model needs) and `not_difficult_regions`: their `name`, whether an indel
+genotype model `used` them, and whether `--regions` `given` them.
+
+## Options
+
+```text
+{{#include ../../_generated/cli/check-models.txt}}
+```

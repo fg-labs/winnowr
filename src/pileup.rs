@@ -1519,7 +1519,8 @@ pub fn measure_annotations_and_pileup<S: AsRef<str>>(
         return Ok((sites, Some(PileupTables { options, rows })));
     }
     let sites = measure_annotations(inputs, regions, annotations)?;
-    log::info!(
+    // score reports this at startup (see `crate::model_set`).
+    log::debug!(
         "The pileup settings {options} read alleles with another base quality or flank than the \
          alignment settings {annotations}: reading the reads again for the pileup evidence"
     );
