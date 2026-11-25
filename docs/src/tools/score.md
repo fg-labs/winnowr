@@ -2,7 +2,8 @@
 
 Applies models to a sample's calls and writes the VCF with drops, promotions, flips and
 re-genotypes. See [Scoring](../user-guide/scoring.md). The models' feature source decides
-whether `--gvcf` is read (see [Feature sources](../user-guide/feature-sources.md)).
+whether `--gvcf` is read, and whether `--alignments` is needed (see
+[Feature sources](../user-guide/feature-sources.md)).
 
 ## Usage
 

@@ -20,12 +20,14 @@ repeat-length or pileup features need `--strlen` or `--pileup` tables, or `--ali
 [Repeat-length features](repeat-length.md) and [Pileup features](pileup.md)).
 
 The models given to one run must share a feature source, which decides where the features of
-gVCF-mode annotations come from: models trained on `extract --feature-source vcf` tables need no
-`--gvcf`. See [Feature sources](feature-sources.md).
+gVCF-mode annotations come from: models trained on `extract --feature-source vcf` or
+`extract --alignments` tables need no `--gvcf`, and the latter need `--alignments` and
+`--reference`, which `score` measures the reads from before any model scores. See
+[Feature sources](feature-sources.md).
 
-The depth feature (`dp_norm`) is each call's RAW_MQandDP depth (for models of the `vcf` feature
-source, see [Feature sources](feature-sources.md)) over the median of that depth across the calls
-on the models' contigs, which `score` logs. For a VCF of only part of the genome, e.g. a target
+The depth feature (`dp_norm`) is each call's RAW_MQandDP depth (for models of the `vcf` and
+`alignments` feature sources, see [Feature sources](feature-sources.md)) over the median of that
+depth across the calls on the models' contigs, which `score` logs. For a VCF of only part of the genome, e.g. a target
 footprint, that median is skewed; `--dp-median` gives the depth to divide by instead (at least 1):
 the median depth of the sample's whole-genome calls, as `extract` or `score` logs it, not coverage
 from another tool. Normalize as the models' training tables were: nothing records or checks the

@@ -35,8 +35,9 @@ Run `extract` the same way for every sample, the held-out one included. `train` 
 `snp.winnowr.json` and `indel.winnowr.json`; score with them as in the
 [scoring quick start](quick-scoring.md).
 
-Without gVCFs, extract every table with `--feature-source vcf` (and no `--gvcf`), which derives
-the features of gVCF-mode annotations from the VCF's standard annotations; see
+Without gVCFs, extract every table with `--alignments` and `--reference` (and no `--gvcf`), which
+derives the features of gVCF-mode annotations from the VCF's standard annotations and the sample's
+reads, or with `--feature-source vcf`, which derives what it can from the VCF alone; see
 [Feature sources](../user-guide/feature-sources.md). `train` takes tables of one feature source
 only.
 

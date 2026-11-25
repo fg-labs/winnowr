@@ -185,8 +185,10 @@ pub struct DerivedFeatures {
 ///
 /// The raw annotations (RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ) are those of the records'
 /// feature source: a reblocked gVCF's, or the stand-ins that [`crate::vcf_source`] derives from a
-/// standard VCF (where the RAW_MQandDP depth is INFO/DP, and `mq` is INFO/MQ). The features of the
-/// two sources are computed alike.
+/// standard VCF (where the RAW_MQandDP depth is INFO/DP, and `mq` is INFO/MQ), with, for the
+/// alignments source, the mapping quality sums and depth measured from the reads instead (see
+/// [`crate::read_annotations::MapqSums`]: the depth is the reads counted over the record, and
+/// `mq` their root mean square MAPQ). The features of every source are computed alike.
 ///
 /// The REF span of a record is `[pos - 1, pos - 1 + len(REF))` (0-based, half-open), so a
 /// deletion overlaps a region through its deleted bases.
@@ -237,7 +239,8 @@ pub fn derive_features(
     let mut derived = DerivedFeatures {
         sor: column(&|r| {
             let from_sb = strand_odds_ratio(r.sb_ref_fwd, r.sb_ref_rev, r.sb_alt_fwd, r.sb_alt_rev);
-            // Only the VCF feature source sets a fallback (INFO/SOR); FORMAT/SB is preferred.
+            // Only the VCF and alignments feature sources set a fallback (INFO/SOR); FORMAT/SB is
+            // preferred.
             if from_sb.is_nan() { r.raw.sor } else { from_sb }
         }),
         het: column(&|r| f64::from(u8::from(r.genotype == Genotype::HET))),
@@ -435,6 +438,45 @@ mod tests {
         let derived = derive_features(&[snp(1), snp(2)], &[], None);
         assert!(derived.dp_norm.iter().all(|value| value.is_nan()));
         assert!(derive_features(&[], &[], None).dp_norm.is_empty());
+    }
+
+    /// When more than half the calls have a depth of 0 (e.g. no read counted), their median is 0,
+    /// and every call's `dp_norm` is missing, the calls with a depth too; a given median divides
+    /// them.
+    #[test]
+    fn dp_norm_is_missing_for_every_call_when_the_median_depth_is_0() {
+        let records: Vec<RawRecord> = [0.0, 0.0, 5.0]
+            .iter()
+            .zip(1..)
+            .map(|(&depth, pos)| {
+                let mut call = snp(pos);
+                call.raw.raw_dp = depth;
+                call
+            })
+            .collect();
+        let derived = derive_features(&records, &[], None);
+        assert!(derived.dp_norm.iter().all(|value| value.is_nan()), "{:?}", derived.dp_norm);
+        assert_eq!(derived.dp_norm_divisor, DpNormDivisor::from_depth(0.0, false));
+        assert_eq!(derive_features(&records, &[], Some(10.0)).dp_norm, [0.0, 0.0, 0.5]);
+    }
+
+    /// With an even count, the median averages the middle two depths: when exactly half the
+    /// calls have a depth of 0, the median is positive and `dp_norm` is present.
+    #[test]
+    fn dp_norm_is_present_when_exactly_half_the_depths_are_0() {
+        let records: Vec<RawRecord> = [0.0, 0.0, 5.0, 5.0]
+            .iter()
+            .zip(1..)
+            .map(|(&depth, pos)| {
+                let mut call = snp(pos);
+                call.raw.raw_dp = depth;
+                call
+            })
+            .collect();
+        let derived = derive_features(&records, &[], None);
+        // The median of 0, 0, 5 and 5 is 2.5.
+        assert_eq!(derived.dp_norm, [0.0, 0.0, 2.0, 2.0]);
+        assert_eq!(derived.dp_norm_divisor, DpNormDivisor::from_depth(2.5, false));
     }
 
     #[test]

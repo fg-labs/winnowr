@@ -59,6 +59,8 @@ pub struct TableInputs<'a> {
     /// Where the raw annotations come from (the feature source the table records): by default
     /// the VCF's own, with no gVCF.
     pub annotations: AnnotationInputs<'a>,
+    /// Outputs to protect against a gVCF and its indexes only when that gVCF is opened.
+    pub outputs: &'a [std::path::PathBuf],
     /// The region sets to flag.
     pub regions: &'a [RegionSet],
     /// Repeat-tract evidence (see [`crate::strlen`]) to join as repeat-length features.
@@ -70,6 +72,32 @@ pub struct TableInputs<'a> {
     /// The depth `dp_norm` divides by, in place of the calls' median depth (see
     /// [`derive_features`]); checked with [`crate::features::check_dp_median`].
     pub dp_median: Option<f64>,
+}
+
+/// Checks the inputs of a feature table that can be checked before any is read:
+/// [`build_feature_table`] runs it first, and a command runs it before a pass over the reads
+/// that the table needs, so that a mistake fails before the pass rather than after it.
+///
+/// # Errors
+///
+/// Returns an error if the promote-label inputs are incomplete, the given depth median is not a
+/// depth (see [`crate::features::check_dp_median`]), a contig is repeated, or a region set has no
+/// intervals on `contigs`.
+pub fn check_table_inputs<S: AsRef<str>>(
+    contigs: &[S],
+    regions: &[RegionSet],
+    truth: &TruthInputs<'_>,
+    dp_median: Option<f64>,
+) -> Result<()> {
+    truth.check()?;
+    if let Some(dp_median) = dp_median {
+        crate::features::check_dp_median(dp_median)?;
+    }
+    crate::raw_records::check_unique_contigs(contigs)?;
+    for region_set in regions {
+        region_set.check_contigs(contigs)?;
+    }
+    Ok(())
 }
 
 /// Extracts the features of every SNP and indel call of a sample and, given a hap.py VCF,
@@ -97,16 +125,17 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
     summary: &VcfSummary,
     inputs: &TableInputs<'_>,
 ) -> Result<FeatureTable> {
-    inputs.truth.check()?;
-    if let Some(dp_median) = inputs.dp_median {
-        crate::features::check_dp_median(dp_median)?;
-    }
-    crate::raw_records::check_unique_contigs(contigs)?;
-    for region_set in inputs.regions {
-        region_set.check_contigs(contigs)?;
-    }
+    check_table_inputs(contigs, inputs.regions, &inputs.truth, inputs.dp_median)?;
     let mut timer = PhaseTimer::start();
-    let records = extract_raw_records(vcf, inputs.annotations, contigs)?;
+    let before_gvcf = |gvcf: &Path| {
+        let indexes = crate::vcf::index_candidates(gvcf);
+        for output in inputs.outputs {
+            crate::scoring::check_output_not_input(output, [("gVCF", gvcf)])?;
+            crate::scoring::check_output_not_indexes(output, "gVCF index", &indexes)?;
+        }
+        Ok(())
+    };
+    let records = extract_raw_records(vcf, inputs.annotations, contigs, &before_gvcf)?;
     timer.lap("reading the calls");
     let labels = inputs.truth.happy.map(|happy| read_happy_labels(happy, contigs)).transpose()?;
     if labels.is_some() {

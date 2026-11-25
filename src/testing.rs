@@ -106,9 +106,11 @@ pub struct TestRead<'a> {
     pub flag: u16,
     /// The mapping quality.
     pub mapq: u8,
-    /// The base quality of every base.
+    /// The base quality of every base, unless `quals` gives them.
     pub qual: u8,
-    /// The bases (`None`: all `A`).
+    /// The base quality of each base (`None`: `qual` for every base).
+    pub quals: Option<&'a [u8]>,
+    /// The bases (`None`: all `A`; `*`: no SEQ, and no qualities).
     pub bases: Option<&'a str>,
 }
 
@@ -130,10 +132,18 @@ pub fn write_bam(dir: &Path, name: &str, length: u64, reads: &[TestRead<'_>]) ->
             .filter(|op| matches!(op.char(), 'M' | 'I' | 'S' | '=' | 'X'))
             .map(|op| op.len() as usize)
             .sum::<usize>();
-        let bases = read.bases.map_or_else(|| vec![b'A'; query_len], |b| b.as_bytes().to_vec());
-        assert_eq!(bases.len(), query_len, "the bases of {} do not match its CIGAR", read.name);
+        let (bases, quals) = if read.bases == Some("*") {
+            (Vec::new(), Vec::new())
+        } else {
+            let bases = read.bases.map_or_else(|| vec![b'A'; query_len], |b| b.as_bytes().to_vec());
+            assert_eq!(bases.len(), query_len, "the bases of {} do not match its CIGAR", read.name);
+            let quals = read.quals.map_or_else(|| vec![read.qual; query_len], <[u8]>::to_vec);
+            let name = read.name;
+            assert_eq!(quals.len(), query_len, "the qualities of {name} do not match its CIGAR");
+            (bases, quals)
+        };
         let mut record = bam::Record::new();
-        record.set(read.name.as_bytes(), Some(&cigar), &bases, &vec![read.qual; query_len]);
+        record.set(read.name.as_bytes(), Some(&cigar), &bases, &quals);
         record.set_tid(0);
         record.set_pos(read.pos);
         record.set_mapq(read.mapq);

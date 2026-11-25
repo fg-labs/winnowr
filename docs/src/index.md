@@ -24,8 +24,8 @@ No trained models are distributed: you train them on samples with a truth set, s
 The VCF must be genotyped from a HaplotypeCaller gVCF (e.g. one made with `--dragen-mode`). `score`
 and `extract` also take that gVCF (`--gvcf`), and read it only when the VCF lacks the raw
 annotations. Without the gVCF, models can be trained on features derived from the VCF's standard
-annotations instead (`extract --feature-source vcf`); see
-[Feature sources](user-guide/feature-sources.md).
+annotations and the reads instead (`extract --alignments`), or from the VCF alone
+(`extract --feature-source vcf`); see [Feature sources](user-guide/feature-sources.md).
 
 By default `score` also applies two indel rules that are fixed, not chosen by cross-validation. An
 indel call that the thresholds leave alone is dropped when its P(keep) is below 0.5. Given GIAB's

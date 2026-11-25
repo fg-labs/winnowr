@@ -16,11 +16,14 @@ use rust_htslib::bcf::{IndexedReader, Read, Record};
 
 use crate::alleles::{Genotype, first_alt_index, variant_type_of};
 use crate::common::VariantType;
+use crate::evidence::Evidence as _;
 use crate::feature_source::FeatureSource;
 use crate::gvcf::{
     RawAnnotation, check_gvcf_header, has_raw_annotations, matching_site, missing_raw_annotations,
     raw_annotation, read_gvcf_sites,
 };
+use crate::pileup::{MeasuredSite, PileupOptions};
+use crate::read_annotations::ReadAnnotationOptions;
 use crate::shards::{ContigShard, ReaderPool, contig_shards};
 use crate::vcf::{
     DeclaredIds, FieldReader, check_contigs, fetch_span, field_name, filter_string, has_field,
@@ -103,6 +106,16 @@ pub enum AnnotationInputs<'a> {
     /// [`crate::vcf_source`]); the header must declare INFO/MQ, INFO/DP, FORMAT/AD, FORMAT/PL, and
     /// FORMAT/SB or INFO/SOR.
     Vcf,
+    /// [`FeatureSource::VcfAlignments`]: as [`AnnotationInputs::Vcf`], but with the mapping
+    /// quality sums and depth measured from the reads in place of INFO/MQ and INFO/DP (see
+    /// [`crate::read_annotations::MapqSums`]); the header must declare FORMAT/AD, FORMAT/PL, and FORMAT/SB or INFO/SOR.
+    VcfAlignments {
+        /// The sites of the VCF's records, measured with `options` (see
+        /// [`crate::pileup::measure_annotations`]): one for each SNP and indel record.
+        sites: &'a [MeasuredSite],
+        /// The settings the reads were measured with.
+        options: ReadAnnotationOptions,
+    },
 }
 
 impl AnnotationInputs<'_> {
@@ -112,15 +125,18 @@ impl AnnotationInputs<'_> {
         match self {
             AnnotationInputs::Gvcf(_) => FeatureSource::Gvcf,
             AnnotationInputs::Vcf => FeatureSource::Vcf,
+            AnnotationInputs::VcfAlignments { options, .. } => {
+                FeatureSource::VcfAlignments(*options)
+            }
         }
     }
 
-    /// The gVCF the gVCF source may read, if any (`None` for the VCF source).
+    /// The gVCF the gVCF source may read, if any (`None` for the other sources).
     #[must_use]
     pub fn gvcf(&self) -> Option<&Path> {
         match self {
             AnnotationInputs::Gvcf(gvcf) => *gvcf,
-            AnnotationInputs::Vcf => None,
+            AnnotationInputs::Vcf | AnnotationInputs::VcfAlignments { .. } => None,
         }
     }
 }
@@ -138,14 +154,19 @@ impl Default for AnnotationInputs<'_> {
 /// header declares all of them (any gVCF is then not read, unless no record has them), and
 /// otherwise from the gVCF, joined by position. Records without them (no `RAW_MQandDP`, or no
 /// gVCF site) get [`RawAnnotation::MISSING`]. With [`AnnotationInputs::Vcf`], they are derived
-/// from each record's standard annotations (see [`crate::vcf_source::derive_annotation`]). Records that are neither SNPs
-/// nor indels (see [`variant_type_of`]) are skipped.
+/// from each record's standard annotations (see [`crate::vcf_source`]): the shared parts, and the
+/// mapping quality and depth from INFO/MQ and INFO/DP. With [`AnnotationInputs::VcfAlignments`]
+/// the shared parts are derived the same way, and the mapping quality sums and depth are those
+/// measured from the reads at the record (see [`join_read_annotations`]).
+/// Records that are neither SNPs nor indels (see [`variant_type_of`]) are skipped.
 ///
 /// # Arguments
 ///
 /// * `vcf` - the indexed single-sample VCF.
 /// * `annotations` - where the raw annotations come from.
 /// * `contigs` - the contigs to read, in order.
+/// * `before_gvcf` - validates a gVCF immediately before its first open, including the
+///   records-missing fallback; never called for an unused gVCF.
 ///
 /// # Errors
 ///
@@ -154,11 +175,14 @@ impl Default for AnnotationInputs<'_> {
 /// raw annotations (including a VCF whose header declares them but none of whose records has
 /// them, without a gVCF), the VCF source's VCF does not declare the fields it needs (see
 /// [`crate::vcf_source::check_header`]) or none of its records has INFO/MQ and a positive
-/// INFO/DP, or a file cannot be read.
+/// INFO/DP, the alignments source's VCF does not declare the fields it needs (see
+/// [`crate::vcf_source::check_header_with_reads`]) or its sites are not of its records (see
+/// [`join_read_annotations`]), or a file cannot be read.
 pub fn extract_raw_records<P, S>(
     vcf: P,
     annotations: AnnotationInputs<'_>,
     contigs: &[S],
+    before_gvcf: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<Vec<RawRecord>>
 where
     P: AsRef<Path>,
@@ -169,19 +193,29 @@ where
     let mut annotation_source = {
         let reader = open_indexed(vcf)?;
         let header = reader.header();
-        check_vcf_header(header, vcf, contigs)?;
-        // The source's own checks first, so that the VCF source's missing fields are an error,
-        // not first logged as features missing for every call.
-        let source = match annotations {
-            AnnotationInputs::Vcf => {
-                vcf_source::check_header(header, vcf)?;
-                AnnotationSource::DerivedFromVcf
-            }
-            AnnotationInputs::Gvcf(gvcf) => gvcf_annotation_source(header, vcf, gvcf, contigs)?,
-        };
-        // INFO/SOR stands in for FORMAT/SB for the VCF source.
-        let skip_sb = annotations == AnnotationInputs::Vcf && has_info(header, b"SOR");
-        warn_undeclared_fields(header, vcf, skip_sb);
+        let feature_source = annotations.feature_source();
+        let source = check_header_for_source(
+            header,
+            vcf,
+            feature_source,
+            annotations.gvcf(),
+            contigs,
+            before_gvcf,
+        )?;
+        // INFO/SOR stands in for FORMAT/SB for the sources that derive from the VCF, and the
+        // alignments source reads INFO/DP only for the dp feature.
+        let derived = matches!(source, AnnotationSource::Derived(_));
+        let skip: &[&str] = if derived && has_info(header, b"SOR") { &[SB] } else { &[] };
+        let reads = matches!(source, AnnotationSource::Derived(MqSource::Reads));
+        let not_core: &[&str] = if reads { &[INFO_DP] } else { &[] };
+        warn_undeclared_fields(header, vcf, skip, not_core);
+        if derived {
+            info!(
+                "Deriving the features of gVCF-mode annotations from the standard annotations of \
+                 VCF {} (feature source {feature_source})",
+                vcf.display()
+            );
+        }
         source
     };
     let gvcf = annotations.gvcf();
@@ -194,7 +228,7 @@ where
     let n_records: usize = per_shard.iter().map(|shard| shard.records.len()).sum();
     let n_missing: usize = per_shard.iter().map(|shard| shard.missing_annotations).sum();
     let all_missing = n_records > 0 && n_missing == n_records;
-    if all_missing && matches!(annotation_source, AnnotationSource::DerivedFromVcf) {
+    if all_missing && matches!(annotation_source, AnnotationSource::Derived(MqSource::Info)) {
         bail!(
             "VCF {} declares INFO/MQ and INFO/DP, but none of its {n_records} records has both \
              (with a positive INFO/DP), so the vcf feature source has no mapping quality or depth \
@@ -218,6 +252,7 @@ where
             vcf.display(),
             gvcf.display()
         );
+        before_gvcf(gvcf)?;
         check_gvcf_header(open_indexed(gvcf)?.header(), gvcf, contigs)?;
         annotation_source = AnnotationSource::RawFromGvcf(gvcf);
         per_shard = read_shards(vcf, annotation_source, &shards)?;
@@ -254,24 +289,19 @@ where
         records.extend(shard.records);
     }
     info!("Read {} records on {} contig(s)", records.len(), contigs.len());
+    if let AnnotationInputs::VcfAlignments { sites, .. } = annotations {
+        join_read_annotations(&mut records, sites)?;
+    }
     if skipped > 0 {
         info!(
             "Skipped {skipped} records that are neither SNPs nor indels (MNPs, symbolic, \
              breakend or only `*` alleles)"
         );
     }
-    if missing > 0 {
-        let what = match annotation_source {
-            AnnotationSource::RawFromVcf => "lack RAW_MQandDP (set to missing)",
-            AnnotationSource::RawFromGvcf(_) => "had no gVCF annotations (set to missing)",
-            AnnotationSource::DerivedFromVcf => {
-                "lack INFO/MQ, or a positive INFO/DP (their mq, and without INFO/DP their \
-                 dp_norm, is missing)"
-            }
-        };
+    if let Some(what) = annotation_source.missing().filter(|_| missing > 0) {
         warn!("{missing} records {what}");
     }
-    if matches!(annotation_source, AnnotationSource::DerivedFromVcf) {
+    if let AnnotationSource::Derived(_) = annotation_source {
         warn_missing_vcf_source_values(&records);
     }
     if other_alleles > 0 {
@@ -302,6 +332,113 @@ fn warn_missing_vcf_source_values(records: &[RawRecord]) {
     }
 }
 
+/// Checks a VCF for a feature source before any of its records is read: one sample, FORMAT/GT and
+/// `contigs` in the header, the fields the source derives from (see [`crate::vcf_source`]), or,
+/// for the gVCF source, the raw annotations or a `gvcf` that has them. [`extract_raw_records`]
+/// runs the same check; `extract` and `score` also run it before measuring the reads the
+/// alignments source needs, so that a mistake fails before that pass rather than after it.
+///
+/// # Errors
+///
+/// Returns an error if the VCF cannot be opened or fails a check.
+pub fn check_vcf<S: AsRef<str>>(
+    vcf: &Path,
+    source: FeatureSource,
+    gvcf: Option<&Path>,
+    contigs: &[S],
+) -> Result<()> {
+    check_unique_contigs(contigs)?;
+    check_header_for_source(open_indexed(vcf)?.header(), vcf, source, gvcf, contigs, &|_| Ok(()))
+        .map(|_| ())
+}
+
+/// Checks a VCF header for a feature source (see [`check_vcf`]), and says where the raw
+/// annotations are read from.
+///
+/// # Errors
+///
+/// Returns an error if the header fails a check.
+fn check_header_for_source<'a, S: AsRef<str>>(
+    header: &rust_htslib::bcf::header::HeaderView,
+    vcf: &Path,
+    source: FeatureSource,
+    gvcf: Option<&'a Path>,
+    contigs: &[S],
+    before_gvcf: &dyn Fn(&Path) -> Result<()>,
+) -> Result<AnnotationSource<'a>> {
+    check_vcf_header(header, vcf, contigs)?;
+    // The source's own checks first, so that a derived source's missing fields are an error, not
+    // first logged as features missing for every call.
+    let annotation_source = match source {
+        FeatureSource::Vcf => {
+            vcf_source::check_header(header, vcf)?;
+            AnnotationSource::Derived(MqSource::Info)
+        }
+        FeatureSource::VcfAlignments(_) => {
+            vcf_source::check_header_with_reads(header, vcf)?;
+            AnnotationSource::Derived(MqSource::Reads)
+        }
+        FeatureSource::Gvcf => gvcf_annotation_source(header, vcf, gvcf, contigs, before_gvcf)?,
+    };
+    Ok(annotation_source)
+}
+
+/// Sets each record's mapping-quality sums and depth from its site measured in the reads (the
+/// alignments source's mapping quality and depth): `raw_dp` is the reads counted, `raw_mq` the
+/// sum of their squared MAPQs, and `as_mq_ref` and `as_mq_alt` the sums of the squared MAPQs of
+/// those with the reference and with a called alternate allele (NaN when the alleles cannot be
+/// read; see [`crate::read_annotations::MapqSums::alleles_read`]). A zero VarDP takes the reads
+/// counted, or 1 without any, where the VCF source takes INFO/DP: so `qd` does not depend on
+/// INFO/DP.
+///
+/// The sites are measured from the same VCF on the same contigs, in the same order (see
+/// [`crate::pileup::measure_annotations`]), so they are joined in order, in parallel.
+///
+/// # Errors
+///
+/// Returns an error if the sites are not those of the records, one for each, in order.
+fn join_read_annotations(records: &mut [RawRecord], sites: &[MeasuredSite]) -> Result<()> {
+    if records.len() != sites.len() {
+        bail!(
+            "the reads were measured at {} calls, but the VCF has {}: the reads must be measured \
+             at this VCF's calls",
+            sites.len(),
+            records.len()
+        );
+    }
+    records.par_iter_mut().zip(sites).try_for_each(|(record, site)| {
+        let (chrom, pos, reference, alt) = PileupOptions::row_key(&site.row);
+        let same = chrom == &*record.chrom
+            && pos == record.pos
+            && reference.as_bytes() == record.reference
+            && alt.split(',').map(str::as_bytes).eq(record.alts.iter().map(Vec::as_slice));
+        let Some(sums) = site.mapq.as_ref().filter(|_| same) else {
+            bail!(
+                "the call at {}:{} was not measured in the reads: the reads must be measured at \
+                 this VCF's calls",
+                record.chrom,
+                record.pos
+            );
+        };
+        let allele = |sum_sq: u64| if sums.alleles_read { sum_sq as f64 } else { f64::NAN };
+        let read_depth = sums.n_reads as f64;
+        let var_dp = match record.raw.var_dp {
+            depth if depth != 0.0 => depth,
+            _ if sums.n_reads > 0 => read_depth,
+            _ => 1.0,
+        };
+        record.raw = RawAnnotation {
+            raw_mq: sums.sum_sq as f64,
+            raw_dp: read_depth,
+            as_mq_ref: allele(sums.ref_sum_sq),
+            as_mq_alt: allele(sums.alt_sum_sq),
+            var_dp,
+            ..record.raw
+        };
+        Ok(())
+    })
+}
+
 /// Where the gVCF source reads the raw annotations from: the VCF's records when its header
 /// declares them, or else the gVCF.
 ///
@@ -314,6 +451,7 @@ fn gvcf_annotation_source<'a, S: AsRef<str>>(
     vcf: &Path,
     gvcf: Option<&'a Path>,
     contigs: &[S],
+    before_gvcf: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<AnnotationSource<'a>> {
     Ok(match (has_raw_annotations(header), gvcf) {
         (true, gvcf) => {
@@ -328,6 +466,7 @@ fn gvcf_annotation_source<'a, S: AsRef<str>>(
             AnnotationSource::RawFromVcf
         }
         (false, Some(gvcf)) => {
+            before_gvcf(gvcf)?;
             check_gvcf_header(open_indexed(gvcf)?.header(), gvcf, contigs)?;
             info!("Reading the raw annotations from the gVCF {}", gvcf.display());
             AnnotationSource::RawFromGvcf(gvcf)
@@ -336,8 +475,8 @@ fn gvcf_annotation_source<'a, S: AsRef<str>>(
             "VCF {} lacks the INFO annotations {} and no gVCF was given: pass the gVCF the \
              VCF was genotyped from (--gvcf), or a VCF that keeps the raw annotations of \
              HaplotypeCaller's gVCF mode. To use VCFs without them, extract every training and \
-             evaluation table with --feature-source vcf, and score with the models trained on \
-             those tables",
+             evaluation table with --feature-source vcf (or --alignments and --reference, with \
+             the reads), and score with the models trained on those tables",
             vcf.display(),
             missing_raw_annotations(header).join(", ")
         ),
@@ -390,7 +529,7 @@ fn read_shards(
 /// modes or versions do not write.
 const FEATURE_FIELDS: [(&str, bool, bool); 10] = [
     // (field, is INFO, is core)
-    ("DP", true, true),
+    (INFO_DP, true, true),
     ("AD", false, true),
     ("GQ", false, true),
     ("PL", false, true),
@@ -402,18 +541,20 @@ const FEATURE_FIELDS: [(&str, bool, bool); 10] = [
     ("DRAGstrInfo", true, false),
 ];
 
-/// Logs the [`FEATURE_FIELDS`] a VCF header does not declare: a warning for core fields, a note
-/// for the others. `skip_sb` leaves out FORMAT/SB, for the VCF source when INFO/SOR stands in for
-/// it.
+/// Logs the [`FEATURE_FIELDS`] a VCF header does not declare, but those in `skip`: a warning for
+/// core fields (but those in `not_core`), a note for the others.
 fn warn_undeclared_fields(
     header: &rust_htslib::bcf::header::HeaderView,
     path: &Path,
-    skip_sb: bool,
+    skip: &[&str],
+    not_core: &[&str],
 ) {
     let undeclared = |core: bool| -> Vec<String> {
         FEATURE_FIELDS
             .iter()
-            .filter(|&&(field, _, is_core)| is_core == core && !(skip_sb && field == SB))
+            .filter(|&&(field, _, is_core)| {
+                !skip.contains(&field) && (is_core && !not_core.contains(&field)) == core
+            })
             .filter(|&&(field, is_info, _)| !has_field(header, field.as_bytes(), is_info))
             .map(|&(field, is_info, _)| field_name(field, is_info))
             .collect()
@@ -442,9 +583,36 @@ enum AnnotationSource<'a> {
     RawFromVcf,
     /// The raw annotations of the gVCF at this path (the gVCF feature source).
     RawFromGvcf(&'a Path),
-    /// Derived from the VCF's standard annotations (the VCF feature source; see
-    /// [`crate::vcf_source`]).
-    DerivedFromVcf,
+    /// Derived from the VCF's standard annotations (see [`crate::vcf_source`]), with the mapping
+    /// quality and depth from this source.
+    Derived(MqSource),
+}
+
+/// Where the mapping quality and depth of derived annotations come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MqSource {
+    /// INFO/MQ and INFO/DP, as each record is read (the VCF feature source; see
+    /// [`vcf_source::with_info_depths`]).
+    Info,
+    /// The reads, joined once every record is read (the alignments feature source; see
+    /// [`join_read_annotations`]).
+    Reads,
+}
+
+impl AnnotationSource<'_> {
+    /// What the records counted as missing their raw annotations lack, for the warning (`None`
+    /// for the reads, which are joined to every record).
+    fn missing(&self) -> Option<&'static str> {
+        match self {
+            AnnotationSource::RawFromVcf => Some("lack RAW_MQandDP (set to missing)"),
+            AnnotationSource::RawFromGvcf(_) => Some("had no gVCF annotations (set to missing)"),
+            AnnotationSource::Derived(MqSource::Info) => Some(
+                "lack INFO/MQ, or a positive INFO/DP (their mq, and without INFO/DP their \
+                 dp_norm, is missing)",
+            ),
+            AnnotationSource::Derived(MqSource::Reads) => None,
+        }
+    }
 }
 
 /// The records read from one shard of a contig, and counts for logging.
@@ -492,6 +660,9 @@ fn reader<'a>(slot: &'a mut Option<IndexedReader>, path: &Path) -> Result<&'a mu
 /// The FORMAT field of the per-strand allele depths.
 const SB: &str = "SB";
 
+/// The INFO field of the read depth.
+const INFO_DP: &str = "DP";
+
 /// The span of the shards that a contig's records are read in, in parallel.
 const RECORD_SHARD_SPAN: u64 = 5_000_000;
 
@@ -530,7 +701,7 @@ fn read_shard(
             continue;
         }
         let alleles = record.alleles();
-        let derive = matches!(source, AnnotationSource::DerivedFromVcf);
+        let derive = matches!(source, AnnotationSource::Derived(_));
         let Some(mut raw) = raw_record(&mut fields, &record, &alleles, &chrom, derive)? else {
             skipped += 1;
             continue;
@@ -540,13 +711,16 @@ fn read_shard(
                 Some(annotation) => raw.raw = annotation,
                 None => missing_annotations += 1,
             },
-            AnnotationSource::DerivedFromVcf => {
+            AnnotationSource::Derived(MqSource::Info) => {
+                let info_mq = fields.info_value(&record, b"MQ", 0)?;
+                raw.raw = vcf_source::with_info_depths(raw.raw, info_mq, raw.dp);
                 // No INFO/MQ or INFO/DP, or a zero depth: mq is missing.
                 if raw.raw.raw_mq.is_nan() || raw.raw.raw_dp.is_nan() || raw.raw.raw_dp <= 0.0 {
                     missing_annotations += 1;
                 }
             }
-            AnnotationSource::RawFromGvcf(_) => {}
+            // Joined after the shards are read: the gVCF's sites, or the reads' sums.
+            AnnotationSource::RawFromGvcf(_) | AnnotationSource::Derived(MqSource::Reads) => {}
         }
         records.push(raw);
     }
@@ -589,8 +763,9 @@ fn join_gvcf_annotations(
 }
 
 /// Reads one record's raw values, or `None` if it is neither a SNP nor an indel. With `derive`
-/// (the VCF source), the raw annotations are derived from the record (see
-/// [`vcf_source::read_annotation`]); otherwise they are left missing.
+/// (the VCF and alignments sources), the parts of the raw annotations those sources share are
+/// derived from the record (see [`vcf_source::read_annotation`]), and the mapping quality and depth
+/// are left for their source; otherwise the raw annotations are left missing.
 fn raw_record(
     fields: &mut FieldReader,
     record: &Record,
@@ -677,6 +852,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::read_annotations::MapqSums;
     use crate::testing::{
         CALL_FIELDS, DEFAULT_MODE_FIELDS, RAW_FIELDS, vcf_header, write_indexed_vcf,
     };
@@ -717,7 +893,7 @@ mod tests {
     ];
 
     fn extract(vcf: &Path, gvcf: Option<&Path>, contigs: &[&str]) -> Result<Vec<RawRecord>> {
-        extract_raw_records(vcf, AnnotationInputs::Gvcf(gvcf), contigs)
+        extract_raw_records(vcf, AnnotationInputs::Gvcf(gvcf), contigs, &|_| Ok(()))
     }
 
     #[test]
@@ -1056,6 +1232,7 @@ mod tests {
         let no_raw = write_vcf(&dir, "noraw.vcf.gz", &[CALL_FIELDS], &["S1"], &record);
         let message = error(&no_raw, None, &["chr1"]);
         assert!(message.contains("lacks the INFO annotations RAW_MQandDP, QUALapprox, VarDP, AS_RAW_MQ and no gVCF was given"), "{message}");
+        assert!(message.contains("--alignments and --reference"), "{message}");
 
         let bad_gvcf = write_vcf(&dir, "bad.g.vcf.gz", &[CALL_FIELDS], &["S1"], &record);
         let message = error(&no_raw, Some(&bad_gvcf), &["chr1"]);
@@ -1169,7 +1346,7 @@ mod tests {
     const VCF_SOURCE: [&str; 3] = [CALL_FIELDS, DEFAULT_MODE_FIELDS, ""];
 
     fn extract_vcf_source(vcf: &Path, contigs: &[&str]) -> Result<Vec<RawRecord>> {
-        extract_raw_records(vcf, AnnotationInputs::Vcf, contigs)
+        extract_raw_records(vcf, AnnotationInputs::Vcf, contigs, &|_| Ok(()))
     }
 
     #[test]
@@ -1333,6 +1510,179 @@ mod tests {
         assert_eq!(mq[1], 60.0);
     }
 
+    /// A site measured from the reads at a record of chr1, with these sums.
+    fn measured_site(pos: u64, reference: &str, alt: &str, sums: MapqSums) -> MeasuredSite {
+        let row = crate::pileup::PileupRow {
+            chrom: "chr1".to_string(),
+            pos,
+            reference: reference.to_string(),
+            alt: alt.to_string(),
+            n_reads: 0,
+            counts: [[0; 3]; 3],
+        };
+        MeasuredSite { row, counted: sums.alleles_read, mapq: Some(sums) }
+    }
+
+    fn extract_alignments_source(vcf: &Path, sites: &[MeasuredSite]) -> Result<Vec<RawRecord>> {
+        let options = ReadAnnotationOptions::default();
+        extract_raw_records(
+            vcf,
+            AnnotationInputs::VcfAlignments { sites, options },
+            &["chr1"],
+            &|_| Ok(()),
+        )
+    }
+
+    /// The sums of `n_reads` reads of MAPQ `mapq`, `n_ref` of them with the reference allele and
+    /// `n_alt` with a called alternate allele (allele sums only with `alleles_read`).
+    fn sums(n_reads: u64, mapq: u64, n_ref: u64, n_alt: u64, alleles_read: bool) -> MapqSums {
+        let sq = mapq * mapq;
+        MapqSums {
+            n_reads,
+            sum_sq: n_reads * sq,
+            ref_sum_sq: n_ref * sq,
+            alt_sum_sq: n_alt * sq,
+            alleles_read,
+        }
+    }
+
+    /// The alignments source takes the mapping qualities and depth from the reads, and the rest
+    /// as the VCF source does; INFO/MQ is not read, and INFO/DP is not used for them, nor for
+    /// VarDP's fallback.
+    #[test]
+    fn the_alignments_source_takes_mapping_qualities_and_depth_from_the_reads() {
+        let dir = TempDir::new().unwrap();
+        let records = [
+            // INFO/MQ and INFO/DP are not read for the mapping quality or depth.
+            "chr1 100 . A C 50 PASS DP=4;MQ=30;SOR=0.693 GT:AD:DP:PL 0/1:1,2:5:40,0,50",
+            // An indel whose alleles cannot be read from a read: totals only.
+            "chr1 200 . AT GTT 30 PASS . GT:AD:PL 1/1:0,6:90,12,0",
+            // No read counted: VarDP keeps its own depth, the AD of the called alleles.
+            "chr1 300 . A C,G 20 PASS . GT:AD:SB:PL 0/1:9,3,0:2,3,4,5:30,0,60,30,60,60",
+            // No depth of its own: VarDP takes the reads counted, not INFO/DP.
+            "chr1 400 . A C 30 PASS DP=99 GT:PL 0/1:30,0,60",
+        ];
+        let vcf = write_vcf(&dir, "in.vcf.gz", &VCF_SOURCE, &["S1"], &records);
+        let sites = [
+            measured_site(100, "A", "C", sums(10, 60, 3, 6, true)),
+            measured_site(200, "AT", "GTT", sums(20, 20, 0, 0, false)),
+            measured_site(300, "A", "C,G", sums(0, 60, 0, 0, true)),
+            measured_site(400, "A", "C", sums(25, 60, 25, 0, true)),
+        ];
+        let records = extract_alignments_source(&vcf, &sites).unwrap();
+        let raw: Vec<RawAnnotation> = records.iter().map(|r| r.raw).collect();
+        let [het, indel, without_reads, without_depth] = raw.as_slice() else { panic!("{raw:?}") };
+        assert_eq!(
+            [het.raw_dp, het.raw_mq, het.as_mq_ref, het.as_mq_alt],
+            [10.0, 36000.0, 10800.0, 21600.0]
+        );
+        // The rest is derived from the record, as the VCF source derives it.
+        assert_eq!([het.qual_approx, het.var_dp, het.n_alt], [40.0, 3.0, 1.0]);
+        assert_eq!(het.sor, f64::from(0.693f32));
+        assert_eq!([indel.raw_dp, indel.raw_mq, indel.var_dp], [20.0, 8000.0, 6.0]);
+        assert_nan(indel.as_mq_ref, "as_mq_ref of unread alleles");
+        assert_nan(indel.as_mq_alt, "as_mq_alt of unread alleles");
+        assert_eq!([without_reads.raw_dp, without_reads.raw_mq], [0.0, 0.0]);
+        // Only the called alternate allele is counted.
+        assert_eq!(
+            [without_reads.qual_approx, without_reads.var_dp, without_reads.n_alt],
+            [30.0, 12.0, 1.0]
+        );
+        assert_eq!([without_depth.raw_dp, without_depth.var_dp], [25.0, 25.0]);
+
+        let derived = crate::features::derive_features(&records, &[], None);
+        assert_eq!(derived.mq[..2], [60.0, 20.0]);
+        assert_nan(derived.mq[2], "mq without a read counted");
+        assert_eq!(derived.as_alt_frac[0], 21600.0 / 32400.0);
+        assert_nan(derived.as_alt_frac[1], "as_alt_frac of unread alleles");
+        assert_nan(derived.as_alt_frac[2], "as_alt_frac without a read counted");
+        // The median depth of the reads counted, 10, 20, 0 and 25, is 15.
+        assert_eq!(derived.dp_norm, [10.0 / 15.0, 20.0 / 15.0, 0.0, 25.0 / 15.0]);
+        assert_eq!(derived.qd[0], 40.0 / 3.0);
+        assert_eq!(derived.qd[3], 30.0 / 25.0);
+        assert_eq!(derived.sor[0], f64::from(0.693f32));
+    }
+
+    #[test]
+    fn the_alignments_source_needs_its_fields_declared_but_not_mq_or_dp() {
+        let dir = TempDir::new().unwrap();
+        let sites = [measured_site(100, "A", "C", sums(5, 60, 0, 0, true))];
+        let record = ["chr1 100 . A C 50 PASS . GT 0/1"];
+        // FORMAT/AD, FORMAT/PL and FORMAT/SB only.
+        let needed = CALL_FIELDS
+            .lines()
+            .filter(|line| !line.contains("ID=DP,"))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let vcf = write_vcf(&dir, "needed.vcf.gz", &[&needed], &["S1"], &record);
+        assert_eq!(extract_alignments_source(&vcf, &sites).unwrap().len(), 1);
+        check_vcf(&vcf, alignments(), None, &["chr1"]).unwrap();
+        let bare = needed
+            .lines()
+            .filter(|line| !["ID=SB,", "ID=PL,"].iter().any(|id| line.contains(id)))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let vcf = write_vcf(&dir, "bare.vcf.gz", &[&bare], &["S1"], &record);
+        let message = format!("{:#}", extract_alignments_source(&vcf, &sites).unwrap_err());
+        assert!(
+            message.contains(
+                "bare.vcf.gz does not declare FORMAT/PL, FORMAT/SB or INFO/SOR, which the \
+                 alignments feature source (of extract --alignments, and of models trained on \
+                 its tables) derives qd and sor from"
+            ),
+            "{message}"
+        );
+        // The check before the reads are measured fails as the table would.
+        let checked = check_vcf(&vcf, alignments(), None, &["chr1"]).unwrap_err();
+        assert_eq!(format!("{checked:#}"), message);
+    }
+
+    /// The check before the reads are measured also checks the samples, FORMAT/GT and contigs.
+    #[test]
+    fn the_vcf_is_checked_before_the_reads_are_measured() {
+        let dir = TempDir::new().unwrap();
+        let record = ["chr1 100 . A C 50 PASS . GT 0/1 0/1"];
+        let two = write_vcf(&dir, "two.vcf.gz", &VCF_SOURCE, &["S1", "S2"], &record);
+        let message = format!("{:#}", check_vcf(&two, alignments(), None, &["chr1"]).unwrap_err());
+        assert!(message.ends_with("must have exactly one sample, has 2"), "{message}");
+        let one = write_vcf(
+            &dir,
+            "one.vcf.gz",
+            &VCF_SOURCE,
+            &["S1"],
+            &["chr1 100 . A C 50 PASS . GT 0/1"],
+        );
+        let message =
+            format!("{:#}", check_vcf(&one, alignments(), None, &["chr1", "chr9"]).unwrap_err());
+        assert!(message.ends_with("one.vcf.gz: chr9"), "{message}");
+    }
+
+    /// The alignments source of the default settings.
+    fn alignments() -> FeatureSource {
+        FeatureSource::VcfAlignments(ReadAnnotationOptions::default())
+    }
+
+    /// Every record must have its measured site, in order: the sites are measured at the VCF's
+    /// records.
+    #[test]
+    fn the_alignments_source_needs_every_record_measured() {
+        let dir = TempDir::new().unwrap();
+        let records = ["chr1 100 . A C 50 PASS . GT:AD:PL 0/1:1,2:40,0,50"];
+        let vcf = write_vcf(&dir, "in.vcf.gz", &VCF_SOURCE, &["S1"], &records);
+        let sites = [measured_site(500, "A", "C", sums(5, 60, 0, 0, true))];
+        let message = format!("{:#}", extract_alignments_source(&vcf, &sites).unwrap_err());
+        assert!(
+            message.starts_with("the call at chr1:100 was not measured in the reads"),
+            "{message}"
+        );
+        let two = [sites[0].clone(), sites[0].clone()];
+        let message = format!("{:#}", extract_alignments_source(&vcf, &two).unwrap_err());
+        assert!(
+            message.starts_with("the reads were measured at 2 calls, but the VCF has 1"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn rejects_repeated_contigs() {
         let dir = TempDir::new().unwrap();
@@ -1383,6 +1733,32 @@ mod tests {
         std::fs::rename(&replaced, dir.path().join("elsewhere.tbi")).unwrap();
         let message = error(&vcf, None, &["chr1"]);
         assert!(message.contains("has no index"), "{message}");
+
+        // htslib loads a .csi before a .tbi, so a stray .tbi beside one is not read.
+        rust_htslib::bcf::index::build(&vcf, None, 1, rust_htslib::bcf::index::Type::Csi(14))
+            .unwrap();
+        std::fs::write(&index, b"not an index").unwrap();
+        assert_eq!(extract(&vcf, None, &["chr1"]).unwrap().len(), 3);
+        assert!(crate::vcf::has_index(&vcf));
+
+        // htslib reads only a .csi for a BCF, not a .tbi.
+        let bcf = dir.path().join("in.bcf");
+        {
+            use rust_htslib::bcf::{Format, Header, Read as _, Reader, Writer};
+            let mut reader = Reader::from_path(&vcf).unwrap();
+            let header = Header::from_template(reader.header());
+            let mut writer = Writer::from_path(&bcf, &header, false, Format::Bcf).unwrap();
+            for record in reader.records() {
+                writer.write(&record.unwrap()).unwrap();
+            }
+        }
+        rust_htslib::bcf::index::build(&bcf, None, 1, rust_htslib::bcf::index::Type::Csi(14))
+            .unwrap();
+        assert_eq!(extract(&bcf, None, &["chr1"]).unwrap().len(), 3);
+        std::fs::rename(dir.path().join("in.bcf.csi"), dir.path().join("in.bcf.tbi")).unwrap();
+        let message = error(&bcf, None, &["chr1"]);
+        assert!(message.contains("has no index"), "{message}");
+        assert!(!crate::vcf::has_index(&bcf));
     }
 
     #[test]

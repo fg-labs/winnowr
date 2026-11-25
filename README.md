@@ -147,9 +147,12 @@ indel F1 is not that of the calls `score` writes. Then score with the models as 
 repeat-length or pileup features, give `extract` the `--strlen` or `--pileup` tables and `train`
 `--repeat-length` (or `--regenotype`) or `--pileup-features`.
 
-Without a gVCF, train on features derived from the VCF itself: give every `extract` of the
-training and evaluation samples `--feature-source vcf` (and no `--gvcf`). The models record the
-source, and `score` then derives the calls' features from the VCF, with no `--gvcf`:
+Without a gVCF, train on features derived from the VCF and measured from the reads: give every
+`extract` of the training and evaluation samples `--alignments` and `--reference` (and no
+`--gvcf`), and `score` the same reads options; see
+[Feature sources](https://winnowr.readthedocs.io/en/latest/user-guide/feature-sources.html).
+
+Without the reads either, `--feature-source vcf` derives what it can from the VCF alone:
 
 ```console
 winnowr extract --vcf HG001.vcf.gz --feature-source vcf --happy HG001.happy.vcf.gz -o HG001.parquet
@@ -167,8 +170,9 @@ winnowr subset --table HG002.parquet --happy HG002.happy.vcf.gz --contigs chr1 c
 
 winnowr reads single-sample VCFs from GATK HaplotypeCaller. Six of its features come from
 annotations that only HaplotypeCaller's gVCF mode writes: by default from the VCF's raw annotations
-or the gVCF it was genotyped from (`--gvcf`), or, with `extract --feature-source vcf`, derived from
-a standard VCF without its gVCF. [Feature sources](https://winnowr.readthedocs.io/en/latest/user-guide/feature-sources.html)
+or the gVCF it was genotyped from (`--gvcf`), or, for a standard VCF without its gVCF, derived
+from the VCF and the reads (`extract --alignments`) or from the VCF alone
+(`extract --feature-source vcf`). [Feature sources](https://winnowr.readthedocs.io/en/latest/user-guide/feature-sources.html)
 lists the fields each needs.
 
 ## Commands
