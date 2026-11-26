@@ -107,9 +107,9 @@ fn is_bcf(path: &Path) -> bool {
         .is_some_and(|mut reader| reader.read_exact(&mut magic).is_ok() && &magic == b"BCF")
 }
 
-/// The local CSI/TBI/BAI candidates used by htslib's `hts_idx_check_local`: append each
+/// The local CSI/TBI/BAI/CRAI candidates used by htslib's `hts_idx_check_local`: append each
 /// extension, then replace from the last dot in the entire path (except a dot at byte zero).
-/// Unlike the CRAM and FASTA loaders, this can remove part of a dotted parent directory.
+/// Unlike the FASTA loaders, this can remove part of a dotted parent directory.
 pub fn local_index_paths(data: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     let bytes = data.as_os_str().as_encoded_bytes();
     let dot = bytes.iter().rposition(|&b| b == b'.').filter(|&i| i > 0);
@@ -133,15 +133,6 @@ fn index_paths_at(data: &Path, extensions: &[&str], dot: Option<usize>) -> Vec<P
             std::iter::once(PathBuf::from(appended)).chain(replaced)
         })
         .collect()
-}
-
-/// CRAM's candidates: append, then replace the basename's last extension, including a leading
-/// dot. Unlike CSI/TBI/BAI local lookup, a dot in a parent directory is not a replacement point.
-pub fn index_paths(data: &Path, extensions: &[&str]) -> Vec<PathBuf> {
-    let bytes = data.as_os_str().as_encoded_bytes();
-    let first = bytes.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
-    let dot = bytes.iter().rposition(|&b| b == b'.').filter(|&i| i >= first);
-    index_paths_at(data, extensions, dot)
 }
 
 /// FASTA's loaders only append their index extensions; they never replace a suffix.

@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
+use crate::alignment_provenance::AlignmentProvenance;
 use crate::common::PhaseTimer;
 use crate::features::derive_features;
 use crate::labels::{HappyPassOnly, attach_labels, check_label_join, read_happy_labels};
@@ -72,6 +73,8 @@ pub struct TableInputs<'a> {
     /// The depth `dp_norm` divides by, in place of the calls' median depth (see
     /// [`derive_features`]); checked with [`crate::features::check_dp_median`].
     pub dp_median: Option<f64>,
+    /// How the reads were aligned, recorded in the table, when known.
+    pub alignment: Option<&'a AlignmentProvenance>,
 }
 
 /// Checks the inputs of a feature table that can be checked before any is read:
@@ -156,6 +159,7 @@ pub fn build_feature_table<S: AsRef<str> + Sync>(
         dp_norm_divisor: Some(derived.dp_norm_divisor),
         restricted_to: None,
         feature_source: inputs.annotations.feature_source(),
+        alignment: inputs.alignment.cloned(),
     };
     let mut table = FeatureTable::from_records(&records, derived, info)?;
     drop(records);

@@ -222,6 +222,107 @@ impl Region {
     }
 }
 
+/// The header provenance checked before a read pass and the policy applied to it.
+#[derive(Debug, Clone, Copy)]
+pub struct AlignmentExpectation<'a> {
+    /// The header's raw provenance (`None` when its header records none).
+    pub provenance: Option<&'a crate::alignment_provenance::AlignmentProvenance>,
+    /// Original @PG/@SQ records, compared without interpreting command-line arguments.
+    pub header_records: &'a [String],
+    /// The same user overrides applied during preflight.
+    pub tags: Option<&'a crate::alignment_provenance::AlignmentTags>,
+    /// Whether a changed provenance is an error rather than a warning.
+    pub strict: bool,
+}
+
+impl AlignmentExpectation<'_> {
+    /// Checks provenance from the same reader that supplies the measured alignments.
+    fn check(&self, header: &rust_htslib::bam::HeaderView, path: &Path) -> Result<()> {
+        use crate::alignment_provenance::{
+            AlignmentProvenance, AlignmentTags, HeaderProvenance, resolve_reads,
+        };
+        if matches!(self.tags, Some(AlignmentTags::None)) {
+            return Ok(());
+        }
+        let observed =
+            HeaderProvenance::from_header_text(&String::from_utf8_lossy(header.as_bytes()));
+        let effective =
+            |provenance: Option<AlignmentProvenance>| -> Result<Option<AlignmentProvenance>> {
+                let source =
+                    Box::new(move || Ok(provenance)) as crate::alignment_provenance::LazySource<'_>;
+                Ok(resolve_reads(self.tags, None, vec![(path.display().to_string(), source)])?
+                    .provenance)
+            };
+        let raw_changed = observed.header_records != self.header_records;
+        let expected = effective(self.provenance.cloned())?;
+        let actual = effective(observed.provenance)?;
+        if raw_changed || actual != expected {
+            let describe = |provenance: &Option<AlignmentProvenance>| {
+                provenance.as_ref().map_or_else(|| "unknown".to_string(), ToString::to_string)
+            };
+            let detail = if raw_changed {
+                "; raw @PG/@SQ records changed (declarations do not verify a replacement header)"
+            } else {
+                ""
+            };
+            let message = format!(
+                "the alignment provenance of {} changed between preflight and reading its alignments: \
+                 expected {}, observed {}{detail}",
+                path.display(),
+                describe(&expected),
+                describe(&actual)
+            );
+            if self.strict {
+                bail!("{message}");
+            }
+            log::warn!("{message}");
+        }
+        Ok(())
+    }
+}
+
+/// Index searches successfully opened by measurement readers, shared across passes and workers.
+#[derive(Debug, Clone, Default)]
+pub struct ReadIndexObservation(Arc<Mutex<Vec<Vec<std::path::PathBuf>>>>);
+
+impl ReadIndexObservation {
+    /// The distinct searches consumed so far. BAM and CRAM searches remain independent.
+    pub fn searches(&self) -> Vec<Vec<std::path::PathBuf>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Retains a successful reader's search without duplicating it for each shard.
+    fn record(&self, paths: Vec<std::path::PathBuf>) {
+        let mut searches = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !searches.contains(&paths) {
+            searches.push(paths);
+        }
+    }
+}
+
+/// The index search for the file's detected format, using htslib's local search order. The
+/// nonblocking open cannot hang on a replaced FIFO. Missing or unreadable files retain the BAM
+/// search for early output checks; a measurement reader still fails to open those inputs.
+pub fn alignment_index_paths(path: &Path) -> Vec<std::path::PathBuf> {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let mut magic = [0; 4];
+    let cram = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()
+        .is_some_and(|file| {
+            file.metadata().is_ok_and(|metadata| metadata.is_file())
+                && file.read_exact_at(&mut magic, 0).is_ok()
+                && &magic == b"CRAM"
+        });
+    if cram {
+        crate::vcf::local_index_paths(path, &["csi", "crai"])
+    } else {
+        crate::vcf::local_index_paths(path, &["csi", "bai"])
+    }
+}
+
 /// The inputs of a read pass (`winnowr strlen` and `winnowr pileup`).
 #[derive(Debug, Clone)]
 pub struct ReadInputs<'a> {
@@ -231,6 +332,35 @@ pub struct ReadInputs<'a> {
     pub alignments: &'a Path,
     /// The indexed reference FASTA (also used to decode CRAM).
     pub reference: &'a Path,
+    /// Checks each measurement reader against the preflight header before consuming reads.
+    pub expected_alignment: Option<AlignmentExpectation<'a>>,
+    /// Retains the searches used by successful measurement readers for a later output audit.
+    pub observed_indexes: Option<ReadIndexObservation>,
+}
+
+impl ReadInputs<'_> {
+    /// Opens an indexed measurement reader, retaining the format-specific index search. An
+    /// explicit index binds that search to the reader: if the file changes format between
+    /// detection and opening, its incompatible index fails rather than recording a stale search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the alignments or their selected index cannot be opened.
+    pub fn open_alignments(&self) -> Result<rust_htslib::bam::IndexedReader> {
+        let open_error =
+            || format!("failed to open {} (it must be indexed)", self.alignments.display());
+        let Some(observed) = &self.observed_indexes else {
+            return rust_htslib::bam::IndexedReader::from_path(self.alignments)
+                .with_context(open_error);
+        };
+        let paths = alignment_index_paths(self.alignments);
+        let index = paths.iter().find(|path| path.exists()).with_context(open_error)?;
+        let reads =
+            rust_htslib::bam::IndexedReader::from_path_and_index(self.alignments, index.as_path())
+                .with_context(open_error)?;
+        observed.record(paths);
+        Ok(reads)
+    }
 }
 
 /// The span length that shards of a region are split into, so that large contigs are measured
@@ -487,10 +617,10 @@ impl ShardReaders {
             self.vcf = Some(crate::vcf::open_indexed(inputs.vcf)?);
         }
         if self.reads.is_none() {
-            let mut reads = rust_htslib::bam::IndexedReader::from_path(inputs.alignments)
-                .with_context(|| {
-                    format!("failed to open {} (it must be indexed)", inputs.alignments.display())
-                })?;
+            let mut reads = inputs.open_alignments()?;
+            if let Some(expected) = inputs.expected_alignment {
+                expected.check(reads.header(), inputs.alignments)?;
+            }
             reads.set_reference(inputs.reference)?;
             // Ignored for BAM; for CRAM, skips decoding the fields the pass does not read.
             let _ = reads.set_cram_options(
@@ -523,6 +653,226 @@ mod tests {
 
     use super::*;
 
+    /// Converts the generated BAM fixture to indexed CRAM using its local reference.
+    fn to_cram(path: &Path, reference: &Path) -> std::path::PathBuf {
+        use rust_htslib::bam::{self, Read as _};
+        let mut source = bam::Reader::from_path(path).unwrap();
+        let text = String::from_utf8_lossy(source.header().as_bytes()).replace(
+            "\tLN:100",
+            &format!("\tLN:100\tM5:8adc5937e635f6c9af646f0b23560fae\tUR:{}", reference.display()),
+        );
+        let header = bam::Header::from_template(&bam::HeaderView::from_bytes(text.as_bytes()));
+        let output = path.with_extension("cram");
+        let mut writer = bam::Writer::from_path(&output, &header, bam::Format::Cram).unwrap();
+        writer.set_reference(reference).unwrap();
+        for record in source.records() {
+            writer.write(&record.unwrap()).unwrap();
+        }
+        drop(writer);
+        bam::index::build(&output, None, bam::index::Type::Bai, 1).unwrap();
+        output
+    }
+
+    #[rstest]
+    fn explicit_alignment_indexes_match_reader_format(#[values(false, true)] cram: bool) {
+        use rust_htslib::bam::{self, Read as _};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let reference = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(100))]);
+        let read = crate::testing::TestRead {
+            name: "r1",
+            pos: 10,
+            cigar: "20M",
+            bases: None,
+            qual: 30,
+            quals: None,
+            mapq: 60,
+            flag: 0,
+        };
+        let bam = crate::testing::write_bam(dir.path(), "reads.bam", 100, &[read]);
+        let cram_path = to_cram(&bam, &reference);
+        let path = if cram { &cram_path } else { &bam };
+        let incompatible = if cram {
+            bam.with_extension("bam.bai")
+        } else {
+            cram_path.with_extension("cram.crai")
+        };
+        assert!(bam::IndexedReader::from_path_and_index(path, &incompatible).is_err());
+        let candidates = if cram {
+            crate::vcf::local_index_paths(path, &["csi", "crai"])
+        } else {
+            crate::vcf::local_index_paths(path, &["csi", "bai"])
+        };
+        let observed = ReadIndexObservation::default();
+        let inputs = ReadInputs {
+            vcf: Path::new("unused.vcf.gz"),
+            alignments: path,
+            reference: &reference,
+            expected_alignment: None,
+            observed_indexes: Some(observed.clone()),
+        };
+        let mut reads = inputs.open_alignments().unwrap();
+        assert_eq!(observed.searches(), vec![candidates]);
+        reads.set_reference(&reference).unwrap();
+        reads.fetch((0, 0, 100)).unwrap();
+        let records: Vec<_> = reads.records().map(Result::unwrap).collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].qname(), b"r1");
+        assert_eq!(records[0].pos(), 10);
+    }
+
+    #[test]
+    fn index_observation_retains_each_measured_format_search() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reference = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(100))]);
+        let bam = crate::testing::write_bam(dir.path(), "reads.bam", 100, &[]);
+        let cram = to_cram(&bam, &reference);
+        let observed = ReadIndexObservation::default();
+        let inputs = ReadInputs {
+            vcf: Path::new("unused.vcf.gz"),
+            alignments: &bam,
+            reference: &reference,
+            expected_alignment: None,
+            observed_indexes: Some(observed.clone()),
+        };
+        assert!(observed.searches().is_empty());
+        drop(inputs.open_alignments().unwrap());
+        drop(inputs.clone().open_alignments().unwrap());
+        let bam_paths = crate::vcf::local_index_paths(&bam, &["csi", "bai"]);
+        assert_eq!(observed.searches(), vec![bam_paths.clone()]);
+        std::fs::copy(&cram, &bam).unwrap();
+        std::fs::copy(cram.with_extension("cram.crai"), bam.with_extension("bam.crai")).unwrap();
+        drop(inputs.open_alignments().unwrap());
+        assert_eq!(
+            observed.searches(),
+            vec![bam_paths, crate::vcf::local_index_paths(&bam, &["csi", "crai"])]
+        );
+    }
+
+    #[rstest]
+    #[case::different(true, true, &[], true, false)]
+    #[case::newly_known(false, true, &[], true, false)]
+    #[case::newly_unknown(true, false, &[], true, false)]
+    #[case::overridden(true, true, &["aligner=bwa"], true, false)]
+    #[case::removed(true, true, &["aligner!"], true, false)]
+    #[case::disabled(true, true, &["none"], true, true)]
+    #[case::warning(true, true, &[], false, true)]
+    fn replacement_header_is_checked_before_measuring(
+        #[case] original_known: bool,
+        #[case] replacement_known: bool,
+        #[case] overrides: &[&str],
+        #[case] strict: bool,
+        #[case] accepted: bool,
+        #[values(false, true)] cram: bool,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fasta = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(100))]);
+        let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
+        let vcf = crate::testing::write_indexed_vcf(dir.path(), "calls.vcf.gz", &header, &[]);
+        // Identity comes from PN, independent of the options that BWA's lossy CL cannot prove.
+        let original_program = "@PG\tID:bwa\tPN:bwa\tCL:bwa mem ref.fa r.fq";
+        let replacement_program = "@PG\tID:bwa-mem3\tPN:bwa-mem3\tCL:bwa-mem3 mem ref.fa r.fq";
+        let original_lines = [original_program];
+        let replacement_lines = [replacement_program];
+        let bam = crate::testing::write_bam_with_header(
+            dir.path(),
+            "reads.bam",
+            100,
+            &[],
+            if original_known { &original_lines } else { &[] },
+        );
+        let bam = if cram { to_cram(&bam, &fasta) } else { bam };
+        let expected = crate::alignment_provenance::HeaderProvenance::read(&bam).unwrap();
+        let replacement = crate::testing::write_bam_with_header(
+            dir.path(),
+            "replacement.bam",
+            100,
+            &[],
+            if replacement_known { &replacement_lines } else { &[] },
+        );
+        let replacement = if cram { to_cram(&replacement, &fasta) } else { replacement };
+        std::fs::rename(&replacement, &bam).unwrap();
+        let index = if cram { "cram.crai" } else { "bam.bai" };
+        std::fs::rename(replacement.with_extension(index), bam.with_extension(index)).unwrap();
+        let tags = crate::alignment_provenance::AlignmentTags::parse(overrides).unwrap();
+        let inputs = ReadInputs {
+            observed_indexes: None,
+            vcf: &vcf,
+            alignments: &bam,
+            reference: &fasta,
+            expected_alignment: Some(AlignmentExpectation {
+                provenance: expected.provenance.as_ref(),
+                header_records: &expected.header_records,
+                tags: tags.as_ref(),
+                strict,
+            }),
+        };
+        let mut readers = ShardReaders::default();
+        let contigs = SharedContigs::default();
+        let result = readers.open(&inputs, "chr1", 0, &contigs);
+        assert_eq!(result.is_ok(), accepted, "unexpected reader result: {:?}", result.err());
+    }
+
+    /// A declaration must not hide a changed lossy CL when the worker opens its own reader.
+    #[rstest]
+    #[case::bwa("bwa", "bwa mem -p ref.fa reads.fq", "bwa mem ref.fa reads.fq", &["p=", "options-inference=explicit"], true, false)]
+    #[case::minimap2("minimap2", "minimap2 -a ref.fa reads.fq", "minimap2 -a -x sr ref.fa reads.fq", &["a=", "options-inference=explicit"], true, false)]
+    #[case::unchanged("bwa", "bwa mem -p ref.fa reads.fq", "bwa mem -p ref.fa reads.fq", &["p=", "options-inference=explicit"], true, true)]
+    #[case::warn("bwa", "bwa mem -p ref.fa reads.fq", "bwa mem ref.fa reads.fq", &["p=", "options-inference=explicit"], false, true)]
+    #[case::disabled("bwa", "bwa mem -p ref.fa reads.fq", "bwa mem ref.fa reads.fq", &["none"], true, true)]
+    fn review_declaration_does_not_hide_a_changed_command_line(
+        #[case] aligner: &str,
+        #[case] original: &str,
+        #[case] replacement: &str,
+        #[case] overrides: &[&str],
+        #[case] strict: bool,
+        #[case] accepted: bool,
+        #[values(false, true)] cram: bool,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fasta = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(100))]);
+        let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
+        let vcf = crate::testing::write_indexed_vcf(dir.path(), "calls.vcf.gz", &header, &[]);
+        let program = |cl: &str| format!("@PG\tID:mapper\tPN:{aligner}\tVN:1\tCL:{cl}");
+        let bam = crate::testing::write_bam_with_header(
+            dir.path(),
+            "reads.bam",
+            100,
+            &[],
+            &[&program(original)],
+        );
+        let bam = if cram { to_cram(&bam, &fasta) } else { bam };
+        let expected = crate::alignment_provenance::HeaderProvenance::read(&bam).unwrap();
+        let replacement = crate::testing::write_bam_with_header(
+            dir.path(),
+            "replacement.bam",
+            100,
+            &[],
+            &[&program(replacement)],
+        );
+        let replacement = if cram { to_cram(&replacement, &fasta) } else { replacement };
+        std::fs::rename(&replacement, &bam).unwrap();
+        let index = if cram { "cram.crai" } else { "bam.bai" };
+        std::fs::rename(replacement.with_extension(index), bam.with_extension(index)).unwrap();
+        let tags = crate::alignment_provenance::AlignmentTags::parse(overrides).unwrap();
+        let inputs = ReadInputs {
+            observed_indexes: None,
+            vcf: &vcf,
+            alignments: &bam,
+            reference: &fasta,
+            expected_alignment: Some(AlignmentExpectation {
+                provenance: expected.provenance.as_ref(),
+                header_records: &expected.header_records,
+                tags: tags.as_ref(),
+                strict,
+            }),
+        };
+        let mut readers = ShardReaders::default();
+        let contigs = SharedContigs::default();
+        let result = readers.open(&inputs, "chr1", 0, &contigs);
+        assert_eq!(result.is_ok(), accepted, "unexpected reader result: {:?}", result.err());
+    }
+
     #[rstest]
     #[case::contig("chr1", "chr1", None)]
     #[case::span("chr1:100-200", "chr1", Some((100, 200)))]
@@ -539,9 +889,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let reference = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(1000))]);
         let inputs = ReadInputs {
+            observed_indexes: None,
             vcf: Path::new("unused.vcf.gz"),
             alignments: Path::new("unused.bam"),
             reference: &reference,
+            expected_alignment: None,
         };
         let summary = crate::vcf::VcfSummary {
             samples: vec!["S1".to_string()],

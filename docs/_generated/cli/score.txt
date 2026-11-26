@@ -110,5 +110,18 @@ Options:
       --reference <REFERENCE>
           The indexed, uncompressed reference FASTA, for --alignments (also used to decode CRAM)
 
+      --alignment-tags <KEY=VALUE|KEY!|none>...
+          How the reads were aligned, as KEY=VALUE tags (e.g. alt-project=primary; KEY= for a flag
+          without a value) and KEY! to remove a detected tag, or none to record nothing (and read no
+          header or table for it). They replace the tags of the same name read from the reads'
+          header (its @PG records) and evidence tables, each before they must agree, and add the
+          rest; without either, the tags set are the reads' whole alignment provenance, compared on
+          those tags only (see the user guide: Alignment provenance)
+
+      --strict-provenance
+          Fail when the reads were not aligned as the models' training reads were, when the models
+          disagree on it, or when the models record it and the reads' is not known; without it,
+          these are warnings. Models that record no alignment provenance are not checked
+
   -h, --help
           Print help (see a summary with '-h')

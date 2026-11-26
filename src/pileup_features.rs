@@ -159,14 +159,14 @@ mod tests {
             counts,
         };
         let options: PileupOptions = "mapq30".parse().unwrap();
-        let pileup = PileupTables {
+        let pileup = PileupTables::new(
             options,
-            rows: vec![
+            vec![
                 row(10, "A", "G", [[21, 1, 0], [0, 2, 18], [0, 0, 1]]),
                 row(20, "AC", "A", [[0, 0, 10], [0, 0, 9], [0; 3]]),
                 row(20, "AC", "AT", [[9; 3]; 3]), // another record at the position
             ],
-        };
+        );
         let joined = add_pileup_features(table.clone(), &pileup).unwrap();
         assert_eq!(joined.info().pileup_settings, Some(options));
         assert_eq!(*joined.f64_column("pu_ref_mq0").unwrap().first().unwrap(), 21.0);
@@ -176,7 +176,7 @@ mod tests {
         for name in PILEUP_FEATURES {
             assert!(joined.has_column(name), "{name}");
         }
-        let other = PileupTables { options, rows: vec![row(99, "A", "G", [[0; 3]; 3])] };
+        let other = PileupTables::new(options, vec![row(99, "A", "G", [[0; 3]; 3])]);
         let message = add_pileup_features(table, &other).unwrap_err().to_string();
         assert!(message.contains("none of the 3 calls has a row"), "{message}");
     }

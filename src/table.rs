@@ -9,6 +9,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
+use std::io::{self, BufReader, Read};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,14 +23,20 @@ use arrow_array::{
 use arrow_schema::{Field, Schema};
 use arrow_select::filter::filter_record_batch;
 use indexmap::IndexMap;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::arrow_writer::{ArrowColumnChunk, compute_leaves};
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::FOOTER_SIZE;
+use parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
 use parquet::file::properties::{DEFAULT_MAX_ROW_GROUP_ROW_COUNT, WriterProperties};
+use parquet::file::reader::ChunkReader as _;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::alignment_provenance::AlignmentProvenance;
 use crate::common::VariantType;
 use crate::feature_source::FeatureSource;
 use crate::features::{DerivedFeatures, DpNormDivisor, region_feature};
@@ -42,6 +50,83 @@ type RawNumber = (&'static str, fn(&RawRecord) -> f64);
 
 /// The schema metadata key holding the [`FeatureTableInfo`] JSON.
 const METADATA_KEY: &str = "winnowr";
+
+/// One opened Parquet file shared by decoders without sharing a seek position. Cloning a `File`
+/// alone shares its offset, so Parquet's seek-based `File` implementation cannot be used here.
+#[derive(Clone)]
+struct PositionedFile {
+    file: Arc<File>,
+    length: u64,
+    /// The modification time when opened, where the platform records one.
+    modified: Option<std::time::SystemTime>,
+}
+
+impl PositionedFile {
+    fn new(file: File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            file: Arc::new(file),
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    /// Whether the opened file's current length and modification time still are those it had
+    /// when opened: a cheap indication of a change (a coarse clock can miss one, so the footer is
+    /// compared too, see [`FeatureTable::read_parquet_selected`]).
+    fn unchanged(&self) -> io::Result<bool> {
+        let metadata = self.file.metadata()?;
+        Ok(metadata.len() == self.length && metadata.modified().ok() == self.modified)
+    }
+}
+
+/// A sequential cursor using positioned reads from the retained file, independent of other cursors.
+struct PositionedRead {
+    file: Arc<File>,
+    offset: u64,
+}
+
+impl Read for PositionedRead {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.file.read_at(buffer, self.offset)?;
+        self.offset = self.offset.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Parquet read offset overflow")
+        })?;
+        Ok(read)
+    }
+}
+
+impl parquet::file::reader::Length for PositionedFile {
+    fn len(&self) -> u64 {
+        self.length
+    }
+}
+
+impl parquet::file::reader::ChunkReader for PositionedFile {
+    type T = BufReader<PositionedRead>;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        if start > self.length {
+            return Err(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Parquet offset past EOF").into()
+            );
+        }
+        Ok(BufReader::new(PositionedRead { file: Arc::clone(&self.file), offset: start }))
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
+        let end = start.checked_add(length as u64).filter(|end| *end <= self.length);
+        if end.is_none() {
+            return Err(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Parquet range past EOF").into()
+            );
+        }
+        let mut buffer = vec![0; length];
+        let mut reader = PositionedRead { file: Arc::clone(&self.file), offset: start };
+        reader.read_exact(&mut buffer)?;
+        Ok(buffer.into())
+    }
+}
 
 /// Metadata stored alongside a feature table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +173,11 @@ pub struct FeatureTableInfo {
     /// tables that record none are of the gVCF source.
     #[serde(default, skip_serializing_if = "FeatureSource::is_default")]
     pub feature_source: FeatureSource,
+    /// How the sample's reads were aligned (see [`crate::alignment_provenance`]): from its
+    /// evidence tables, its reads' header or `--alignment-tags`. `None` when unknown, not written
+    /// then, so that such tables are as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<AlignmentProvenance>,
 }
 
 /// The part of the genome a restricted table's calls and truth FN counts are of.
@@ -569,8 +659,11 @@ impl FeatureTable {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read, has no winnowr metadata, or (when selecting
-    /// by variant type) has no string `variant_type` column.
+    /// Returns an error if the file cannot be read, has no winnowr metadata, changes its length or
+    /// footer (metadata, schema, or row groups) before or during row decoding, or (when selecting
+    /// by variant type) has no string `variant_type` column. Changes are detected only at the
+    /// observation points: a rewrite restored before the final check, or preserving the observed
+    /// length, modification time and footer bytes, can escape detection.
     pub fn read_parquet_selected<P: AsRef<Path>>(
         path: P,
         selection: &TableSelection,
@@ -578,8 +671,21 @@ impl FeatureTable {
         let path = path.as_ref();
         let file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("{} is not a Parquet file", path.display()))?;
+        let file = PositionedFile::new(file)?;
+        let not_parquet = || format!("{} is not a Parquet file", path.display());
+        // The footer is decoded from these bytes, which every row-group decoder compares with its
+        // own read of the footer: the decoded structs cannot be compared, as an all-NaN float
+        // column records NaN statistics, which never equal themselves.
+        let footer = footer_metadata(&file).with_context(not_parquet)?;
+        let opening_metadata = ParquetMetaDataReader::decode_metadata(&footer)
+            .and_then(|metadata| {
+                ArrowReaderMetadata::try_new(Arc::new(metadata), ArrowReaderOptions::default())
+            })
+            .with_context(not_parquet)?;
+        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            file.clone(),
+            opening_metadata.clone(),
+        );
         let Some(metadata) = builder.schema().metadata().get(METADATA_KEY) else {
             bail!("{} is not a winnowr feature table (no winnowr metadata)", path.display());
         };
@@ -609,15 +715,46 @@ impl FeatureTable {
         let schema =
             Arc::new(Schema::new(arrow_array::RecordBatchReader::schema(&reader).fields().clone()));
         drop(reader);
-        // Row groups are decoded in parallel, each by its own reader, and kept in order. Each is
-        // decoded as one batch rather than the reader's default 1024 rows: on a 4.8M-call table
-        // that read in about 70% of the time, with a lower peak memory.
+        // Row groups use independent cursors on the same opened file, so replacement of its path
+        // cannot pair one file's metadata with another's rows. They are decoded in parallel and
+        // kept in order, as one batch rather than the reader's default 1024 rows: on a 4.8M-call
+        // table that read in about 70% of the time, with a lower peak memory.
+        #[cfg(test)]
+        tests::after_metadata();
+        // The whole footer, row-group statistics included, is compared before any row group is
+        // decoded and again once all are, so a rewrite that changes it before or during decoding
+        // is rejected; the footer ends the file, so a change of length is rejected first. Each
+        // row group checks only the length and modification time, so the footer is not read
+        // once per row group (its size grows with their number). A rewrite that leaves the
+        // length and footer bytes identical is not detected.
+        let changed = || format!("{} changed while it was read", path.display());
+        let reread = || {
+            format!(
+                "failed to read the footer of {} again: it may have changed while it was read",
+                path.display()
+            )
+        };
+        let check_footer = || -> Result<()> {
+            if !file.unchanged().with_context(reread)?
+                || footer_metadata(&file).with_context(reread)? != footer
+            {
+                bail!(changed());
+            }
+            Ok(())
+        };
+        check_footer()?;
         let per_group: Vec<Vec<RecordBatch>> = (0..row_groups)
             .into_par_iter()
             .map(|group| -> Result<Vec<RecordBatch>> {
-                let file = File::open(path)
-                    .with_context(|| format!("failed to open {}", path.display()))?;
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+                if !file.unchanged().with_context(reread)? {
+                    bail!(changed());
+                }
+                #[cfg(test)]
+                tests::during_decoding(path);
+                let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    file.clone(),
+                    opening_metadata.clone(),
+                );
                 let rows = usize::try_from(builder.metadata().row_group(group).num_rows())?;
                 let mut builder = builder.with_row_groups(vec![group]).with_batch_size(rows.max(1));
                 if let Some(mask) = &projection {
@@ -640,6 +777,7 @@ impl FeatureTable {
                 Ok(batches)
             })
             .collect::<Result<_>>()?;
+        check_footer()?;
         let batches: Vec<RecordBatch> = per_group.into_iter().flatten().collect();
         // Columns are concatenated in parallel: copying a whole-genome table on one thread took
         // longer than decoding it.
@@ -659,6 +797,22 @@ impl FeatureTable {
         let batch = RecordBatch::try_new_with_options(schema, columns, &options)?;
         Ok(FeatureTable { batch, info })
     }
+}
+
+/// The Thrift-encoded metadata that ends a Parquet file, read from the opened file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or does not end as a Parquet file does.
+fn footer_metadata(file: &PositionedFile) -> Result<bytes::Bytes> {
+    let tail_start =
+        file.length.checked_sub(FOOTER_SIZE as u64).context("too short to be a Parquet file")?;
+    let tail: [u8; FOOTER_SIZE] = file.get_bytes(tail_start, FOOTER_SIZE)?.as_ref().try_into()?;
+    let length = FooterTail::try_new(&tail)?.metadata_length();
+    let start = tail_start
+        .checked_sub(length as u64)
+        .context("the Parquet metadata is longer than the file")?;
+    Ok(file.get_bytes(start, length)?)
 }
 
 /// Which columns and rows of a feature table to read (see
@@ -735,6 +889,364 @@ mod tests {
 
     use super::*;
 
+    thread_local! {
+        static AFTER_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_metadata() {
+        AFTER_METADATA.with(|hook| {
+            if let Some(action) = hook.borrow_mut().take() {
+                action();
+            }
+        });
+    }
+
+    /// An action on a path, run once by a row-group worker reading that path, before decoding.
+    type DecodingHook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+
+    /// Shared, as the row groups are decoded on other threads; keyed by path, as tests run in
+    /// parallel.
+    static DURING_DECODING: std::sync::Mutex<Vec<DecodingHook>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn during_decoding(path: &Path) {
+        let action = {
+            let mut hooks = DURING_DECODING.lock().unwrap();
+            let index = hooks.iter().position(|(hooked, _)| hooked == path);
+            index.map(|index| hooks.remove(index).1)
+        };
+        if let Some(action) = action {
+            action();
+        }
+    }
+
+    #[test]
+    fn positioned_file_reads_have_independent_offsets_and_checked_bounds() {
+        use parquet::file::reader::ChunkReader as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bytes");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let source = PositionedFile::new(File::open(&path).unwrap()).unwrap();
+        let mut first = source.get_read(1).unwrap();
+        let mut second = source.get_read(5).unwrap();
+        let mut pair = [0; 2];
+        first.read_exact(&mut pair).unwrap();
+        assert_eq!(&pair, b"bc");
+        second.read_exact(&mut pair).unwrap();
+        assert_eq!(&pair, b"fg");
+        assert_eq!(source.get_bytes(0, 4).unwrap().as_ref(), b"abcd");
+        first.read_exact(&mut pair).unwrap();
+        assert_eq!(&pair, b"de");
+        let owned = source.get_bytes(4, 4).unwrap();
+        assert!(source.get_bytes(8, 0).unwrap().is_empty());
+        assert!(source.get_bytes(8, 1).is_err());
+        assert!(source.get_bytes(u64::MAX, 2).is_err());
+        assert!(source.get_read(9).is_err());
+        assert_eq!(source.get_read(8).unwrap().read(&mut pair).unwrap(), 0);
+        (0..128).into_par_iter().for_each(|i| {
+            let offset = i % 6;
+            assert_eq!(
+                source.get_bytes(offset as u64, 2).unwrap().as_ref(),
+                &b"abcdefgh"[offset..offset + 2]
+            );
+        });
+        File::options().write(true).open(&path).unwrap().set_len(2).unwrap();
+        assert!(source.get_bytes(0, 8).is_err());
+        assert_eq!(owned.as_ref(), b"efgh");
+    }
+
+    #[test]
+    fn replacement_after_metadata_cannot_change_the_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut original =
+            crate::testing::call_table(&[("chr1", 10, "A", "C", "PASS", "snp", "0/1", false)]);
+        original.info.alignment =
+            Some(crate::testing::provenance(&[("alt-project", "primary")], false));
+        let mut replacement =
+            crate::testing::call_table(&[("chr1", 20, "G", "T", "PASS", "snp", "1/1", false)]);
+        replacement.info.alignment =
+            Some(crate::testing::provenance(&[("alt-project", "keep-alt")], false));
+        let path = dir.path().join("input.parquet");
+        let next = dir.path().join("replacement.parquet");
+        original.write_parquet(&path).unwrap();
+        replacement.write_parquet(&next).unwrap();
+        let destination = path.clone();
+        AFTER_METADATA.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(next, destination).unwrap();
+            }));
+        });
+        let loaded = FeatureTable::read_parquet(&path).unwrap();
+        assert_eq!(loaded.i64_column("pos").unwrap(), &[10]);
+        assert_eq!(loaded.info.alignment, original.info.alignment);
+        assert_eq!(FeatureTable::read_parquet(&path).unwrap().i64_column("pos").unwrap(), &[20]);
+    }
+
+    #[test]
+    fn in_place_metadata_rewrite_cannot_change_the_loaded_provenance() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let mut original =
+            crate::testing::call_table(&[("chr1", 10, "A", "C", "PASS", "snp", "0/1", false)]);
+        original.info.alignment =
+            Some(crate::testing::provenance(&[("alt-project", "primary")], false));
+        let mut replacement =
+            crate::testing::call_table(&[("chr1", 20, "A", "C", "PASS", "snp", "0/1", false)]);
+        replacement.info.alignment =
+            Some(crate::testing::provenance(&[("alt-project", "otherxx")], false));
+        let path = dir.path().join("input.parquet");
+        let next = dir.path().join("replacement.parquet");
+        original.write_parquet(&path).unwrap();
+        replacement.write_parquet(&next).unwrap();
+        let bytes = std::fs::read(&next).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+        let destination = path.clone();
+        AFTER_METADATA.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let mut file =
+                    File::options().write(true).truncate(true).open(destination).unwrap();
+                file.write_all(&bytes).unwrap();
+            }));
+        });
+        let error = FeatureTable::read_parquet(&path).unwrap_err();
+        assert!(error.to_string().contains("changed while it was read"), "{error:#}");
+        assert_eq!(FeatureTable::read_parquet(&path).unwrap().i64_column("pos").unwrap(), &[20]);
+    }
+
+    /// Encodes small row groups without allocating the production row-group size.
+    fn rewrite_fixture(path: &Path, batch: &RecordBatch, rows_per_group: usize) {
+        let metadata = serde_json::to_string(&FeatureTableInfo::default()).unwrap();
+        let schema = batch
+            .schema()
+            .as_ref()
+            .clone()
+            .with_metadata(HashMap::from([(METADATA_KEY.to_string(), metadata)]));
+        let batch = batch.clone().with_schema(Arc::new(schema)).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), None).unwrap();
+        for start in (0..batch.num_rows()).step_by(rows_per_group) {
+            writer
+                .write(&batch.slice(start, rows_per_group.min(batch.num_rows() - start)))
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    /// Pads only the space before the footer, leaving column offsets and schemas unchanged.
+    fn pad_parquet_to(path: &Path, length: usize) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).unwrap();
+        let footer_length =
+            u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+                as usize;
+        let start = bytes.len() - 8 - footer_length;
+        let padding = length - bytes.len();
+        bytes.splice(start..start, std::iter::repeat_n(0, padding));
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    /// Rewrites the same inode after the opening footer has been read.
+    fn rewrite_after_metadata(path: &Path, bytes: Vec<u8>) {
+        use std::io::Write as _;
+        let destination = path.to_path_buf();
+        AFTER_METADATA.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let mut file =
+                    File::options().write(true).truncate(true).open(destination).unwrap();
+                file.write_all(&bytes).unwrap();
+            }));
+        });
+    }
+
+    #[test]
+    fn in_place_row_group_removal_returns_an_error_instead_of_panicking() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("input.parquet");
+        let next = dir.path().join("replacement.parquet");
+        let batch = RecordBatch::try_from_iter([(
+            "qual",
+            Arc::new(Float64Array::from(vec![10.0, 20.0])) as ArrayRef,
+        )])
+        .unwrap();
+        rewrite_fixture(&path, &batch, 1);
+        rewrite_fixture(&next, &batch, 2);
+        let length =
+            std::fs::metadata(&path).unwrap().len().max(std::fs::metadata(&next).unwrap().len())
+                as usize;
+        pad_parquet_to(&path, length);
+        let bytes = pad_parquet_to(&next, length);
+        assert_eq!(FeatureTable::read_parquet(&next).unwrap().num_rows(), 2);
+        rewrite_after_metadata(&path, bytes);
+        let error = FeatureTable::read_parquet(&path).unwrap_err();
+        assert!(error.to_string().contains("changed while it was read"), "{error:#}");
+    }
+
+    #[test]
+    fn in_place_row_rewrite_with_the_same_schema_and_metadata_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("input.parquet");
+        let next = dir.path().join("replacement.parquet");
+        let values = |values: Vec<f64>| {
+            RecordBatch::try_from_iter([("qual", Arc::new(Float64Array::from(values)) as ArrayRef)])
+                .unwrap()
+        };
+        rewrite_fixture(&path, &values(vec![10.0, 20.0]), 1);
+        rewrite_fixture(&next, &values(vec![30.0, 40.0]), 1);
+        let length =
+            std::fs::metadata(&path).unwrap().len().max(std::fs::metadata(&next).unwrap().len())
+                as usize;
+        pad_parquet_to(&path, length);
+        let bytes = pad_parquet_to(&next, length);
+        // Only the rows differ: the length, schema, winnowr metadata and row-group count match.
+        assert_eq!(
+            FeatureTable::read_info(&path).unwrap(),
+            FeatureTable::read_info(&next).unwrap()
+        );
+        let (original, replacement) = (
+            FeatureTable::read_parquet(&path).unwrap(),
+            FeatureTable::read_parquet(&next).unwrap(),
+        );
+        assert_eq!(original.batch.schema(), replacement.batch.schema());
+        assert_ne!(original.batch, replacement.batch);
+        rewrite_after_metadata(&path, bytes);
+        let error = FeatureTable::read_parquet(&path).unwrap_err();
+        assert!(error.to_string().contains("changed while it was read"), "{error:#}");
+    }
+
+    /// An update that keeps the old footer bytes and writes a new footer farther on must not be
+    /// read at the length the file had when it was opened.
+    #[test]
+    fn pr38_an_in_place_update_that_extends_the_file_is_rejected() {
+        use std::io::Write as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("input.parquet");
+        let next = dir.path().join("replacement.parquet");
+        let values = |values: Vec<f64>| {
+            RecordBatch::try_from_iter([("qual", Arc::new(Float64Array::from(values)) as ArrayRef)])
+                .unwrap()
+        };
+        rewrite_fixture(&path, &values(vec![10.0, 20.0]), 1);
+        rewrite_fixture(&next, &values(vec![30.0, 40.0, 50.0]), 1);
+        let appended = std::fs::read(&next).unwrap();
+        let destination = path.clone();
+        AFTER_METADATA.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let mut file = File::options().append(true).open(destination).unwrap();
+                file.write_all(&appended).unwrap();
+            }));
+        });
+        let error = FeatureTable::read_parquet(&path).unwrap_err();
+        assert!(error.to_string().contains("changed while it was read"), "{error:#}");
+    }
+
+    /// A rewrite while the rows are decoded (here of a table's only row group) is found once
+    /// they all are.
+    #[test]
+    fn pr38_a_rewrite_during_decoding_is_rejected() {
+        use std::io::Write as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("input.parquet");
+        let next = dir.path().join("replacement.parquet");
+        let values = |values: Vec<f64>| {
+            RecordBatch::try_from_iter([("qual", Arc::new(Float64Array::from(values)) as ArrayRef)])
+                .unwrap()
+        };
+        rewrite_fixture(&path, &values(vec![10.0, 20.0]), 2);
+        rewrite_fixture(&next, &values(vec![30.0, 40.0]), 2);
+        let length =
+            std::fs::metadata(&path).unwrap().len().max(std::fs::metadata(&next).unwrap().len())
+                as usize;
+        pad_parquet_to(&path, length);
+        let bytes = pad_parquet_to(&next, length);
+        let destination = path.clone();
+        DURING_DECODING.lock().unwrap().push((
+            path.clone(),
+            Box::new(move || {
+                let mut file =
+                    File::options().write(true).truncate(true).open(destination).unwrap();
+                file.write_all(&bytes).unwrap();
+            }),
+        ));
+        let error = FeatureTable::read_parquet(&path).unwrap_err();
+        assert!(error.to_string().contains("changed while it was read"), "{error:#}");
+    }
+
+    /// An all-NaN column records NaN statistics, which a decoded-footer comparison would never
+    /// find equal to themselves, failing every read of an unchanged file.
+    #[test]
+    fn a_table_with_an_all_nan_column_is_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("input.parquet");
+        let batch = RecordBatch::try_from_iter([(
+            "qual",
+            Arc::new(Float64Array::from(vec![f64::NAN, f64::NAN])) as ArrayRef,
+        )])
+        .unwrap();
+        rewrite_fixture(&path, &batch, 1);
+        assert_eq!(FeatureTable::read_parquet(&path).unwrap().num_rows(), 2);
+    }
+
+    #[test]
+    fn in_place_rewrite_to_another_length_names_the_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("input.parquet");
+        let batch = RecordBatch::try_from_iter([(
+            "qual",
+            Arc::new(Float64Array::from(vec![10.0, 20.0])) as ArrayRef,
+        )])
+        .unwrap();
+        rewrite_fixture(&path, &batch, 1);
+        rewrite_after_metadata(&path, b"not a parquet file".to_vec());
+        let error = FeatureTable::read_parquet(&path).unwrap_err();
+        // The length change is found before the footer is read again.
+        let expected = format!("{} changed while it was read", path.display());
+        assert_eq!(error.to_string(), expected, "{error:#}");
+    }
+
+    #[test]
+    fn in_place_schema_rewrite_is_rejected_before_decoding() {
+        for projected in [false, true] {
+            for change_type in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("input.parquet");
+                let next = dir.path().join("replacement.parquet");
+                let qual = Arc::new(Float64Array::from(vec![10.0, 20.0])) as ArrayRef;
+                let depth = Arc::new(Float64Array::from(vec![30.0, 40.0])) as ArrayRef;
+                let original =
+                    RecordBatch::try_from_iter([("qual", qual.clone()), ("dp", depth.clone())])
+                        .unwrap();
+                let replacement = if change_type {
+                    RecordBatch::try_from_iter([
+                        ("qual", Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef),
+                        ("dp", depth),
+                    ])
+                    .unwrap()
+                } else {
+                    RecordBatch::try_from_iter([("dp", depth), ("qual", qual)]).unwrap()
+                };
+                rewrite_fixture(&path, &original, 2);
+                rewrite_fixture(&next, &replacement, 2);
+                let length = std::fs::metadata(&path)
+                    .unwrap()
+                    .len()
+                    .max(std::fs::metadata(&next).unwrap().len())
+                    as usize;
+                pad_parquet_to(&path, length);
+                let bytes = pad_parquet_to(&next, length);
+                assert_eq!(FeatureTable::read_parquet(&next).unwrap().num_rows(), 2);
+                rewrite_after_metadata(&path, bytes);
+                let selection = TableSelection {
+                    columns: projected.then(|| vec!["qual".to_string()]),
+                    ..TableSelection::default()
+                };
+                let error = FeatureTable::read_parquet_selected(&path, &selection).unwrap_err();
+                assert!(error.to_string().contains("changed while it was read"), "{error:#}");
+            }
+        }
+    }
+
     #[test]
     fn reads_selected_columns_and_rows_across_row_groups() {
         // More rows than fit in one row group, so the file has two.
@@ -802,6 +1314,26 @@ mod tests {
         let unknown = json.replace(r#""feature_source":"vcf""#, r#""feature_source":"bam""#);
         let error = serde_json::from_str::<FeatureTableInfo>(&unknown).unwrap_err().to_string();
         assert!(error.contains("unknown feature source 'bam'"), "{error}");
+    }
+
+    /// A table of unknown alignment provenance is written as before it was recorded; a known
+    /// one round trips.
+    #[test]
+    fn the_alignment_provenance_is_recorded_when_known() {
+        let unknown = info_with_divisor(None);
+        let json = serde_json::to_string(&unknown).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("alignment").is_none(), "{json}");
+        assert_eq!(serde_json::from_str::<FeatureTableInfo>(&json).unwrap(), unknown);
+        let provenance = crate::testing::provenance(&[("aligner", "bwa-mem3")], false);
+        let known = FeatureTableInfo { alignment: Some(provenance), ..unknown };
+        let json = serde_json::to_string(&known).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["alignment"],
+            serde_json::json!({"aligner": "bwa-mem3", "options-inference": "explicit"})
+        );
+        assert_eq!(serde_json::from_str::<FeatureTableInfo>(&json).unwrap(), known);
     }
 
     #[test]

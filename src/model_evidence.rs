@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use log::info;
 
+use crate::alignment_provenance::{AlignmentProvenance, AlignmentTags};
 use crate::common::PhaseTimer;
-use crate::evidence::{Evidence, EvidenceTables, read_tables};
+use crate::evidence::{Evidence, EvidenceTables, read_tables_checked};
 use crate::model::{ModelInfo, WinnowrModel};
 use crate::pileup::{PileupOptions, PileupTables, measure_pileup};
 use crate::pileup_features::add_pileup_features;
@@ -192,7 +193,11 @@ pub fn check_supplied<E: ModelEvidence>(
         );
     }
     if users.is_empty() && !tables.is_empty() {
-        log::warn!("no model uses {}; --{} is ignored", E::FEATURES, E::NAME);
+        log::warn!(
+            "no model uses {}; --{} is ignored for features (it may still be read for alignment provenance)",
+            E::FEATURES,
+            E::NAME
+        );
     }
     Ok(())
 }
@@ -233,11 +238,13 @@ pub fn read_for_models<E: ModelEvidence>(
     tables: &[PathBuf],
     models: &[WinnowrModel],
     paths: &[PathBuf],
+    tags: Option<&AlignmentTags>,
+    check: impl FnMut(&Path, Option<&AlignmentProvenance>) -> Result<()>,
 ) -> Result<Option<EvidenceTables<E>>> {
     if tables.is_empty() || models.iter().all(|model| E::of_model(&model.info).is_none()) {
         return Ok(None);
     }
-    let read = read_tables::<E>(tables)?;
+    let read = read_tables_checked::<E>(tables, tags, check)?;
     let source = format!("--{} {}", E::NAME, tables[0].display());
     for (path, model) in paths.iter().zip(models) {
         if let Some(trained) = E::of_model(&model.info) {
@@ -303,9 +310,33 @@ pub fn measure_and_decide(
     );
     let contigs = measure.contigs.to_vec();
     let (strlen, pileup) = (measure.strlen, measure.pileup);
+    let expected_alignment = measure.inputs.expected_alignment.map(|expected| {
+        (
+            expected.provenance.cloned(),
+            expected.header_records.to_vec(),
+            expected.tags.cloned(),
+            expected.strict,
+        )
+    });
+    let observed_indexes = measure.inputs.observed_indexes.clone();
     let mut measuring = Some(std::thread::spawn(move || {
         pool.install(|| -> Result<Measured> {
-            let inputs = ReadInputs { vcf: &vcf, alignments: &alignments, reference: &reference };
+            let expected_alignment =
+                expected_alignment.as_ref().map(|(provenance, header_records, tags, strict)| {
+                    crate::read_pass::AlignmentExpectation {
+                        provenance: provenance.as_ref(),
+                        header_records,
+                        tags: tags.as_ref(),
+                        strict: *strict,
+                    }
+                });
+            let inputs = ReadInputs {
+                observed_indexes,
+                vcf: &vcf,
+                alignments: &alignments,
+                reference: &reference,
+                expected_alignment,
+            };
             let strlen_rows = strlen
                 .map(|options| {
                     let sites = measure_regions(&inputs, &contigs, &options)?;
@@ -315,7 +346,7 @@ pub fn measure_and_decide(
             let pileup = pileup
                 .map(|options| {
                     let rows = measure_pileup(&inputs, &contigs, &options)?;
-                    Ok::<_, anyhow::Error>(PileupTables { options, rows })
+                    Ok::<_, anyhow::Error>(PileupTables::new(options, rows))
                 })
                 .transpose()?;
             Ok((strlen_rows, pileup))
@@ -342,7 +373,7 @@ pub fn measure_and_decide(
     timer.lap("measuring the evidence from the reads (while scoring other models)");
     let mut table = table;
     if let (Some(rows), Some(options)) = (strlen_rows, measure.strlen) {
-        table = add_strlen_features(table, &StrlenTables { options, rows })?;
+        table = add_strlen_features(table, &StrlenTables::new(options, rows))?;
     }
     if let Some(pileup) = pileup {
         table = add_pileup_features(table, &pileup)?;
@@ -477,8 +508,15 @@ mod tests {
         assert!(message.starts_with("models use pileup features; pass --pileup"), "{message}");
         assert!(message.ends_with("a.json, c.json"), "{message}");
         // No tables, or no model using them: nothing is read.
-        assert_eq!(read_for_models::<PileupOptions>(&[], &models, &paths).unwrap(), None);
-        assert_eq!(read_for_models::<PileupOptions>(&tables, &models[1..2], &paths).unwrap(), None);
+        assert_eq!(
+            read_for_models::<PileupOptions>(&[], &models, &paths, None, |_, _| Ok(())).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_for_models::<PileupOptions>(&tables, &models[1..2], &paths, None, |_, _| Ok(()))
+                .unwrap(),
+            None
+        );
     }
 
     /// `score --alignments` decides as `score --pileup` does with the same evidence measured
@@ -492,7 +530,7 @@ mod tests {
         use crate::rescore::Mode;
         use crate::testing::{
             CALL_FIELDS, TestRead, call_table, separable_model, separable_model_of, vcf_header,
-            write_bam, write_fasta, write_indexed_vcf,
+            write_bam_with_header, write_fasta, write_indexed_vcf,
         };
 
         let dir = TempDir::new().unwrap();
@@ -526,8 +564,22 @@ mod tests {
             bases: Some(bases),
         };
         let reads = [read("both", &both), read("one", &one)];
-        let bam = write_bam(dir.path(), "reads.bam", reference.len() as u64, &reads);
-        let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
+        let program =
+            |reads: &str| format!("@PG\tID:bwa\tPN:bwa\tVN:0.7.17\tCL:bwa mem ref.fa {reads}");
+        let bam = write_bam_with_header(
+            dir.path(),
+            "reads.bam",
+            reference.len() as u64,
+            &reads,
+            &[&program("reads.fq")],
+        );
+        let inputs = ReadInputs {
+            observed_indexes: None,
+            vcf: &vcf,
+            alignments: &bam,
+            reference: &fasta,
+            expected_alignment: None,
+        };
 
         // The SNP model's class is the number of alternate reads at MAPQ 20 or more (drop, keep,
         // flip); the indel model's is `x`. The indel call shares its key with the SNP at 131, so
@@ -552,13 +604,14 @@ mod tests {
 
         let contigs = ["chr1".to_string()];
         let rows = measure_pileup(&inputs, &contigs, &options).unwrap();
-        let measured = add_pileup_features(table.clone(), &PileupTables { options, rows }).unwrap();
+        let measured =
+            add_pileup_features(table.clone(), &PileupTables::new(options, rows)).unwrap();
         let expected = crate::policy::decide_calls(&measured, &models, &policy).unwrap();
         let measuring =
             Measuring { inputs: &inputs, strlen: None, pileup: Some(options), contigs: &contigs };
         let threads = NonZeroUsize::new(2).unwrap();
         let got = measure_and_decide(
-            table,
+            table.clone(),
             &models,
             &policy,
             &measuring,
@@ -567,6 +620,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, expected);
+
+        // The measurement thread must retain the raw header records checked before scoring: a
+        // header whose command line differs only in its reads normalizes to the same provenance,
+        // so only the raw records tell it apart.
+        let checked = crate::alignment_provenance::HeaderProvenance::read(&bam).unwrap();
+        assert!(checked.provenance.is_some());
+        let other_records: Vec<String> = checked
+            .header_records
+            .iter()
+            .map(|record| record.replace(&program("reads.fq"), &program("other.fq")))
+            .collect();
+        assert_ne!(other_records, checked.header_records);
+        let other = crate::alignment_provenance::HeaderProvenance::from_header_text(
+            &other_records.join("\n"),
+        );
+        assert_eq!(other.provenance, checked.provenance);
+        let decide_expecting = |header_records: &[String]| {
+            let expecting = ReadInputs {
+                observed_indexes: None,
+                expected_alignment: Some(crate::read_pass::AlignmentExpectation {
+                    provenance: checked.provenance.as_ref(),
+                    header_records,
+                    tags: None,
+                    strict: true,
+                }),
+                ..inputs.clone()
+            };
+            let measuring = Measuring { inputs: &expecting, ..measuring };
+            measure_and_decide(
+                table.clone(),
+                &models,
+                &policy,
+                &measuring,
+                threads,
+                &mut PhaseTimer::start(),
+            )
+        };
+        assert_eq!(decide_expecting(&checked.header_records).unwrap(), expected);
+        let error = format!("{:#}", decide_expecting(&other_records).unwrap_err());
+        assert!(error.contains("raw @PG/@SQ records changed"), "{error}");
 
         let mut actions: Vec<(u64, Task, bool, bool)> =
             got.iter().map(|(key, d)| (key.1, d.task, d.drop, d.flip)).collect();

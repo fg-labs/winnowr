@@ -535,6 +535,26 @@ pub fn check_output_not_input<'a>(
     Ok(())
 }
 
+/// Checks an output against an input's identity captured from the handle that read it, even
+/// if the input's original path no longer names that file.
+///
+/// # Errors
+///
+/// Returns an error if the output names the captured input (including through a link).
+pub fn check_output_not_loaded_input(
+    output: &Path,
+    what: &str,
+    input: &std::fs::Metadata,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(actual) = std::fs::metadata(output)
+        && (actual.dev(), actual.ino()) == (input.dev(), input.ino())
+    {
+        bail!("the output {} is the input {what}; write to another path", output.display());
+    }
+    Ok(())
+}
+
 /// Protects existing index files and absent candidates that precede the index currently selected
 /// by the reader. Creating a later candidate does not change selection and remains allowed.
 ///
@@ -1055,7 +1075,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(text, std::fs::read_to_string(&serial).unwrap());
-        assert!(!crate::io::lacks_bgzf_eof(&sharded));
+        assert!(!crate::io::lacks_bgzf_eof(&sharded).unwrap());
         assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), lines.len());
         assert_eq!(text.matches(DROP_FILTER).count(), 4, "3 drops plus the header line");
         // The shard files were removed with their directory.

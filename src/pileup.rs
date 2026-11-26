@@ -29,6 +29,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use smallvec::SmallVec;
 
+use crate::alignment_provenance::AlignmentProvenance;
 use crate::alleles::{Genotype, length_change, trim_alleles, variant_type_of};
 use crate::common::VariantType;
 use crate::evidence::{Evidence, EvidenceTables, write_table};
@@ -258,8 +259,8 @@ impl PileupRow {
 /// The rows of one or more pileup tables, with the settings they were measured with.
 pub type PileupTables = EvidenceTables<PileupOptions>;
 
-/// Writes rows measured with `options` as a pileup table (see [`write_table`]). Returns the
-/// number of rows written.
+/// Writes rows measured with `options`, of reads aligned as `alignment` records (when known), as a
+/// pileup table (see [`write_table`]). Returns the number of rows written.
 ///
 /// # Errors
 ///
@@ -268,8 +269,9 @@ pub fn write_pileup_table(
     path: &Path,
     rows: &[PileupRow],
     options: PileupOptions,
+    alignment: Option<&AlignmentProvenance>,
 ) -> Result<usize> {
-    write_table(path, options, rows.iter().map(PileupRow::to_line))
+    write_table(path, options, alignment, rows.iter().map(PileupRow::to_line))
 }
 
 /// The bases that tell a record's same-length alleles apart: the 0-based positions at which
@@ -1516,7 +1518,7 @@ pub fn measure_annotations_and_pileup<S: AsRef<str>>(
     if options.reads_alleles_as(annotations) {
         let sites = measure_sites(inputs, regions, &options, Some(annotations))?;
         let rows = sites.iter().filter(|site| site.counted).map(|site| site.row.clone()).collect();
-        return Ok((sites, Some(PileupTables { options, rows })));
+        return Ok((sites, Some(PileupTables::new(options, rows))));
     }
     let sites = measure_annotations(inputs, regions, annotations)?;
     // score reports this at startup (see `crate::model_set`).
@@ -1525,7 +1527,7 @@ pub fn measure_annotations_and_pileup<S: AsRef<str>>(
          alignment settings {annotations}: reading the reads again for the pileup evidence"
     );
     let rows = measure_pileup(inputs, regions, &options)?;
-    Ok((sites, Some(PileupTables { options, rows })))
+    Ok((sites, Some(PileupTables::new(options, rows))))
 }
 
 /// Measures the reads at every SNP and indel record (any FILTER) whose POS lies in each region,
@@ -1692,14 +1694,14 @@ mod tests {
         ];
         let options = PileupOptions::default();
         let path = dir.path().join("p.tsv.gz");
-        assert_eq!(write_pileup_table(&path, &rows, options).unwrap(), 2);
+        assert_eq!(write_pileup_table(&path, &rows, options, None).unwrap(), 2);
         let other = dir.path().join("q.tsv");
-        write_pileup_table(&other, &rows[..1], options).unwrap();
+        write_pileup_table(&other, &rows[..1], options, None).unwrap();
         let tables = read_tables::<PileupOptions>(&[&path, &other]).unwrap();
-        assert_eq!(tables, PileupTables { options, rows: rows.clone() });
+        assert_eq!(tables, PileupTables::new(options, rows.clone()));
 
         let mixed = dir.path().join("mixed.tsv");
-        write_pileup_table(&mixed, &rows, "mapq30".parse().unwrap()).unwrap();
+        write_pileup_table(&mixed, &rows, "mapq30".parse().unwrap(), None).unwrap();
         let message = read_tables::<PileupOptions>(&[&path, &mixed]).unwrap_err().to_string();
         assert!(message.contains("different settings"), "{message}");
         let bare = dir.path().join("bare.tsv");
@@ -1713,6 +1715,81 @@ mod tests {
         assert!(message.contains("bad.tsv:3") && message.contains("expected 14"), "{message}");
         let none: [&Path; 0] = [];
         assert!(read_tables::<PileupOptions>(&none).is_err());
+    }
+
+    /// The reads' alignment provenance is recorded in its own line, which the rows' reading skips
+    /// and older tables lack; the tables given together must agree on it.
+    #[test]
+    fn the_alignment_provenance_is_recorded() {
+        use crate::evidence::read_alignment;
+        let dir = TempDir::new().unwrap();
+        let rows = [PileupRow {
+            chrom: "chr1".into(),
+            pos: 10,
+            reference: "A".into(),
+            alt: "G".into(),
+            n_reads: 1,
+            counts: [[1, 0, 0], [0; 3], [0; 3]],
+        }];
+        let options = PileupOptions::default();
+        let provenance = crate::testing::bwa_provenance;
+        let primary = provenance("primary");
+        let path = dir.path().join("p.tsv.gz");
+        write_pileup_table(&path, &rows, options, Some(&primary)).unwrap();
+        let unknown = dir.path().join("u.tsv");
+        write_pileup_table(&unknown, &rows, options, None).unwrap();
+        let tables = read_tables::<PileupOptions>(&[&path, &unknown]).unwrap();
+        assert_eq!(tables.rows, rows);
+        assert_eq!(tables.alignment.as_ref(), Some(&primary));
+        assert_eq!(read_alignment(&[&path, &unknown]).unwrap(), Some(primary));
+        assert_eq!(read_alignment(&[&unknown]).unwrap(), None);
+        assert_eq!(read_tables::<PileupOptions>(&[&unknown]).unwrap().alignment, None);
+        let other = dir.path().join("o.tsv");
+        write_pileup_table(&other, &rows, options, Some(&provenance("keep-alt"))).unwrap();
+        for message in [
+            read_alignment(&[&path, &other]).unwrap_err().to_string(),
+            read_tables::<PileupOptions>(&[&path, &other]).unwrap_err().to_string(),
+        ] {
+            assert!(message.contains("were aligned differently: alt-project: "), "{message}");
+            assert!(message.contains("o.tsv keep-alt. "), "{message}");
+        }
+        // A malformed line names the table.
+        let bad = dir.path().join("bad.tsv");
+        std::fs::write(&bad, format!("{SETTINGS_PREFIX}default\n##alignment=[1]\n{HEADER}\n"))
+            .unwrap();
+        for error in [
+            read_alignment(&[&bad]).unwrap_err(),
+            read_tables::<PileupOptions>(&[&bad]).unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("bad.tsv has a malformed ##alignment= line"), "{message}");
+        }
+    }
+
+    /// A table that is not a regular file (e.g. a pipe) is not read for its provenance before
+    /// scoring, so that it is not consumed. Opening this pipe, which has no writer, would block,
+    /// so the read runs in a child under a deadline: a regression fails rather than hangs.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_is_not_read_for_its_provenance() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("pipe.tsv");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success());
+        let log = dir.path().join("child.log");
+        let mut processes = crate::testing::TestProcesses::default();
+        let envs = [("WINNOWR_PILEUP_FIFO", &fifo)];
+        processes.spawn_test("pileup::tests::fifo_provenance_child", envs, &log);
+        processes.wait_for_success(std::time::Duration::from_secs(10));
+    }
+
+    /// Child of [`a_pipe_is_not_read_for_its_provenance`].
+    #[cfg(unix)]
+    #[test]
+    fn fifo_provenance_child() {
+        let Some(fifo) = std::env::var_os("WINNOWR_PILEUP_FIFO") else { return };
+        assert_eq!(crate::evidence::read_alignment(&[Path::new(&fifo)]).unwrap(), None);
+        crate::testing::child_body_ran();
     }
 
     #[test]
@@ -1993,7 +2070,13 @@ mod tests {
             TestRead { bases: Some(&a60), ..read("a60", 90, "70M", 60) },
         ];
         let bam = write_bam(dir.path(), "reads.bam", reference.len() as u64, &reads);
-        let inputs = ReadInputs { vcf: &vcf, alignments: &bam, reference: &fasta };
+        let inputs = ReadInputs {
+            observed_indexes: None,
+            vcf: &vcf,
+            alignments: &bam,
+            reference: &fasta,
+            expected_alignment: None,
+        };
         let options = PileupOptions::default();
         let rows = measure_pileup(&inputs, &["chr1", "chr2"], &options).unwrap();
         let summary: Vec<(u64, u64, AlleleCounts)> =
@@ -2008,8 +2091,11 @@ mod tests {
             ]
         );
         let path = dir.path().join("pileup.tsv.gz");
-        write_pileup_table(&path, &rows, options).unwrap();
-        assert_eq!(read_tables::<PileupOptions>(&[&path]).unwrap(), PileupTables { options, rows });
+        write_pileup_table(&path, &rows, options, None).unwrap();
+        assert_eq!(
+            read_tables::<PileupOptions>(&[&path]).unwrap(),
+            PileupTables::new(options, rows)
+        );
     }
 
     /// The paths of a VCF of `records` on [`reference`], the reads, and the reference.
@@ -2035,7 +2121,13 @@ mod tests {
         }
 
         fn inputs(&self) -> ReadInputs<'_> {
-            ReadInputs { vcf: &self.vcf, alignments: &self.bam, reference: &self.fasta }
+            ReadInputs {
+                observed_indexes: None,
+                vcf: &self.vcf,
+                alignments: &self.bam,
+                reference: &self.fasta,
+                expected_alignment: None,
+            }
         }
     }
 
@@ -3452,7 +3544,7 @@ mod tests {
             (None, None) => {}
             (Some(options), Some(tables)) => {
                 let rows = rows_of(&options);
-                assert_eq!(tables, PileupTables { options, rows: rows.clone() });
+                assert_eq!(tables, PileupTables::new(options, rows.clone()));
                 if separate {
                     // The rows are not those the annotations' pass counts with its settings.
                     assert_ne!(rows, counted_rows(&sites));

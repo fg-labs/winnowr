@@ -14,6 +14,10 @@ use indexmap::IndexMap;
 use rayon::prelude::*;
 use serde::{Serialize, Serializer};
 
+use crate::alignment_provenance::{
+    AlignmentProvenance, MergeConflict, ProvenanceDifference, UnknownReason, compare_with_models,
+    conflicts, describe_differences, incomplete_options_reason, indeterminate_tags, merge,
+};
 use crate::common::named_enum;
 use crate::feature_source::{FeatureSource, shared_source};
 use crate::model::{ModelInfo, ReferenceContigs, check_reference};
@@ -73,6 +77,22 @@ pub enum Check {
     ReferenceNotChecked,
     /// A reference index or VCF given to check the models against cannot be read.
     InputUnreadable,
+    /// The models record different alignment provenance: a warning, or an error when strict.
+    AlignmentProvenanceDiffers,
+    /// The models' alignment provenance differs from the reads': a warning, or an error when
+    /// strict.
+    AlignmentProvenanceMismatch,
+    /// A model records no alignment provenance.
+    AlignmentProvenanceUnknown,
+    /// The models record alignment provenance, and the reads' is not known: a warning, or an
+    /// error when strict.
+    AlignmentProvenanceNotChecked,
+    /// The reads' header has aligner records that normalize differently.
+    AlignmentHeaderMixed,
+    /// Equal mixed markers do not establish that the models and reads were aligned alike.
+    AlignmentProvenanceIndeterminate,
+    /// Alignment settings could not be inferred reliably from a lossy recorded command line.
+    AlignmentProvenanceIncomplete,
 }
 
 named_enum!(Check, "check", {
@@ -97,6 +117,13 @@ named_enum!(Check, "check", {
     NoReferenceContigs => "no_reference_contigs",
     ReferenceNotChecked => "reference_not_checked",
     InputUnreadable => "input_unreadable",
+    AlignmentProvenanceDiffers => "alignment_provenance_differs",
+    AlignmentProvenanceMismatch => "alignment_provenance_mismatch",
+    AlignmentProvenanceUnknown => "alignment_provenance_unknown",
+    AlignmentProvenanceNotChecked => "alignment_provenance_not_checked",
+    AlignmentHeaderMixed => "alignment_header_mixed",
+    AlignmentProvenanceIndeterminate => "alignment_provenance_indeterminate",
+    AlignmentProvenanceIncomplete => "alignment_provenance_incomplete",
 });
 
 /// How bad a [`Problem`] is: an error stops a run, a warning does not.
@@ -136,6 +163,10 @@ pub struct Problem {
     pub model: Option<PathBuf>,
     /// What is wrong, and what to do.
     pub message: String,
+    /// The tags on which the models' and the reads' alignment provenance differ, for
+    /// [`Check::AlignmentProvenanceMismatch`] (not written when empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub differences: Vec<ProvenanceDifference>,
 }
 
 impl Problem {
@@ -156,7 +187,13 @@ impl Problem {
         model: Option<&Path>,
         message: M,
     ) -> Self {
-        Problem { check, severity, model: model.map(Path::to_path_buf), message: message.into() }
+        Problem {
+            check,
+            severity,
+            model: model.map(Path::to_path_buf),
+            message: message.into(),
+            differences: Vec::new(),
+        }
     }
 }
 
@@ -207,6 +244,21 @@ pub struct SetInputs<'a> {
     /// True if some models given could not be read, and so are not in the set: whether a region
     /// BED is used is then not known.
     pub unreadable_models: bool,
+    /// What the models' alignment provenance is checked against.
+    pub reads: ReadsCheck<'a>,
+}
+
+/// How the reads to be scored were aligned, and how strictly the models' alignment provenance is
+/// checked against it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadsCheck<'a> {
+    /// The reads' alignment provenance, when known (from their header, their evidence tables or
+    /// `--alignment-tags`).
+    pub alignment: Option<&'a AlignmentProvenance>,
+    /// Why it is not known, when it is not.
+    pub unknown: UnknownReason,
+    /// Whether an alignment provenance problem is an error (`--strict-provenance`).
+    pub strict: bool,
 }
 
 /// Runs every check of a model set against its inputs, and returns every problem found, in a
@@ -237,6 +289,7 @@ pub fn check_model_set(set: &ModelSet<'_>, inputs: &SetInputs<'_>) -> Vec<Proble
         problems.extend(pileup_alignment_passes(set));
         problems.extend(model_regions(set, inputs));
         problems.extend(model_warnings(set));
+        problems.extend(alignment_provenance_problems(set, inputs.reads));
     }
     problems.sort_by_key(|problem| problem.check);
     problems
@@ -571,6 +624,134 @@ fn model_warnings(set: &ModelSet<'_>) -> Vec<Problem> {
     problems
 }
 
+/// The alignment provenance the models share: the [`merge`] of every model's that records one, if
+/// they agree, else `None`.
+#[must_use]
+pub fn models_alignment(infos: &[&ModelInfo]) -> Option<AlignmentProvenance> {
+    let known: Vec<&AlignmentProvenance> =
+        infos.iter().filter_map(|info| info.alignment.as_ref()).collect();
+    merge(&known).ok().flatten()
+}
+
+/// The alignment provenance checks: [`Check::AlignmentProvenanceDiffers`],
+/// [`Check::AlignmentProvenanceMismatch`], [`Check::AlignmentProvenanceNotChecked`],
+/// [`Check::AlignmentProvenanceIndeterminate`] and [`Check::AlignmentProvenanceIncomplete`], each
+/// an error when strict, else a warning. Models that record no provenance are not checked. Models
+/// that agree are compared with the reads as one (their [`merge`]), retaining complete contributors'
+/// known absent settings even with incomplete peers; otherwise each is (see [`compare_with_models`]).
+/// Scoring repeats these checks after required evidence is loaded.
+pub fn alignment_provenance_problems(set: &ModelSet<'_>, check: ReadsCheck<'_>) -> Vec<Problem> {
+    let (paths, known): (Vec<&Path>, Vec<&AlignmentProvenance>) = set
+        .paths
+        .iter()
+        .zip(set.infos)
+        .filter_map(|(path, info)| Some((path.as_path(), info.alignment.as_ref()?)))
+        .unzip();
+    if known.is_empty() {
+        return Vec::new();
+    }
+    let severity = if check.strict { Severity::Error } else { Severity::Warning };
+    let advice = if check.strict {
+        "Pass --alignment-tags if the reads' recorded alignment is wrong."
+    } else {
+        "Pass --strict-provenance to make this an error, or --alignment-tags if the reads' \
+         recorded alignment is wrong."
+    };
+    let conflicts = conflicts(&known);
+    let mut problems: Vec<Problem> = conflicts
+        .iter()
+        .map(|MergeConflict { first, second, differences }| {
+            let (first, second) = (paths[*first], paths[*second]);
+            let message = format!(
+                "--models were trained on reads aligned differently: {}. Score with models \
+                 trained on reads aligned alike",
+                describe_differences(
+                    differences,
+                    &first.display().to_string(),
+                    &second.display().to_string()
+                )
+            );
+            Problem::new(Check::AlignmentProvenanceDiffers, severity, Some(second), message)
+        })
+        .collect();
+    for (path, model) in paths.iter().zip(&known) {
+        if let Some(reason) = incomplete_options_reason(model) {
+            problems.push(Problem::new(
+                Check::AlignmentProvenanceIncomplete,
+                severity,
+                Some(path),
+                format!(
+                    "model {} records incomplete alignment settings: {reason}. Regenerate its \
+                     training feature tables with extract --alignment-tags options-inference=explicit \
+                     and the intended settings, then retrain from those tables",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let Some(reads) = check.alignment else {
+        if check.unknown == UnknownReason::Unreadable {
+            return problems;
+        }
+        let recorded = match merge(&known) {
+            Ok(Some(merged)) => merged.to_string(),
+            _ => known[0].to_string(),
+        };
+        let message = format!(
+            "the models record how their training reads were aligned ({recorded}), but the \
+             reads' alignment is not known, so it is not checked: {}",
+            check.unknown.explanation()
+        );
+        problems.push(Problem::new(Check::AlignmentProvenanceNotChecked, severity, None, message));
+        return problems;
+    };
+    if let Some(reason) = incomplete_options_reason(reads) {
+        problems.push(Problem::new(
+            Check::AlignmentProvenanceIncomplete,
+            severity,
+            None,
+            format!(
+                "the reads record incomplete alignment settings: {reason}. Supply the intended \
+                 settings as --alignment-tags with an options-inference=explicit declaration"
+            ),
+        ));
+    }
+    let compared = merge(&known).ok().flatten();
+    let indeterminate: BTreeSet<String> = if let Some(merged) = &compared {
+        indeterminate_tags(merged, reads)
+    } else {
+        known.iter().flat_map(|model| indeterminate_tags(model, reads)).collect()
+    };
+    if !indeterminate.is_empty() {
+        problems.push(Problem::new(
+            Check::AlignmentProvenanceIndeterminate,
+            severity,
+            None,
+            format!(
+                "alignment provenance is indeterminate on {}: both the models and reads record \
+                 mixed, which does not establish agreement. {advice}",
+                indeterminate.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+    for (index, differences) in compare_with_models(&known, reads) {
+        let path = index.map(|index| paths[index]);
+        let whose = path.map_or_else(
+            || "the models'".to_string(),
+            |path| format!("model {}'s", path.display()),
+        );
+        let message = format!(
+            "the reads were not aligned as {whose} training reads were: {}. Calls may be scored \
+             worse (see the user guide: Alignment provenance). {advice}",
+            describe_differences(&differences, "models", "reads")
+        );
+        let mut problem = Problem::new(Check::AlignmentProvenanceMismatch, severity, path, message);
+        problem.differences = differences;
+        problems.push(problem);
+    }
+    problems
+}
+
 /// The message of the errors among `problems` for a command to fail with: the one error's message
 /// alone, or `N problems with the models and their inputs:` and each, one per line (`None`
 /// without errors).
@@ -603,6 +784,7 @@ mod tests {
     use super::*;
     use crate::common::{Task, VariantType};
     use crate::read_annotations::ReadAnnotationOptions;
+    use crate::testing::provenance;
 
     /// A genotype model of `variant_type` on chr1 (of 1000 bp).
     fn info(variant_type: VariantType) -> ModelInfo {
@@ -669,7 +851,7 @@ mod tests {
             let json = serde_json::to_value(severity).unwrap();
             assert_eq!(json, serde_json::Value::String(severity.as_str().into()));
         }
-        assert_eq!(Check::ALL.len(), Check::InputUnreadable as usize + 1);
+        assert_eq!(Check::ALL.len(), Check::AlignmentProvenanceIncomplete as usize + 1);
         assert_eq!(Severity::ALL, [Severity::Error, Severity::Warning]);
     }
 
@@ -1015,6 +1197,260 @@ mod tests {
         let problems = check(&[snp], &SetInputs::default());
         assert_eq!(checks(&problems), [expected]);
         assert_eq!(problems[0].severity, Severity::Warning);
+    }
+
+    /// Genotype snp and indel models trained on reads aligned as `snp` and `indel` record.
+    fn aligned(snp: AlignmentProvenance, indel: AlignmentProvenance) -> [ModelInfo; 2] {
+        let (mut a, mut b) = (info(VariantType::Snp), info(VariantType::Indel));
+        a.alignment = Some(snp);
+        b.alignment = Some(indel);
+        [a, b]
+    }
+
+    /// The alignment problems of `infos` against reads aligned as `reads`.
+    fn alignment_checks(
+        infos: &[ModelInfo],
+        reads: Option<&AlignmentProvenance>,
+        unknown: UnknownReason,
+        strict: bool,
+    ) -> Vec<(Check, Severity)> {
+        let inputs = SetInputs {
+            reads: ReadsCheck { alignment: reads, unknown, strict },
+            ..SetInputs::default()
+        };
+        check(infos, &inputs).iter().map(|p| (p.check, p.severity)).collect()
+    }
+
+    /// The models are merged before they are compared with the reads, whatever their order: a
+    /// model of tags alone does not hide another's difference.
+    #[test]
+    fn the_models_are_merged_before_the_reads_are_compared() {
+        let tags_only = provenance(&[("aligner", "bwa-mem3")], true);
+        let header = provenance(&[("aligner", "bwa-mem3"), ("alt-project", "primary")], false);
+        let reads = provenance(&[("aligner", "bwa-mem3"), ("alt-project", "keep-alt")], false);
+        let mismatch = [(Check::AlignmentProvenanceMismatch, Severity::Warning)];
+        for infos in
+            [aligned(tags_only.clone(), header.clone()), aligned(header.clone(), tags_only.clone())]
+        {
+            let problems = check(
+                &infos,
+                &SetInputs {
+                    reads: ReadsCheck { alignment: Some(&reads), ..ReadsCheck::default() },
+                    ..SetInputs::default()
+                },
+            );
+            assert_eq!(
+                problems.iter().map(|p| (p.check, p.severity)).collect::<Vec<_>>(),
+                mismatch
+            );
+            assert_eq!(problems[0].model, None);
+        }
+        // Two models of tags alone that record different tags are compared as their union.
+        let a = provenance(&[("alt-project", "primary")], true);
+        let b = provenance(&[("Y", "")], true);
+        let reads = provenance(&[("alt-project", "keep-alt"), ("Y", "")], false);
+        assert_eq!(
+            alignment_checks(&aligned(a, b), Some(&reads), UnknownReason::NotGiven, false),
+            mismatch
+        );
+    }
+
+    /// Models that differ are a problem of their own (an error when strict), and each is then
+    /// compared with the reads.
+    #[test]
+    fn models_aligned_differently_are_compared_one_by_one() {
+        let primary = provenance(&[("alt-project", "primary")], false);
+        let keep = provenance(&[("alt-project", "keep-alt")], false);
+        let infos = aligned(primary.clone(), keep);
+        assert_eq!(
+            alignment_checks(&infos, Some(&primary), UnknownReason::NotGiven, true),
+            [
+                (Check::AlignmentProvenanceDiffers, Severity::Error),
+                (Check::AlignmentProvenanceMismatch, Severity::Error)
+            ]
+        );
+        let problems = check(
+            &infos,
+            &SetInputs {
+                reads: ReadsCheck { alignment: Some(&primary), ..ReadsCheck::default() },
+                ..SetInputs::default()
+            },
+        );
+        assert!(problems[0].message.ends_with("Score with models trained on reads aligned alike"));
+        assert_eq!(problems[1].model.as_deref(), Some(Path::new("b.winnowr.json")));
+    }
+
+    #[rstest]
+    #[case::normal(false, Severity::Warning)]
+    #[case::strict(true, Severity::Error)]
+    fn equal_mixed_markers_are_indeterminate(#[case] strict: bool, #[case] severity: Severity) {
+        let mixed = provenance(&[("alt-project", "mixed")], false);
+        let infos = aligned(mixed.clone(), mixed.clone());
+        let problems = check(
+            &infos,
+            &SetInputs {
+                reads: ReadsCheck { alignment: Some(&mixed), strict, ..ReadsCheck::default() },
+                ..SetInputs::default()
+            },
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].check.as_str(), "alignment_provenance_indeterminate");
+        assert_eq!(problems[0].severity, severity);
+        assert!(problems[0].message.contains("alt-project"));
+        assert!(problems[0].message.contains("mixed"));
+    }
+
+    #[rstest]
+    #[case::reads_only(false, true)]
+    #[case::models_only(true, false)]
+    #[case::both(true, true)]
+    fn scoring_requires_complete_options_on_both_sides(
+        #[case] model_incomplete: bool,
+        #[case] reads_incomplete: bool,
+        #[values(false, true)] strict: bool,
+    ) {
+        let provenance = |incomplete| {
+            let mut provenance = provenance(&[("aligner", "bwa")], false);
+            if incomplete {
+                provenance.0.insert("options-inference".to_string(), "incomplete".to_string());
+            }
+            provenance
+        };
+        let model = provenance(model_incomplete);
+        let reads = provenance(reads_incomplete);
+        let infos = aligned(model.clone(), model);
+        let problems = check(
+            &infos,
+            &SetInputs {
+                reads: ReadsCheck { alignment: Some(&reads), strict, ..ReadsCheck::default() },
+                ..SetInputs::default()
+            },
+        );
+        let incomplete: Vec<_> = problems
+            .iter()
+            .filter(|problem| problem.check.as_str() == "alignment_provenance_incomplete")
+            .collect();
+        assert_eq!(
+            incomplete.len(),
+            usize::from(model_incomplete) * 2 + usize::from(reads_incomplete),
+            "{problems:?}"
+        );
+        assert!(
+            incomplete.iter().all(|problem| problem.severity
+                == if strict { Severity::Error } else { Severity::Warning })
+        );
+        assert!(
+            incomplete.iter().all(|problem| problem.message.contains("options-inference=explicit"))
+        );
+        if model_incomplete {
+            let model_problems: Vec<_> =
+                incomplete.iter().filter(|problem| problem.message.starts_with("model ")).collect();
+            assert_eq!(model_problems.len(), 2, "{problems:?}");
+            assert!(
+                model_problems.iter().all(|problem| {
+                    problem.message.contains("extract --alignment-tags options-inference=explicit")
+                        && problem.message.contains("then retrain")
+                }),
+                "{problems:?}"
+            );
+        }
+        assert!(
+            !problems.iter().any(|problem| problem.check == Check::AlignmentProvenanceMismatch),
+            "{problems:?}"
+        );
+    }
+
+    #[rstest]
+    fn constraints_from_complete_models_survive_an_incomplete_peer(
+        #[values(false, true)] strict: bool,
+        #[values(false, true)] incomplete_first: bool,
+    ) {
+        let complete = provenance(&[("aligner", "bwa")], false);
+        let incomplete =
+            provenance(&[("aligner", "bwa"), ("options-inference", "incomplete")], false);
+        let reads = provenance(&[("aligner", "bwa"), ("p", "")], false);
+        let infos = if incomplete_first {
+            aligned(incomplete, complete)
+        } else {
+            aligned(complete, incomplete)
+        };
+        let problems = check(
+            &infos,
+            &SetInputs {
+                reads: ReadsCheck { alignment: Some(&reads), strict, ..ReadsCheck::default() },
+                ..SetInputs::default()
+            },
+        );
+        let severity = if strict { Severity::Error } else { Severity::Warning };
+        assert_eq!(
+            problems.iter().map(|p| (p.check, p.severity)).collect::<Vec<_>>(),
+            [
+                (Check::AlignmentProvenanceMismatch, severity),
+                (Check::AlignmentProvenanceIncomplete, severity),
+            ],
+            "{problems:?}"
+        );
+        assert_eq!(
+            problems[0].differences,
+            [ProvenanceDifference {
+                tag: "p".to_string(),
+                models: None,
+                reads: Some(String::new()),
+            }]
+        );
+    }
+
+    #[test]
+    fn scoring_legacy_models_ignore_incomplete_reads_provenance() {
+        let reads = provenance(&[("options-inference", "incomplete")], false);
+        let infos = [ModelInfo { alignment: None, ..info(VariantType::Snp) }];
+        assert!(alignment_checks(&infos, Some(&reads), UnknownReason::NotGiven, true).is_empty());
+    }
+
+    #[test]
+    fn ignored_or_uncompared_mixed_tags_are_not_indeterminate() {
+        let header = provenance(
+            &[("aligner", "bwa"), ("alt-project", "mixed"), ("version", "mixed")],
+            false,
+        );
+        let partial = provenance(&[("aligner", "bwa")], true);
+        let infos = aligned(partial.clone(), partial);
+        assert!(alignment_checks(&infos, Some(&header), UnknownReason::NotGiven, true).is_empty());
+        let version = provenance(&[("version", "mixed")], false);
+        assert!(
+            alignment_checks(
+                &aligned(version.clone(), version.clone()),
+                Some(&version),
+                UnknownReason::NotGiven,
+                true
+            )
+            .is_empty()
+        );
+    }
+
+    /// Why the reads' alignment is not known is said, and an unreadable header is not also "not
+    /// checked".
+    #[rstest]
+    #[case::not_given(
+        UnknownReason::NotGiven,
+        "neither --alignments nor --alignment-tags was given"
+    )]
+    #[case::not_recorded(UnknownReason::NotRecorded, "the reads' header identifies no aligner")]
+    #[case::tags_none(UnknownReason::TagsNone, "--alignment-tags none was given")]
+    fn reads_of_unknown_alignment_are_not_checked(
+        #[case] unknown: UnknownReason,
+        #[case] why: &str,
+    ) {
+        let primary = provenance(&[("alt-project", "primary")], false);
+        let infos = aligned(primary.clone(), primary);
+        let reads = ReadsCheck { unknown, ..ReadsCheck::default() };
+        let inputs = SetInputs { reads, ..SetInputs::default() };
+        let problems = check(&infos, &inputs);
+        assert_eq!(checks(&problems), [Check::AlignmentProvenanceNotChecked]);
+        assert!(problems[0].message.contains(why), "{}", problems[0].message);
+        let unreadable = ReadsCheck { unknown: UnknownReason::Unreadable, ..reads };
+        let unreadable = SetInputs { reads: unreadable, ..inputs };
+        assert!(check(&infos, &unreadable).is_empty());
     }
 
     #[test]

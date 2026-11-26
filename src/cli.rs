@@ -11,22 +11,30 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use log::info;
 
+use crate::alignment_provenance::{
+    AlignmentProvenance, AlignmentTags, LazySource, ReadsAlignment, comparable_tags,
+    compare_with_models, describe_differences, incomplete_options_reason, indeterminate_tags,
+    merge, resolve_reads, training_provenance,
+};
 use crate::common::{AUTOSOMES, PhaseTimer, Task, VariantType, repeated};
+#[cfg(test)]
 use crate::evidence::read_tables;
+use crate::evidence::read_tables_with_tags;
 use crate::extraction::{TableInputs, TruthInputs, build_feature_table, check_table_inputs};
 use crate::feature_source::FeatureSource;
 use crate::features::feature_names;
 use crate::labels::{HappyPassOnly, UnfixableFlips};
 use crate::model::{
     CvFolds, MODEL_SUFFIX, ModelInfo, ReferenceContigs, TrainingParams, WinnowrModel,
-    check_reference, read_model_file,
+    check_reference, read_model_file_with_metadata,
 };
 use crate::model_evidence::{
     Measuring, check_supplied, check_table, measure_and_decide, models_options, models_using,
     read_for_models, shared_options,
 };
 use crate::model_set::{
-    ModelSet, SetInputs, Severity, check_model_set, error_message, models_feature_source,
+    Check, ModelSet, Problem, ReadsCheck, SetInputs, Severity, alignment_provenance_problems,
+    check_model_set, error_message, models_feature_source,
 };
 use crate::pileup::{
     MeasuredSite, PileupOptions, PileupTables, measure_annotations_and_pileup, measure_pileup,
@@ -39,13 +47,13 @@ use crate::policy::{
 };
 use crate::raw_records::AnnotationInputs;
 use crate::read_annotations::{ReadAnnotationOptions, summarise};
-use crate::read_pass::ReadInputs;
+use crate::read_pass::{AlignmentExpectation, ReadInputs};
 use crate::regions::{NamedBed, NamedPath, RegionSet, read_region_sets};
 use crate::repeat_features::STRLEN_FEATURES;
 use crate::rescore::{Mode, Rule};
 use crate::samples::{PromoteSampleCalls, SampleCalls};
 use crate::scoring::write_scored_vcf;
-use crate::strlen::{StrlenOptions, measure_regions, write_strlen_table};
+use crate::strlen::{StrlenOptions, StrlenTables, measure_regions, write_strlen_table};
 use crate::stutter::{
     LENGTH_CALL_FEATURES, StutterFit, StutterModel, fit_stutter_from_feature_tables,
 };
@@ -223,6 +231,30 @@ impl Command {
     }
 }
 
+/// The `--alignment-tags` option of the commands that record or compare how reads were aligned.
+#[derive(Debug, Args)]
+pub(crate) struct AlignmentTagsArgs {
+    /// How the reads were aligned, as KEY=VALUE tags (e.g. alt-project=primary; KEY= for a flag
+    /// without a value) and KEY! to remove a detected tag, or none to record nothing (and read no
+    /// header or table for it). They replace the tags of the same name read from the reads'
+    /// header (its @PG records) and evidence tables, each before they must agree, and add the
+    /// rest; without either, the tags set are the reads' whole alignment provenance, compared on
+    /// those tags only (see the user guide: Alignment provenance).
+    #[arg(long, value_name = "KEY=VALUE|KEY!|none", num_args = 1..)]
+    pub(crate) alignment_tags: Vec<String>,
+}
+
+impl AlignmentTagsArgs {
+    /// The tags given (`None` without the option).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tags are malformed (see [`AlignmentTags::parse`]).
+    fn tags(&self) -> Result<Option<AlignmentTags>> {
+        AlignmentTags::parse(&self.alignment_tags)
+    }
+}
+
 /// The options of `winnowr extract`.
 #[derive(Debug, Args)]
 pub(crate) struct ExtractArgs {
@@ -290,6 +322,11 @@ pub(crate) struct ExtractArgs {
     /// features of SNP and indel calls; needed to train or apply models that use them.
     #[arg(long, num_args = 1..)]
     pub(crate) pileup: Vec<PathBuf>,
+
+    /// How the reads were aligned, recorded in the table (and so in models trained on it). Read
+    /// from the --strlen and --pileup tables and the header of --alignments, which must agree.
+    #[command(flatten)]
+    pub(crate) alignment_tags: AlignmentTagsArgs,
 
     /// The depth that the depth feature (dp_norm) divides each call's RAW_MQandDP depth (INFO/DP
     /// with --feature-source vcf, the reads counted with --alignments) by, in place of the median
@@ -377,6 +414,13 @@ pub(crate) struct TrainArgs {
     /// The model file to write (`.winnowr.json` is appended if missing).
     #[arg(long, short = 'o')]
     pub(crate) output: PathBuf,
+
+    /// Train on tables of reads aligned differently (e.g. to make a model of both): the model
+    /// records only the alignment tags the tables share, and score compares it with the reads on
+    /// those tags only. Without it, tables whose recorded alignment provenance differs are an
+    /// error.
+    #[arg(long)]
+    pub(crate) mixed_alignments: bool,
 
     /// genotype trains on PASS calls (drop/keep/flip; needs hap.py labels); promote trains on
     /// non-PASS calls (stay/promote/promote+flip; needs tables extracted with --truth-vcf).
@@ -958,6 +1002,26 @@ pub(crate) struct ScoreArgs {
     /// The indexed, uncompressed reference FASTA, for --alignments (also used to decode CRAM).
     #[arg(long, requires = "alignments")]
     pub(crate) reference: Option<PathBuf>,
+
+    /// How the reads were aligned (read from the header of --alignments and the --strlen and
+    /// --pileup tables, which must agree), compared with how the models' training reads were.
+    #[command(flatten)]
+    pub(crate) provenance: ProvenanceCheckArgs,
+}
+
+/// The options of `score` and `check-models` that check how the reads were aligned against how
+/// the models' training reads were.
+#[derive(Debug, Args)]
+pub(crate) struct ProvenanceCheckArgs {
+    /// How the reads were aligned.
+    #[command(flatten)]
+    pub(crate) alignment_tags: AlignmentTagsArgs,
+
+    /// Fail when the reads were not aligned as the models' training reads were, when the models
+    /// disagree on it, or when the models record it and the reads' is not known; without it,
+    /// these are warnings. Models that record no alignment provenance are not checked.
+    #[arg(long)]
+    pub(crate) strict_provenance: bool,
 }
 
 /// The options of `winnowr check-models`.
@@ -981,6 +1045,17 @@ pub(crate) struct CheckModelsArgs {
     /// checked against its contigs.
     #[arg(long)]
     pub(crate) vcf: Option<PathBuf>,
+
+    /// The BAM or CRAM of the reads to be scored: only its header is read (no reference is
+    /// needed), and how its reads were aligned (its @PG records) is checked against how the
+    /// models' training reads were.
+    #[arg(long)]
+    pub(crate) alignments: Option<PathBuf>,
+
+    /// How the reads to be scored were aligned, compared with how the models' training reads
+    /// were (as in `score`).
+    #[command(flatten)]
+    pub(crate) provenance: ProvenanceCheckArgs,
 
     /// Print the summary as JSON on stdout (schema version 1), with every problem.
     #[arg(long)]
@@ -1027,6 +1102,10 @@ pub(crate) struct StrlenArgs {
     /// are recorded in the table; a model scores only tables measured as its training tables were.
     #[arg(long, default_value_t = StrlenOptions::default())]
     pub(crate) reads: StrlenOptions,
+
+    /// How the reads were aligned, recorded in the table: read from the header of --alignments.
+    #[command(flatten)]
+    pub(crate) alignment_tags: AlignmentTagsArgs,
 }
 
 /// The options of `winnowr pileup`.
@@ -1071,6 +1150,10 @@ pub(crate) struct PileupArgs {
     /// were.
     #[arg(long, default_value_t = PileupOptions::default())]
     pub(crate) settings: PileupOptions,
+
+    /// How the reads were aligned, recorded in the table: read from the header of --alignments.
+    #[command(flatten)]
+    pub(crate) alignment_tags: AlignmentTagsArgs,
 }
 
 /// Checks that the directory an output file of `option` goes in exists, so that a mistyped path
@@ -1093,10 +1176,17 @@ fn check_output_dir(option: &str, path: &Path) -> Result<()> {
 fn pileup(args: &PileupArgs) -> Result<()> {
     check_output_dir("--output", &args.output)?;
     let started = std::time::Instant::now();
-    let inputs =
-        ReadInputs { vcf: &args.vcf, alignments: &args.alignments, reference: &args.reference };
+    let tags = args.alignment_tags.tags()?;
+    let alignment = recorded_alignment(tags.as_ref(), Some(&args.alignments), Vec::new())?;
+    let inputs = ReadInputs {
+        observed_indexes: None,
+        vcf: &args.vcf,
+        alignments: &args.alignments,
+        reference: &args.reference,
+        expected_alignment: alignment_expectation(&alignment, tags.as_ref(), true),
+    };
     let rows = measure_pileup(&inputs, &args.regions, &args.settings)?;
-    let n = write_pileup_table(&args.output, &rows, args.settings)?;
+    let n = write_pileup_table(&args.output, &rows, args.settings, alignment.provenance.as_ref())?;
     let seconds = started.elapsed().as_secs_f64();
     info!(
         "Wrote {n} records counted with {} to {} in {seconds:.1} s",
@@ -1109,12 +1199,19 @@ fn pileup(args: &PileupArgs) -> Result<()> {
 /// Runs `winnowr strlen`.
 fn strlen(args: &StrlenArgs) -> Result<()> {
     let started = std::time::Instant::now();
-    let inputs =
-        ReadInputs { vcf: &args.vcf, alignments: &args.alignments, reference: &args.reference };
     check_output_dir("--output", &args.output)?;
+    let tags = args.alignment_tags.tags()?;
+    let alignment = recorded_alignment(tags.as_ref(), Some(&args.alignments), Vec::new())?;
+    let inputs = ReadInputs {
+        observed_indexes: None,
+        vcf: &args.vcf,
+        alignments: &args.alignments,
+        reference: &args.reference,
+        expected_alignment: alignment_expectation(&alignment, tags.as_ref(), true),
+    };
     let sites = measure_regions(&inputs, &args.regions, &args.reads)?;
     let n_sites = sites.len();
-    let n = write_strlen_table(&args.output, &sites, args.reads)?;
+    let n = write_strlen_table(&args.output, &sites, args.reads, alignment.provenance.as_ref())?;
     info!("Wrote {n} sites measured with {} to {}", args.reads, args.output.display());
     let seconds = started.elapsed().as_secs_f64();
     info!(
@@ -1150,10 +1247,11 @@ fn extract(args: &ExtractArgs) -> Result<()> {
     let regions = read_region_sets(&args.regions)?;
     let summary = VcfSummary::read(&args.vcf)?;
     let sample = args.sample.clone().unwrap_or_else(|| summary.sample_name(&args.vcf));
+    let tags = args.alignment_tags.tags()?;
     let strlen = if args.strlen.is_empty() {
         None
     } else {
-        Some(read_tables::<StrlenOptions>(&args.strlen)?)
+        Some(read_tables_with_tags::<StrlenOptions>(&args.strlen, tags.as_ref())?)
     };
     if let Some(strlen) = &strlen {
         info!("The strlen tables were measured with read settings {}", strlen.options);
@@ -1161,12 +1259,18 @@ fn extract(args: &ExtractArgs) -> Result<()> {
     let pileup = if args.pileup.is_empty() {
         None
     } else {
-        Some(read_tables::<PileupOptions>(&args.pileup)?)
+        Some(read_tables_with_tags::<PileupOptions>(&args.pileup, tags.as_ref())?)
     };
     if let Some(pileup) = &pileup {
         info!("The pileup tables were measured with settings {}", pileup.options);
     }
-    let reads = read_inputs(&args.vcf, args.alignments.as_deref(), args.reference.as_deref());
+    let alignment = extract_alignment(args, strlen.as_ref(), pileup.as_ref())?;
+    let reads = read_inputs(&args.vcf, args.alignments.as_deref(), args.reference.as_deref()).map(
+        |mut inputs| {
+            inputs.expected_alignment = alignment_expectation(&alignment, tags.as_ref(), true);
+            inputs
+        },
+    );
     let checks = TableChecks {
         vcf: &args.vcf,
         contigs: &args.contigs,
@@ -1183,6 +1287,7 @@ fn extract(args: &ExtractArgs) -> Result<()> {
         pileup: pileup.as_ref(),
         truth,
         dp_median: args.dp_median,
+        alignment: alignment.provenance.as_ref(),
     };
     let table = build_feature_table(&sample, &args.vcf, &args.contigs, &summary, &inputs)?;
     let mut timer = PhaseTimer::start();
@@ -1190,6 +1295,87 @@ fn extract(args: &ExtractArgs) -> Result<()> {
     timer.lap("writing the table");
     info!("Wrote {} calls for {sample} to {}", table.num_rows(), args.output.display());
     Ok(())
+}
+
+/// How a sample's reads were aligned (see [`resolve_reads`]): from `tags` (`--alignment-tags`),
+/// the header of `alignments` (when given) and its evidence `tables` (each named, read only when
+/// needed), with the header's warnings logged.
+///
+/// # Errors
+///
+/// Returns an error if the header or a table cannot be read, or the sources record different
+/// provenance.
+fn reads_alignment(
+    tags: Option<&AlignmentTags>,
+    alignments: Option<&Path>,
+    tables: Vec<(String, LazySource<'_>)>,
+) -> Result<ReadsAlignment> {
+    let reads = resolve_reads(tags, alignments, tables)?;
+    if let (Some(path), Some(header)) = (alignments, &reads.header) {
+        let header = header.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+        let warnings = [header.mixed_warning(path), header.unprofiled_warning(path)];
+        for warning in warnings.into_iter().flatten() {
+            log::warn!("{warning}");
+        }
+    }
+    Ok(reads)
+}
+
+/// The alignment provenance a command records (see [`reads_alignment`]), logged.
+///
+/// # Errors
+///
+/// Returns an error if the header or a table cannot be read, or the sources record different
+/// provenance.
+fn recorded_alignment(
+    tags: Option<&AlignmentTags>,
+    alignments: Option<&Path>,
+    tables: Vec<(String, LazySource<'_>)>,
+) -> Result<ReadsAlignment> {
+    let reads = reads_alignment(tags, alignments, tables)?;
+    match &reads.provenance {
+        Some(provenance) => info!("The output records the reads' alignment: {provenance}"),
+        None => info!("The reads' alignment is not known, so the output records none"),
+    }
+    Ok(reads)
+}
+
+/// Binds measurement readers to the raw header checked before feature extraction or scoring.
+fn alignment_expectation<'a>(
+    reads: &'a ReadsAlignment,
+    tags: Option<&'a AlignmentTags>,
+    strict: bool,
+) -> Option<AlignmentExpectation<'a>> {
+    let header = reads.header.as_ref()?.as_ref().ok()?;
+    Some(AlignmentExpectation {
+        provenance: header.provenance.as_ref(),
+        header_records: &header.header_records,
+        tags,
+        strict,
+    })
+}
+
+/// The alignment provenance `extract` records (see [`recorded_alignment`]): from the --strlen and
+/// --pileup tables it read (`strlen`, `pileup`) and the header of --alignments.
+///
+/// # Errors
+///
+/// Returns an error if the tags are malformed, the header cannot be read, or the sources record
+/// different provenance.
+fn extract_alignment(
+    args: &ExtractArgs,
+    strlen: Option<&StrlenTables>,
+    pileup: Option<&PileupTables>,
+) -> Result<ReadsAlignment> {
+    let tags = args.alignment_tags.tags()?;
+    let mut tables: Vec<(String, LazySource<'_>)> = Vec::new();
+    if let Some(strlen) = strlen {
+        tables.push(("the --strlen tables".to_string(), Box::new(|| Ok(strlen.alignment.clone()))));
+    }
+    if let Some(pileup) = pileup {
+        tables.push(("the --pileup tables".to_string(), Box::new(|| Ok(pileup.alignment.clone()))));
+    }
+    recorded_alignment(tags.as_ref(), args.alignments.as_deref(), tables)
 }
 
 /// The reference `extract` matches non-PASS calls to the truth with: --reference, unless it is
@@ -1204,7 +1390,13 @@ fn read_inputs<'a>(
     alignments: Option<&'a Path>,
     reference: Option<&'a Path>,
 ) -> Option<ReadInputs<'a>> {
-    Some(ReadInputs { vcf, alignments: alignments?, reference: reference? })
+    Some(ReadInputs {
+        observed_indexes: None,
+        vcf,
+        alignments: alignments?,
+        reference: reference?,
+        expected_alignment: None,
+    })
 }
 
 /// The inputs of a feature source, with the reads of the alignments source measured.
@@ -1617,6 +1809,22 @@ fn training_params(args: &TrainArgs, threads: NonZeroUsize) -> Result<TrainingPa
     Ok(params)
 }
 
+/// Loads one training input using the same column selection as fitting.
+fn read_training_table(
+    path: &Path,
+    selection: &TableSelection,
+    expected: &FeatureTableInfo,
+) -> Result<FeatureTable> {
+    let table = FeatureTable::read_parquet_selected(path, selection)?;
+    if table.info().alignment != expected.alignment {
+        bail!(
+            "{} has changed alignment provenance since training preflight; read and check the training inputs again",
+            path.display()
+        );
+    }
+    Ok(table)
+}
+
 /// Runs `winnowr train`.
 fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
     let wait = winnowr_xgboost::wait_between_parallel_regions(threads);
@@ -1640,6 +1848,9 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
     check_output_dir("--output", &output)?;
     let TrainingInfos { infos, regions, contigs, reference_contigs, feature_source } =
         read_training_infos(&args.tables)?;
+    let provenances: Vec<(&str, Option<&AlignmentProvenance>)> =
+        infos.iter().map(|info| (info.sample.as_str(), info.alignment.as_ref())).collect();
+    let alignment = training_provenance(&provenances, args.mixed_alignments)?;
     let info_refs: Vec<&FeatureTableInfo> = infos.iter().collect();
     let groups: Vec<Vec<String>> =
         args.sample_groups.iter().map(|g| g.split(',').map(str::to_string).collect()).collect();
@@ -1672,7 +1883,11 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
         columns: Some(table_columns(&features)),
         variant_type: Some(args.variant_type),
     };
-    let read = |path: &PathBuf| FeatureTable::read_parquet_selected(path, &selection);
+    let read = |path: &PathBuf| {
+        let index =
+            args.tables.iter().position(|candidate| candidate == path).expect("training input");
+        read_training_table(path, &selection, &infos[index])
+    };
     let spec = TrainingSpec {
         variant_type: args.variant_type,
         features: &features,
@@ -1685,6 +1900,7 @@ fn train(args: &TrainArgs, threads: NonZeroUsize) -> Result<()> {
         strlen_settings: strlen_options,
         pileup_settings: pileup_options,
         feature_source,
+        alignment,
     };
     let mut timer = PhaseTimer::start();
     let model = if args.task == Task::Promote {
@@ -1975,6 +2191,9 @@ fn check_labelled_table(
     check_table_feature_source(table, info, models, paths)?;
     check_table::<StrlenOptions>(table, info, models, paths)?;
     check_table::<PileupOptions>(table, info, models, paths)?;
+    for warning in table_alignment_warnings(table, info, models, paths) {
+        log::warn!("{warning}");
+    }
     let trained_on: Vec<String> = paths
         .iter()
         .zip(models)
@@ -1989,6 +2208,85 @@ fn check_labelled_table(
         );
     }
     Ok(())
+}
+
+/// The warnings about a labelled feature table whose reads were not aligned as a model's training
+/// reads were (by their recorded provenance), whose alignment is unknown while a model's is
+/// known, or whose settings or a model's are incompletely inferred. Models that record none are
+/// not checked.
+fn table_alignment_warnings(
+    table: &Path,
+    info: &FeatureTableInfo,
+    models: &[WinnowrModel],
+    paths: &[PathBuf],
+) -> Vec<String> {
+    let (paths, known): (Vec<&PathBuf>, Vec<&AlignmentProvenance>) = paths
+        .iter()
+        .zip(models)
+        .filter_map(|(path, model)| Some((path, model.info.alignment.as_ref()?)))
+        .unzip();
+    let mut warnings: Vec<String> = paths
+        .iter()
+        .zip(&known)
+        .filter_map(|(path, model)| {
+            incomplete_options_reason(model).map(|reason| {
+                format!(
+                    "model {} records incomplete alignment settings: {reason}; regenerate its \
+                     training feature tables with extract --alignment-tags options-inference=explicit \
+                     and the intended settings, then retrain from those tables",
+                    path.display()
+                )
+            })
+        })
+        .collect();
+    let Some(extracted) = &info.alignment else {
+        warnings.extend(paths.iter().map(|path| {
+            format!(
+                "model {} records how its training reads were aligned, but feature table {} \
+                 records no alignment provenance, so it is not checked",
+                path.display(),
+                table.display()
+            )
+        }));
+        return warnings;
+    };
+    if !known.is_empty()
+        && let Some(reason) = incomplete_options_reason(extracted)
+    {
+        warnings.push(format!(
+            "feature table {} records incomplete alignment settings: {reason}; extract it again \
+             with intended settings declared with --alignment-tags and options-inference=explicit",
+            table.display()
+        ));
+    }
+    let compared = merge(&known).ok().flatten();
+    let indeterminate: std::collections::BTreeSet<String> = if let Some(merged) = &compared {
+        indeterminate_tags(merged, extracted)
+    } else {
+        known.iter().flat_map(|model| indeterminate_tags(model, extracted)).collect()
+    };
+    if !indeterminate.is_empty() {
+        warnings.push(format!(
+            "feature table {} has indeterminate alignment provenance on {}: both the models and table record mixed, which does not establish agreement",
+            table.display(),
+            indeterminate.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    warnings.extend(compare_with_models(&known, extracted).into_iter().map(
+        |(index, differences)| {
+            let whose = match (index, paths.as_slice()) {
+                (Some(index), _) => format!("model {}'s", paths[index].display()),
+                (None, [path]) => format!("model {}'s", path.display()),
+                (None, _) => "the models'".to_string(),
+            };
+            format!(
+                "feature table {} is of reads not aligned as {whose} training reads were: {}",
+                table.display(),
+                describe_differences(&differences, "model", "table")
+            )
+        },
+    ));
+    warnings
 }
 
 /// Checks that a feature table's features come from the source each model was trained on.
@@ -2269,18 +2567,7 @@ impl InputIndexes {
         match self {
             Self::None => Vec::new(),
             Self::Vcf => crate::vcf::index_candidates(path),
-            Self::Alignments => {
-                use std::io::Read as _;
-                let mut magic = [0; 4];
-                let cram = std::fs::File::open(path).ok().is_some_and(|mut file| {
-                    file.read_exact(&mut magic).is_ok() && &magic == b"CRAM"
-                });
-                if cram {
-                    crate::vcf::index_paths(path, &["crai"])
-                } else {
-                    crate::vcf::local_index_paths(path, &["csi", "bai"])
-                }
-            }
+            Self::Alignments => crate::read_pass::alignment_index_paths(path),
             Self::Reference => crate::vcf::appended_index_paths(path, &["fai", "gzi"]),
         }
     }
@@ -2301,21 +2588,68 @@ fn check_output_not_inputs(
     strlen: &[PathBuf],
     pileup: &[PathBuf],
 ) -> Result<()> {
-    let given = inputs.iter().filter_map(|&(what, path, indexes)| Some((what, path?, indexes)));
     crate::scoring::check_output_not_input(
         output,
-        given.clone().map(|(what, path, _)| (what, path)),
+        inputs.iter().filter_map(|&(what, path, _)| Some((what, path?))),
     )?;
-    for (what, path, kind) in given {
-        let indexes = kind.paths(path);
-        let what = format!("{what} index");
-        if matches!(kind, InputIndexes::Vcf | InputIndexes::Alignments) {
-            crate::scoring::check_output_not_indexes(output, &what, &indexes)?;
+    let resolved = resolve_output_inputs(inputs);
+    check_output_not_resolved_inputs(output, &resolved, regions, strlen, pileup)
+}
+
+/// An input and its index candidates, retained without reopening it during a later alias audit.
+struct ResolvedInput<'a> {
+    what: &'a str,
+    path: &'a Path,
+    kind: InputIndexes,
+    indexes: Vec<PathBuf>,
+    /// When scoring measures reads, the searches validated by those readers supersede preflight.
+    observed_indexes: Option<crate::read_pass::ReadIndexObservation>,
+}
+
+/// Retains the preflight index search; a later measurement supplies its own observed searches.
+fn resolve_output_inputs<'a>(
+    inputs: &[(&'a str, Option<&'a Path>, InputIndexes)],
+) -> Vec<ResolvedInput<'a>> {
+    inputs
+        .iter()
+        .filter_map(|&(what, path, kind)| {
+            let path = path?;
+            Some(ResolvedInput {
+                what,
+                path,
+                kind,
+                indexes: kind.paths(path),
+                observed_indexes: None,
+            })
+        })
+        .collect()
+}
+
+/// Audits current aliases using the retained index candidates, without reading input contents.
+fn check_output_not_resolved_inputs(
+    output: &Path,
+    inputs: &[ResolvedInput<'_>],
+    regions: &[NamedBed],
+    strlen: &[PathBuf],
+    pileup: &[PathBuf],
+) -> Result<()> {
+    crate::scoring::check_output_not_input(
+        output,
+        inputs.iter().map(|input| (input.what, input.path)),
+    )?;
+    for input in inputs {
+        let what = format!("{} index", input.what);
+        if let Some(observed) = &input.observed_indexes {
+            for search in observed.searches() {
+                crate::scoring::check_output_not_indexes(output, &what, &search)?;
+            }
+        } else if matches!(input.kind, InputIndexes::Vcf | InputIndexes::Alignments) {
+            crate::scoring::check_output_not_indexes(output, &what, &input.indexes)?;
         } else {
             // FASTA sidecars are independent inputs, not alternatives in an index search.
             crate::scoring::check_output_not_input(
                 output,
-                indexes.iter().map(|path| (what.as_str(), path.as_path())),
+                input.indexes.iter().map(|path| (what.as_str(), path.as_path())),
             )?;
         }
     }
@@ -2327,8 +2661,76 @@ fn check_output_not_inputs(
     crate::scoring::check_output_not_input(output, beds.chain(tables))
 }
 
+/// Effective provenance observed per regular evidence file during scoring preflight, by the
+/// file's path as given (not its display text, which can be lossy).
+type AlignmentSnapshots = Vec<(PathBuf, Option<AlignmentProvenance>)>;
+
+/// The preflight snapshot of `path`, if it was observed as a regular file.
+fn snapshot_of<'a>(
+    checked: &'a [(PathBuf, Option<AlignmentProvenance>)],
+    path: &Path,
+) -> Option<&'a Option<AlignmentProvenance>> {
+    checked.iter().find(|(checked, _)| checked == path).map(|(_, alignment)| alignment)
+}
+
+/// Enforces observed snapshots exactly. A source without one (a stream) is not compared here:
+/// the final resolution of the evidence actually loaded (with the retained provenance-only
+/// inputs) finds any disagreement, rather than a comparison with stale preflight provenance.
+fn check_loaded_alignment(
+    path: &Path,
+    alignment: Option<&AlignmentProvenance>,
+    checked: &[(PathBuf, Option<AlignmentProvenance>)],
+    strict: bool,
+) -> Result<()> {
+    let Some(expected) = snapshot_of(checked, path) else { return Ok(()) };
+    if alignment != expected.as_ref() {
+        let message = format!(
+            "{} has changed alignment provenance since scoring preflight; the loaded evidence is not the evidence checked against the models",
+            path.display()
+        );
+        if strict {
+            bail!("{message}");
+        }
+        log::warn!("{message}");
+    }
+    Ok(())
+}
+
+/// Whether a required evidence file was skipped by scoring preflight (it was not a regular file
+/// then), so its one row read may still establish the reads' provenance. Decided from the
+/// recorded observation, not the path's current type, which a replacement can change.
+fn required_alignment_pending(
+    required: &[(&[PathBuf], bool)],
+    checked: &[(PathBuf, Option<AlignmentProvenance>)],
+) -> bool {
+    required.iter().any(|&(paths, required)| {
+        required && paths.iter().any(|path| snapshot_of(checked, path).is_none())
+    })
+}
+
+/// Whether `problem` compares the reads' alignment provenance (rather than the models' alone):
+/// scoring reports these, when warnings, from the comparison of the evidence it loaded.
+fn reads_alignment_problem(problem: &Problem) -> bool {
+    match problem.check {
+        Check::AlignmentProvenanceMismatch
+        | Check::AlignmentProvenanceNotChecked
+        | Check::AlignmentProvenanceIndeterminate => true,
+        Check::AlignmentProvenanceIncomplete => problem.model.is_none(),
+        _ => false,
+    }
+}
+
 /// Runs `winnowr score`.
 fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
+    score_with(args, threads, || {})
+}
+
+/// Scores with a callback between consuming the inputs and auditing output aliases.
+fn score_with<F: FnOnce()>(
+    args: &ScoreArgs,
+    threads: NonZeroUsize,
+    before_output_check: F,
+) -> Result<()> {
     check_output_dir("--output", &args.output)?;
     // Checked again (for the VCF) as it is written, but now too, before any pass over the reads.
     // Optional inputs are checked once the models say whether they are read.
@@ -2350,8 +2752,13 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
     }
     // Each model file is read once: its information is checked before its booster is parsed, so
     // a set that cannot be scored never pays for parsing the boosters.
-    let texts: Vec<String> =
-        args.models.iter().map(|path| read_model_file(path)).collect::<Result<_>>()?;
+    let (texts, model_metadata): (Vec<String>, Vec<std::fs::Metadata>) = args
+        .models
+        .iter()
+        .map(|path| read_model_file_with_metadata(path))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .unzip();
     let load_error = |path: &Path| format!("failed to load model {}", path.display());
     let parts: Vec<(ModelInfo, &str)> = args
         .models
@@ -2360,16 +2767,83 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         .map(|(path, text)| ModelInfo::from_model_json(text).with_context(|| load_error(path)))
         .collect::<Result<_>>()?;
     let summary = VcfSummary::read(&args.vcf)?;
+    let infos: Vec<&ModelInfo> = parts.iter().map(|(info, _)| info).collect();
+    // Protect feature inputs before provenance inspection can open the same paths.
+    let needs_strlen = models_using::<StrlenOptions>(&infos, &args.models);
+    let needs_pileup = models_using::<PileupOptions>(&infos, &args.models);
+    let uses_reads =
+        infos.iter().any(|info| matches!(info.feature_source, FeatureSource::VcfAlignments(_)))
+            || !needs_strlen.is_empty()
+            || !needs_pileup.is_empty();
+    let inputs = [
+        ("alignments", args.alignments.as_deref().filter(|_| uses_reads), InputIndexes::Alignments),
+        ("reference", args.reference.as_deref().filter(|_| uses_reads), InputIndexes::Reference),
+    ];
+    for output in &outputs {
+        crate::scoring::check_output_not_input(
+            output,
+            inputs.iter().filter_map(|&(what, path, _)| Some((what, path?))),
+        )?;
+    }
+    let mut protected_reads = resolve_output_inputs(&inputs);
+    for output in &outputs {
+        check_output_not_resolved_inputs(
+            output,
+            &protected_reads,
+            &[],
+            if needs_strlen.is_empty() { &[] } else { &args.strlen },
+            if needs_pileup.is_empty() { &[] } else { &args.pileup },
+        )?;
+    }
+    let observed_indexes = crate::read_pass::ReadIndexObservation::default();
+    for input in &mut protected_reads {
+        if matches!(input.kind, InputIndexes::Alignments) {
+            input.observed_indexes = Some(observed_indexes.clone());
+        }
+    }
+    let checks_provenance = infos.iter().any(|info| info.alignment.is_some());
+    let tags = args.provenance.alignment_tags.tags()?;
+    let evidence_tags = if checks_provenance { tags.as_ref() } else { Some(&AlignmentTags::None) };
+    let (checked_reads, checked_tables) = if checks_provenance {
+        score_reads_alignment(args)?
+    } else {
+        // Required rows still load, but legacy models need no provenance parsing or agreement.
+        (ReadsAlignment::default(), Vec::new())
+    };
+    let pending_alignment = checks_provenance
+        && !matches!(evidence_tags, Some(AlignmentTags::None))
+        && required_alignment_pending(
+            &[
+                (args.strlen.as_slice(), !needs_strlen.is_empty()),
+                (args.pileup.as_slice(), !needs_pileup.is_empty()),
+            ],
+            &checked_tables,
+        );
+    let reads = &checked_reads;
     // Every problem of the model set is reported at once (see `winnowr check-models`). The
     // region BEDs are read later, those a model uses only.
     let set_inputs = SetInputs {
         regions: &args.regions,
         contigs: vec![(format!("VCF {}", args.vcf.display()), &summary.contig_lengths)],
+        reads: ReadsCheck {
+            alignment: reads.provenance.as_ref(),
+            unknown: reads.unknown,
+            strict: args.provenance.strict_provenance,
+        },
         ..SetInputs::default()
     };
     let infos: Vec<&ModelInfo> = parts.iter().map(|(info, _)| info).collect();
-    let problems = check_model_set(&ModelSet { paths: &args.models, infos: &infos }, &set_inputs);
-    for problem in problems.iter().filter(|problem| problem.severity == Severity::Warning) {
+    let mut problems =
+        check_model_set(&ModelSet { paths: &args.models, infos: &infos }, &set_inputs);
+    if pending_alignment {
+        // A required stream can establish provenance in its one row read. Other checks remain early.
+        problems.retain(|problem| problem.check != Check::AlignmentProvenanceNotChecked);
+    }
+    // Warnings about the reads' provenance come from the final comparison, of the evidence
+    // actually loaded, so they and its agreement describe the same reads (errors stay early).
+    for problem in problems.iter().filter(|problem| {
+        problem.severity == Severity::Warning && !reads_alignment_problem(problem)
+    }) {
         log::warn!("{}", problem.message);
     }
     if let Some(message) = error_message(&problems) {
@@ -2392,33 +2866,69 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
     }
     check_unread_gvcf(feature_source, args.gvcf.as_deref(), UnreadGvcf::Warn)?;
     let read_annotations = models_read_annotations(feature_source, args)?;
-    let needs_strlen = models_using::<StrlenOptions>(&infos, &args.models);
-    let needs_pileup = models_using::<PileupOptions>(&infos, &args.models);
-    let uses_reads =
-        read_annotations.is_some() || !needs_strlen.is_empty() || !needs_pileup.is_empty();
-    let inputs = [
-        ("alignments", args.alignments.as_deref().filter(|_| uses_reads), InputIndexes::Alignments),
-        ("reference", args.reference.as_deref().filter(|_| uses_reads), InputIndexes::Reference),
-    ];
-    for output in &outputs {
-        check_output_not_inputs(
-            output,
-            &inputs,
-            &[],
-            if needs_strlen.is_empty() { &[] } else { &args.strlen },
-            if needs_pileup.is_empty() { &[] } else { &args.pileup },
-        )?;
-    }
     check_supplied::<StrlenOptions>(&needs_strlen, &args.strlen, args.alignments.is_some())?;
     check_supplied::<PileupOptions>(&needs_pileup, &args.pileup, args.alignments.is_some())?;
     if !uses_reads && args.alignments.is_some() {
-        log::warn!("no model uses repeat-length or pileup features; --alignments is ignored");
+        log::warn!(
+            "no model uses repeat-length or pileup features; --alignments is ignored for features (it may still be read for alignment provenance)"
+        );
     }
     // The settings the models' evidence must be measured with.
     let strlen_options = models_options::<StrlenOptions>(&infos, &args.models)?;
-    let strlen = read_for_models::<StrlenOptions>(&args.strlen, &models, &args.models)?;
+    let expected_alignment =
+        alignment_expectation(&checked_reads, tags.as_ref(), args.provenance.strict_provenance);
+    let check = |path: &Path, actual: Option<&AlignmentProvenance>| {
+        check_loaded_alignment(path, actual, &checked_tables, args.provenance.strict_provenance)
+    };
+    let strlen = read_for_models::<StrlenOptions>(
+        &args.strlen,
+        &models,
+        &args.models,
+        evidence_tags,
+        check,
+    )?;
     let pileup_options = models_options::<PileupOptions>(&infos, &args.models)?;
-    let pileup = read_for_models::<PileupOptions>(&args.pileup, &models, &args.models)?;
+    let pileup = read_for_models::<PileupOptions>(
+        &args.pileup,
+        &models,
+        &args.models,
+        evidence_tags,
+        check,
+    )?;
+    let scored_reads = if checks_provenance {
+        loaded_score_alignment(
+            args,
+            &checked_reads,
+            &checked_tables,
+            strlen.as_ref(),
+            pileup.as_ref(),
+        )?
+    } else {
+        ReadsAlignment::default()
+    };
+    let alignment_problems = alignment_provenance_problems(
+        &ModelSet { paths: &args.models, infos: &infos },
+        ReadsCheck {
+            alignment: scored_reads.provenance.as_ref(),
+            unknown: scored_reads.unknown,
+            strict: args.provenance.strict_provenance,
+        },
+    );
+    for problem in alignment_problems.iter().filter(|problem| {
+        problem.severity == Severity::Warning
+            && (reads_alignment_problem(problem) || !problems.contains(problem))
+    }) {
+        log::warn!("{}", problem.message);
+    }
+    if let Some(message) = error_message(&alignment_problems) {
+        bail!("{message}");
+    }
+    log_alignment_check(
+        &infos,
+        scored_reads.provenance.as_ref(),
+        &alignment_problems,
+        uses_reads && args.alignments.is_some(),
+    );
     // Evidence measured from the reads while scoring, as the models need it (--alignments
     // conflicts with --strlen and --pileup, so nothing is both read and measured).
     let measure = match (&args.alignments, &args.reference) {
@@ -2436,7 +2946,13 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
                 info!("Counting the pileup evidence with the models' settings {options}");
             }
             (strlen.is_some() || pileup.is_some()).then_some((
-                ReadInputs { vcf: &args.vcf, alignments, reference },
+                ReadInputs {
+                    observed_indexes: Some(observed_indexes.clone()),
+                    vcf: &args.vcf,
+                    alignments,
+                    reference,
+                    expected_alignment,
+                },
                 strlen,
                 pileup,
             ))
@@ -2474,7 +2990,13 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
     // The alignments feature source's annotations are measured before the table is built, as
     // dp_norm needs every call's depth; so is the pileup evidence, in the same pass when it
     // reads alleles alike.
-    let reads = read_inputs(&args.vcf, args.alignments.as_deref(), args.reference.as_deref());
+    let reads = read_inputs(&args.vcf, args.alignments.as_deref(), args.reference.as_deref()).map(
+        |mut inputs| {
+            inputs.expected_alignment = expected_alignment;
+            inputs.observed_indexes = Some(observed_indexes.clone());
+            inputs
+        },
+    );
     let truth = TruthInputs::default();
     let checks = TableChecks {
         vcf: &args.vcf,
@@ -2501,9 +3023,199 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
         }
     };
     timer.lap("scoring");
+    before_output_check();
+    // Recheck the retained provenance inputs just before writing: output symlinks may have changed
+    // since preflight. Skipped streams were never inputs and remain excluded.
+    let output_index = crate::scoring::scored_vcf_index(&args.output);
+    for output in std::iter::once(args.output.as_path()).chain(output_index.as_deref()) {
+        check_output_not_resolved_inputs(
+            output,
+            &protected_reads,
+            &[],
+            if needs_strlen.is_empty() { &[] } else { &args.strlen },
+            if needs_pileup.is_empty() { &[] } else { &args.pileup },
+        )?;
+        let header = args.alignments.as_deref().filter(|_| checked_reads.header.is_some());
+        let consumed = args
+            .models
+            .iter()
+            .map(|path| ("model", path.as_path()))
+            .chain(header.map(|path| ("alignment header", path)))
+            .chain(protected_beds.clone().map(|bed| ("region BED", bed.path.as_path())))
+            .chain(checked_tables.iter().map(|(path, _)| ("provenance table", path.as_path())));
+        crate::scoring::check_output_not_input(output, consumed)?;
+        for metadata in &model_metadata {
+            crate::scoring::check_output_not_loaded_input(output, "model", metadata)?;
+        }
+    }
     write_scored_vcf(&args.vcf, &args.output, decisions, threads)?;
     timer.lap("writing the VCF");
     Ok(())
+}
+
+/// How the reads `score` scores were aligned (see [`reads_alignment`]): from the header of
+/// --alignments and what the --strlen and --pileup tables record (read before the tables are, see
+/// [`crate::evidence::read_alignment`]). Missing-source warnings wait for the final resolution of
+/// loaded rows and retained provenance-only inputs.
+///
+/// # Errors
+///
+/// Returns an error if the tags are malformed, the header or a table cannot be read, or the
+/// sources record different provenance.
+fn score_reads_alignment(args: &ScoreArgs) -> Result<(ReadsAlignment, AlignmentSnapshots)> {
+    score_reads_alignment_with(args, crate::evidence::observe_alignment_with_tags)
+}
+
+/// Scoring preflight with a supplied observer, allowing tests to replace a path after the initial
+/// classification but before the same-handle observation.
+fn score_reads_alignment_with<F>(
+    args: &ScoreArgs,
+    mut observe: F,
+) -> Result<(ReadsAlignment, AlignmentSnapshots)>
+where
+    F: FnMut(&Path, Option<&AlignmentTags>) -> Result<crate::evidence::AlignmentObservation>,
+{
+    let tags = args.provenance.alignment_tags.tags()?;
+    if matches!(tags, Some(AlignmentTags::None)) {
+        return Ok((reads_alignment(tags.as_ref(), None, Vec::new())?, Vec::new()));
+    }
+    // Provenance can consume inputs no model uses for features. Header-only inspection reads
+    // neither alignment indexes nor the reference, and skips non-regular evidence tables.
+    let tables = args
+        .strlen
+        .iter()
+        .map(|path| ("strlen table", path.as_path()))
+        .chain(args.pileup.iter().map(|path| ("pileup table", path.as_path())))
+        .filter(|(_, path)| crate::io::is_regular_file(path));
+    let inputs =
+        args.alignments.as_deref().map(|path| ("alignments", path)).into_iter().chain(tables);
+    let index = crate::scoring::scored_vcf_index(&args.output);
+    for output in std::iter::once(args.output.as_path()).chain(index.as_deref()) {
+        crate::scoring::check_output_not_input(output, inputs.clone())?;
+    }
+    let mut checked = Vec::new();
+    let mut tables: Vec<(String, LazySource<'_>)> = Vec::new();
+    for (option, paths) in [("--strlen", &args.strlen), ("--pileup", &args.pileup)] {
+        let mut sources: Vec<(String, LazySource<'_>)> = Vec::new();
+        for path in paths {
+            let observation = observe(path, tags.as_ref())?;
+            let name = path.display().to_string();
+            let alignment = match observation {
+                crate::evidence::AlignmentObservation::Regular(alignment) => {
+                    // Classification can race publication of a regular file. Protect every input
+                    // actually observed, including provenance-only evidence, before retaining it.
+                    for output in std::iter::once(args.output.as_path()).chain(index.as_deref()) {
+                        crate::scoring::check_output_not_input(output, [(option, path.as_path())])?;
+                    }
+                    checked.push((path.clone(), alignment.clone()));
+                    alignment
+                }
+                crate::evidence::AlignmentObservation::Skipped => continue,
+            };
+            sources.push((name, Box::new(move || Ok(alignment))));
+        }
+        if !sources.is_empty() {
+            // Rows can acquire provenance before loading; missing-source warnings belong to the
+            // final merge, but conflicts between known sources must still fail preflight.
+            let alignment =
+                crate::alignment_provenance::resolve_reads_quiet(None, None, sources)?.provenance;
+            tables.push((format!("the {option} tables"), Box::new(move || Ok(alignment))));
+        }
+    }
+    let reads = if args.alignments.is_some() {
+        // --alignments conflicts with evidence tables: retain the header's warnings and errors.
+        reads_alignment(tags.as_ref(), args.alignments.as_deref(), tables)?
+    } else {
+        crate::alignment_provenance::resolve_reads_quiet(tags.as_ref(), None, tables)?
+    };
+    Ok((reads, checked))
+}
+
+/// Resolves the provenance of the evidence actually loaded, retaining preflight-only sources.
+/// Required tables replace their snapshots, even when a non-strict snapshot check warned. The
+/// alignment header is not reopened: its raw snapshot remains the measurement expectation.
+fn loaded_score_alignment(
+    args: &ScoreArgs,
+    checked_reads: &ReadsAlignment,
+    checked_tables: &[(PathBuf, Option<AlignmentProvenance>)],
+    strlen: Option<&StrlenTables>,
+    pileup: Option<&PileupTables>,
+) -> Result<ReadsAlignment> {
+    // --alignments conflicts with evidence tables; nothing can add a streamed declaration here.
+    if args.alignments.is_some() || (args.strlen.is_empty() && args.pileup.is_empty()) {
+        return Ok(checked_reads.clone());
+    }
+    let tags = args.provenance.alignment_tags.tags()?;
+    let mut tables: Vec<(String, LazySource<'_>)> = Vec::new();
+    for (option, paths, loaded) in [
+        ("--strlen", &args.strlen, strlen.map(|table| &table.alignment)),
+        ("--pileup", &args.pileup, pileup.map(|table| &table.alignment)),
+    ] {
+        if paths.is_empty() {
+            continue;
+        }
+        let alignment = match loaded {
+            Some(alignment) => alignment.clone(),
+            None => {
+                let sources: Vec<(String, LazySource<'_>)> = paths
+                    .iter()
+                    .filter_map(|path| {
+                        let alignment = snapshot_of(checked_tables, path)?.clone();
+                        let name = path.display().to_string();
+                        Some((name, Box::new(move || Ok(alignment)) as LazySource<'_>))
+                    })
+                    .collect();
+                if sources.is_empty() {
+                    continue;
+                }
+                resolve_reads(None, None, sources)?.provenance
+            }
+        };
+        tables.push((format!("the {option} tables"), Box::new(move || Ok(alignment))));
+    }
+    resolve_reads(tags.as_ref(), None, tables)
+}
+
+/// Logs the final alignment check: models without provenance, no comparable tags, or agreement.
+/// An affirmative result requires at least one compared tag and no alignment problem.
+fn log_alignment_check(
+    infos: &[&ModelInfo],
+    reads: Option<&AlignmentProvenance>,
+    problems: &[Problem],
+    preflight_header_only: bool,
+) {
+    let alignment_problems = [
+        Check::AlignmentProvenanceDiffers,
+        Check::AlignmentProvenanceIndeterminate,
+        Check::AlignmentProvenanceMismatch,
+        Check::AlignmentProvenanceNotChecked,
+        Check::AlignmentProvenanceIncomplete,
+    ];
+    if infos.iter().all(|info| info.alignment.is_none()) {
+        info!("The models record no alignment provenance, so the reads' alignment is not checked");
+    } else if let Some(reads) = reads
+        && !problems.iter().any(|problem| alignment_problems.contains(&problem.check))
+    {
+        let known: Vec<&AlignmentProvenance> =
+            infos.iter().filter_map(|info| info.alignment.as_ref()).collect();
+        if let Ok(Some(models)) = merge(&known) {
+            if comparable_tags(&models, reads).is_empty() {
+                info!(
+                    "The models and reads record alignment provenance, but no tags were comparable"
+                );
+            } else {
+                if preflight_header_only {
+                    info!(
+                        "The preflight alignment header's comparable alignment tags match the models' training provenance: {reads}; measurement workers check their opened headers separately (non-strict mismatches warn and scoring continues)"
+                    );
+                } else {
+                    info!(
+                        "The comparable alignment tags match the models' training provenance: {reads}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Runs `winnowr check-models`.
@@ -2512,17 +3224,39 @@ fn score(args: &ScoreArgs, threads: NonZeroUsize) -> Result<()> {
 ///
 /// Returns an error if a problem of the models is an error, or the summary cannot be written.
 fn check_models(args: &CheckModelsArgs) -> Result<()> {
+    check_models_with_writers(args, std::io::stdout().lock(), std::io::stderr().lock())
+}
+
+/// Writes the complete check-models report before returning its failure status.
+fn check_models_with_writers<W: std::io::Write, E: std::io::Write>(
+    args: &CheckModelsArgs,
+    out: W,
+    err: E,
+) -> Result<()> {
     use crate::check_models::{CheckInputs, check_models, write_json, write_text};
-    let report = check_models(&CheckInputs {
+    let tags = args.provenance.alignment_tags.tags();
+    let mut report = check_models(&CheckInputs {
         models: &args.models,
         regions: &args.regions,
         reference: args.reference.as_deref(),
         vcf: args.vcf.as_deref(),
+        alignments: args.alignments.as_deref(),
+        alignment_tags: tags.as_ref().ok().and_then(Option::as_ref),
+        strict_provenance: args.provenance.strict_provenance,
     });
+    if let Err(error) = tags {
+        report.problems.push(Problem::error(
+            Check::InputUnreadable,
+            None,
+            format!("--alignment-tags cannot be read: {error:#}"),
+        ));
+        report.problems.sort_by_key(|problem| problem.check);
+        report.ok = false;
+    }
     if args.json {
-        write_json(&report, std::io::stdout().lock())?;
+        write_json(&report, out)?;
     } else {
-        write_text(&report, std::io::stdout().lock(), std::io::stderr().lock())?;
+        write_text(&report, out, err)?;
     }
     if !report.ok {
         let errors = report.problems.iter().filter(|p| p.severity == Severity::Error).count();
@@ -2619,6 +3353,42 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    mod captured_logs {
+        use std::cell::RefCell;
+        use std::sync::Once;
+
+        thread_local! {
+            static RECORDS: RefCell<Option<Vec<(log::Level, String)>>> = const { RefCell::new(None) };
+        }
+
+        struct Logger;
+        impl log::Log for Logger {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                RECORDS.with(|records| {
+                    if let Some(records) = records.borrow_mut().as_mut() {
+                        records.push((record.level(), record.args().to_string()));
+                    }
+                });
+            }
+            fn flush(&self) {}
+        }
+
+        pub fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<(log::Level, String)>) {
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                log::set_logger(&Logger).unwrap();
+                log::set_max_level(log::LevelFilter::Info);
+            });
+            RECORDS.with(|records| *records.borrow_mut() = Some(Vec::new()));
+            let result = operation();
+            let records = RECORDS.with(|records| records.borrow_mut().take().unwrap());
+            (result, records)
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("winnowr").chain(args.iter().copied()))
@@ -3625,6 +4395,117 @@ mod tests {
         }
 
         #[test]
+        fn final_alignment_audit_does_not_invent_unmeasured_indexes() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let reads = dir.path().join("reads.bam");
+            let index = dir.path().join("reads.bam.bai");
+            std::fs::write(&reads, b"BAM!").unwrap();
+            std::fs::write(&index, b"unused index").unwrap();
+            let mut inputs =
+                resolve_output_inputs(&[("alignments", Some(&reads), InputIndexes::Alignments)]);
+            assert!(check_output_not_resolved_inputs(&index, &inputs, &[], &[], &[]).is_err());
+            inputs[0].observed_indexes = Some(crate::read_pass::ReadIndexObservation::default());
+            check_output_not_resolved_inputs(&index, &inputs, &[], &[], &[]).unwrap();
+        }
+
+        /// Index searches for BAM and CRAM remain separate, even if both indexes exist.
+        #[rstest]
+        #[case::bam_to_cram(false, "reads.data.crai")]
+        #[case::cram_to_bam_csi(true, "reads.data.csi")]
+        #[case::cram_to_bam_bai(true, "reads.data.bai")]
+        fn review_final_alignment_audit_covers_changed_formats(
+            #[case] initially_cram: bool,
+            #[case] index_name: &str,
+        ) {
+            use rust_htslib::bam::{self, Read as _};
+            let dir = tempfile::TempDir::new().unwrap();
+            let reference = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(100))]);
+            let bam = crate::testing::write_bam(dir.path(), "source.bam", 100, &[]);
+            let source = bam::Reader::from_path(&bam).unwrap();
+            let header = bam::Header::from_template(source.header());
+            let cram = dir.path().join("source.cram");
+            let mut writer = bam::Writer::from_path(&cram, &header, bam::Format::Cram).unwrap();
+            writer.set_reference(&reference).unwrap();
+            drop(writer);
+            bam::index::build(&cram, None, bam::index::Type::Bai, 1).unwrap();
+            let reads = dir.path().join("reads.data");
+            std::fs::copy(if initially_cram { &cram } else { &bam }, &reads).unwrap();
+            let mut inputs =
+                resolve_output_inputs(&[("alignments", Some(&reads), InputIndexes::Alignments)]);
+            let observed = crate::read_pass::ReadIndexObservation::default();
+            inputs[0].observed_indexes = Some(observed.clone());
+            std::fs::copy(if initially_cram { &bam } else { &cram }, &reads).unwrap();
+            // Both formats' indexes coexist, but only the measurement reader's search is active.
+            std::fs::copy(bam.with_extension("bam.bai"), dir.path().join("reads.data.bai"))
+                .unwrap();
+            std::fs::copy(cram.with_extension("cram.crai"), dir.path().join("reads.data.crai"))
+                .unwrap();
+            if index_name.ends_with(".csi") {
+                bam::index::build(&reads, None, bam::index::Type::Csi(14), 1).unwrap();
+            }
+            let measuring = ReadInputs {
+                vcf: Path::new("unused.vcf.gz"),
+                alignments: &reads,
+                reference: &reference,
+                expected_alignment: None,
+                observed_indexes: Some(observed),
+            };
+            drop(measuring.open_alignments().unwrap());
+            let index = dir.path().join(index_name);
+            let before = std::fs::read(&index).unwrap();
+            // No data-path reopen is needed after measurement, even if it disappears.
+            std::fs::remove_file(&reads).unwrap();
+            let error = check_output_not_resolved_inputs(&index, &inputs, &[], &[], &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("is the input alignments index"), "{error}");
+            assert_eq!(std::fs::read(&index).unwrap(), before);
+        }
+
+        #[rstest]
+        fn final_alignment_index_audit_covers_both_measurement_paths(
+            #[values(false, true)] background_evidence: bool,
+            #[values(false, true)] sidecar: bool,
+        ) {
+            let setup = AlignmentsModel::new();
+            let model_path = setup.path("reads.winnowr.json");
+            if background_evidence {
+                let mut model = WinnowrModel::load(&model_path, NonZeroUsize::MIN).unwrap();
+                model.info.feature_source = FeatureSource::Vcf;
+                model.save(&model_path).unwrap();
+            }
+            let output = setup.path("scored.vcf.gz");
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                &setup.path("default.vcf.gz"),
+                "--models",
+                &model_path,
+                "--alignments",
+                &setup.path("reads.bam"),
+                "--reference",
+                &setup.path("ref.fa"),
+                "-o",
+                &output,
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let index = setup.path("reads.bam.bai");
+            let before = std::fs::read(&index).unwrap();
+            let error = score_with(&args, NonZeroUsize::MIN, || {
+                let destination = if sidecar { format!("{output}.tbi") } else { output.clone() };
+                std::os::unix::fs::symlink(&index, destination).unwrap();
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("is the input alignments index"), "{error}");
+            assert_eq!(std::fs::read(&index).unwrap(), before);
+        }
+
+        #[test]
         fn new_outputs_cannot_mask_consumed_alignment_indexes() {
             let setup = AlignmentsModel::new();
             let candidate = setup.path("reads.bam.csi");
@@ -3735,8 +4616,9 @@ mod tests {
             let cram = dir.path().join("batch.v1/reads");
             std::fs::create_dir_all(cram.parent().unwrap()).unwrap();
             std::fs::write(&cram, b"CRAM").unwrap();
-            let crai = PathBuf::from(format!("{}.crai", cram.display()));
-            assert!(InputIndexes::Alignments.paths(&cram).iter().all(|path| path == &crai));
+            let inputs =
+                resolve_output_inputs(&[("alignments", Some(&cram), InputIndexes::Alignments)]);
+            assert_eq!(inputs[0].indexes, crate::vcf::local_index_paths(&cram, &["csi", "crai"]));
             assert!(!InputIndexes::Reference.paths(&cram).contains(&dir.path().join("batch.fai")));
             assert!(!InputIndexes::Reference.paths(&cram).contains(&dir.path().join("batch.gzi")));
         }
@@ -3811,6 +4693,141 @@ mod tests {
                 );
                 assert_eq!(std::fs::read(&index).unwrap(), b"preserve the hidden CRAI");
             }
+        }
+
+        #[test]
+        fn unused_cram_indexes_do_not_block_bam_reruns() {
+            let setup = AlignmentsModel::new();
+            let reads = setup.reads();
+            let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+            let bai = setup.path("reads.bam.bai");
+            let before = std::fs::read(&bai).unwrap();
+            for output in ["reads.bam.crai", "reads.crai"] {
+                for _ in 0..2 {
+                    setup.score(output, &reads).unwrap();
+                }
+                let scored = std::fs::read_to_string(setup.path(output)).unwrap();
+                assert_eq!(
+                    scored
+                        .lines()
+                        .filter(|line| !line.starts_with('#') && line.contains("WINNOWR_P="))
+                        .count(),
+                    CALLS
+                );
+            }
+            assert_eq!(std::fs::read(&bai).unwrap(), before);
+        }
+
+        #[rstest]
+        #[case::appended("reads.cram", "reads.cram.csi")]
+        #[case::dotted_parent("batch.v1/reads", "batch.csi")]
+        fn cram_csi_candidates_are_protected(
+            #[case] data: &str,
+            #[case] index: &str,
+            #[values("score", "extract")] command: &str,
+            #[values(false, true)] existing: bool,
+        ) {
+            use rust_htslib::bam::{self, Read as _};
+            let setup = AlignmentsModel::new();
+            let reference = setup.path("ref.fa");
+            let mut source = bam::Reader::from_path(setup.path("reads.bam")).unwrap();
+            let header = bam::Header::from_template(source.header());
+            let cram = setup.dir.path().join(data);
+            std::fs::create_dir_all(cram.parent().unwrap()).unwrap();
+            let mut writer = bam::Writer::from_path(&cram, &header, bam::Format::Cram).unwrap();
+            writer.set_reference(&reference).unwrap();
+            for record in source.records() {
+                writer.write(&record.unwrap()).unwrap();
+            }
+            drop(writer);
+            bam::index::build(&cram, None, bam::index::Type::Bai, 1).unwrap();
+            let index = setup.dir.path().join(index);
+            let crai = PathBuf::from(format!("{}.crai", cram.display()));
+            if existing {
+                std::fs::copy(&crai, &index).unwrap();
+            }
+            // The default loader accepts a CRAI stored under a CSI candidate name.
+            let mut reader = bam::IndexedReader::from_path(&cram).unwrap();
+            reader.set_reference(&reference).unwrap();
+            reader.fetch(("chr1", 0, 10000)).unwrap();
+            assert!(reader.records().next().unwrap().is_ok());
+            drop(reader);
+            let original = std::fs::read(&crai).unwrap();
+            let vcf = setup.path("default.vcf.gz");
+            let model = setup.path("reads.winnowr.json");
+            let mut args = vec![
+                command,
+                "--vcf",
+                &vcf,
+                "--alignments",
+                cram.to_str().unwrap(),
+                "--reference",
+                &reference,
+                "-o",
+                index.to_str().unwrap(),
+            ];
+            if command == "score" {
+                args.extend(["--models", &model]);
+            } else {
+                args.extend(["--contigs", "chr1"]);
+            }
+            let error = format!("{:#}", try_run(&args).unwrap_err());
+            let expected = if existing {
+                "is the input alignments index; write to another path"
+            } else {
+                "would mask the input alignments index; write to another path"
+            };
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(std::fs::read(&crai).unwrap(), original);
+            if existing {
+                assert_eq!(std::fs::read(&index).unwrap(), original);
+                if command == "score" {
+                    let reads = ["--alignments", cram.to_str().unwrap(), "--reference", &reference];
+                    setup.score("csi-indexed.vcf", &reads).unwrap();
+                    // A malformed higher-priority candidate must not fall back to the valid CRAI.
+                    std::fs::write(&index, b"not an index").unwrap();
+                    assert!(bam::IndexedReader::from_path(&cram).is_err());
+                    let error = format!("{:#}", setup.score("bad-index.vcf", &reads).unwrap_err());
+                    assert!(error.contains("it must be indexed"), "{error}");
+                }
+            } else {
+                assert!(!index.exists());
+            }
+        }
+
+        #[test]
+        fn unused_bai_indexes_do_not_block_cram_reruns() {
+            use rust_htslib::bam::{self, Read as _};
+            let setup = AlignmentsModel::new();
+            let reference = setup.path("ref.fa");
+            let mut source = bam::Reader::from_path(setup.path("reads.bam")).unwrap();
+            let header = bam::Header::from_template(source.header());
+            let cram = setup.path("reads.cram");
+            let mut writer = bam::Writer::from_path(&cram, &header, bam::Format::Cram).unwrap();
+            writer.set_reference(&reference).unwrap();
+            for record in source.records() {
+                writer.write(&record.unwrap()).unwrap();
+            }
+            drop(writer);
+            bam::index::build(&cram, None, bam::index::Type::Bai, 1).unwrap();
+            let crai = format!("{cram}.crai");
+            let before = std::fs::read(&crai).unwrap();
+            for output in ["reads.cram.bai", "reads.bai"] {
+                for _ in 0..2 {
+                    setup
+                        .score(output, &["--alignments", &cram, "--reference", &reference])
+                        .unwrap();
+                }
+                let scored = std::fs::read_to_string(setup.path(output)).unwrap();
+                assert_eq!(
+                    scored
+                        .lines()
+                        .filter(|line| !line.starts_with('#') && line.contains("WINNOWR_P="))
+                        .count(),
+                    CALLS
+                );
+            }
+            assert_eq!(std::fs::read(&crai).unwrap(), before);
         }
 
         #[test]
@@ -4071,8 +5088,18 @@ mod tests {
                     bases: is_alt.then_some(alt.as_str()),
                 })
                 .collect();
-            crate::testing::write_bam(dir, "reads.bam", reference.len() as u64, &reads);
+            crate::testing::write_bam_with_header(
+                dir,
+                "reads.bam",
+                reference.len() as u64,
+                &reads,
+                &[ALIGNER_RECORD],
+            );
         }
+
+        /// The `@PG` record of the aligner of [`write_reads`]' reads.
+        const ALIGNER_RECORD: &str = "@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:0.16.0\tCL:bwa-mem3 mem \
+                                      --alt-project primary -t 8 ref.fa reads.fq";
 
         /// `extract --alignments` stops when no read is counted at any call: the reads are not
         /// of the calls, or none passes the alignment settings.
@@ -4117,6 +5144,11 @@ mod tests {
 
         impl AlignmentsModel {
             fn new() -> Self {
+                Self::new_with_tags(&[])
+            }
+
+            /// Supplies verified settings when a test needs known rather than lossy BWA options.
+            fn new_with_tags(tags: &[&str]) -> Self {
                 let setup = Self { dir: tempfile::TempDir::new().unwrap() };
                 write_default_mode_calls(setup.dir.path());
                 write_reads(setup.dir.path(), &default_reads);
@@ -4124,8 +5156,8 @@ mod tests {
                 let base = ["pileup", "--vcf", &vcf, "--regions", "chr1", "-o", &pileup];
                 let reads = setup.reads();
                 let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
-                run(&[&base[..], &reads].concat());
-                let with_pileup = ["--pileup", pileup.as_str()];
+                run(&[&base[..], &reads, tags].concat());
+                let with_pileup = [&["--pileup", pileup.as_str()][..], tags].concat();
                 let tables = [
                     setup.extract("S1", "S1", &with_pileup),
                     setup.extract("S2", "S2", &with_pileup),
@@ -4295,8 +5327,11 @@ mod tests {
         #[test]
         fn a_policy_bed_is_read_before_the_reads() {
             let setup = AlignmentsModel::new();
+            // The reads' header is read (for their alignment provenance) before the BEDs, but a
+            // pass over the reads needs their index, which this copy does not have.
             let (bam, fasta, bed) =
-                (setup.path("missing.bam"), setup.path("ref.fa"), setup.path("missing.bed"));
+                (setup.path("unindexed.bam"), setup.path("ref.fa"), setup.path("missing.bed"));
+            std::fs::copy(setup.path("reads.bam"), &bam).unwrap();
             let regions = format!("{NOT_DIFFICULT_REGIONS}={bed}");
             let options = [
                 "--alignments",
@@ -4311,9 +5346,1672 @@ mod tests {
             let error = setup.score("policy.vcf.gz", &options).unwrap_err();
             let message = format!("{error:#}");
             assert!(
-                message.contains("missing.bed") && !message.contains("missing.bam"),
+                message.contains("missing.bed") && !message.contains("unindexed.bam"),
                 "{message}"
             );
+        }
+
+        #[rstest]
+        #[case::metadata(true)]
+        #[case::rows(false)]
+        fn pr38_overrides_apply_before_evidence_shard_agreement(#[case] metadata: bool) {
+            let setup = AlignmentsModel::new();
+            let evidence = read_tables::<PileupOptions>(&[setup.path("pileup.tsv.gz")]).unwrap();
+            // The shards conflict: one records primary, the other keep-alt.
+            let shard = |name: &str, alt_project: &str| {
+                let path = setup.path(name);
+                let mut alignment = evidence.alignment.clone().unwrap();
+                alignment.0.insert("alt-project".to_string(), alt_project.to_string());
+                crate::evidence::write_table::<PileupOptions>(
+                    Path::new(&path),
+                    evidence.options,
+                    Some(&alignment),
+                    evidence.rows.iter().map(crate::pileup::PileupRow::to_line),
+                )
+                .unwrap();
+                path
+            };
+            let (first, other) = (shard("first.tsv", "primary"), shard("other.tsv", "keep-alt"));
+            assert!(read_tables::<PileupOptions>(&[&first, &other]).is_err());
+            // The effective provenance of the shards with `tags` (none: no overrides).
+            let effective = |tags: Option<&str>| -> Result<Option<AlignmentProvenance>> {
+                let tags: Vec<&str> =
+                    tags.map(|tags| vec!["--alignment-tags", tags]).unwrap_or_default();
+                if metadata {
+                    let base =
+                        ["score", "--vcf", "v", "--models", "m", "-o", "o", "--pileup", &first];
+                    let Command::Score(args) =
+                        parse(&[&base[..], &[other.as_str()], &tags].concat()).unwrap().command
+                    else {
+                        panic!("not score")
+                    };
+                    Ok(score_reads_alignment(&args)?.0.provenance)
+                } else {
+                    let output = setup.path("overridden.parquet");
+                    let (vcf, happy, reads) =
+                        (setup.path("default.vcf.gz"), setup.path("happy.vcf"), setup.reads());
+                    let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+                    let base = ["extract", "--vcf", &vcf, "--happy", &happy, "--contigs", "chr1"];
+                    let rest = ["--sample", "S3", "-o", &output, "--pileup", &first, &other];
+                    try_run(&[&base[..], &rest, &reads, &tags].concat())?;
+                    Ok(FeatureTable::read_info(&output)?.alignment)
+                }
+            };
+            let error = format!("{:#}", effective(None).unwrap_err());
+            assert!(error.contains("aligned differently"), "{error}");
+            let set = effective(Some("alt-project=primary")).unwrap().unwrap();
+            assert_eq!(set.get("alt-project"), Some("primary"));
+            let removed = effective(Some("alt-project!")).unwrap().unwrap();
+            assert_eq!(removed.get("alt-project"), None);
+            assert_eq!(removed.get("aligner"), Some("bwa-mem3"));
+            assert_eq!(effective(Some("none")).unwrap(), None);
+        }
+
+        #[rstest]
+        #[case::known_changes(Some("primary"), Some("keep-alt"), false)]
+        #[case::known_disappears(Some("primary"), None, false)]
+        #[case::unknown_becomes_known(None, Some("primary"), false)]
+        #[case::mixed_training(Some("primary"), Some("keep-alt"), true)]
+        fn pr38_training_rejects_provenance_changed_since_preflight(
+            #[case] before: Option<&str>,
+            #[case] after: Option<&str>,
+            #[case] mixed: bool,
+        ) {
+            let tables = MixedTables::new(&[]);
+            let path = tables.extract("S4", &["chr1", "chr2"]);
+            let mut table = FeatureTable::read_parquet(&path).unwrap();
+            table.info_mut().alignment = before.map(crate::testing::bwa_provenance);
+            table.write_parquet(&path).unwrap();
+            let expected = FeatureTable::read_info(&path).unwrap();
+            let other = if mixed {
+                Some(crate::testing::bwa_provenance("keep-alt"))
+            } else {
+                expected.alignment.clone()
+            };
+            training_provenance(
+                &[("S4", expected.alignment.as_ref()), ("S5", other.as_ref())],
+                mixed,
+            )
+            .unwrap();
+            table.info_mut().alignment = after.map(crate::testing::bwa_provenance);
+            table.write_parquet(&path).unwrap();
+            let error =
+                read_training_table(Path::new(&path), &TableSelection::default(), &expected)
+                    .unwrap_err();
+            assert!(error.to_string().contains("alignment provenance"), "{error:#}");
+        }
+
+        #[rstest]
+        #[case::known_changes(Some("primary"), Some("keep-alt"), None, true, false)]
+        #[case::known_disappears(Some("primary"), None, None, true, false)]
+        #[case::unknown_becomes_known(None, Some("primary"), None, true, false)]
+        #[case::warns(Some("primary"), Some("keep-alt"), None, false, true)]
+        #[case::overridden(
+            Some("primary"),
+            Some("keep-alt"),
+            Some("alt-project=primary"),
+            true,
+            true
+        )]
+        #[case::removed(Some("primary"), Some("keep-alt"), Some("alt-project!"), true, true)]
+        #[case::disabled(Some("primary"), Some("keep-alt"), Some("none"), true, true)]
+        fn pr38_scoring_checks_each_loaded_evidence_file(
+            #[case] before: Option<&str>,
+            #[case] after: Option<&str>,
+            #[case] tags: Option<&str>,
+            #[case] strict: bool,
+            #[case] accepted: bool,
+        ) {
+            use crate::evidence::{AlignmentObservation, observe_alignment_with_tags, write_table};
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("evidence.tsv");
+            let tags = AlignmentTags::parse(&tags.into_iter().collect::<Vec<_>>()).unwrap();
+            let write = |value: Option<&str>| {
+                write_table::<PileupOptions>(
+                    &path,
+                    PileupOptions::default(),
+                    value.map(crate::testing::bwa_provenance).as_ref(),
+                    std::iter::empty(),
+                )
+                .unwrap();
+            };
+            write(before);
+            // The snapshot as scoring takes it: only of a table observed as a regular file.
+            let checked = match observe_alignment_with_tags(&path, tags.as_ref()).unwrap() {
+                AlignmentObservation::Regular(alignment) => vec![(path.clone(), alignment)],
+                AlignmentObservation::Skipped => Vec::new(),
+            };
+            write(after);
+            let model = crate::testing::separable_model_of(
+                Task::Genotype,
+                VariantType::Snp,
+                "pu_alt_mqhigh",
+            );
+            let result = read_for_models::<PileupOptions>(
+                std::slice::from_ref(&path),
+                &[model],
+                &[PathBuf::from("model.json")],
+                tags.as_ref(),
+                |path, actual| check_loaded_alignment(path, actual, &checked, strict),
+            );
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+        }
+
+        #[test]
+        fn pr38_a_stream_is_not_compared_with_preflight_provenance() {
+            let checked = vec![(
+                PathBuf::from("regular.tsv"),
+                Some(crate::testing::bwa_provenance("primary")),
+            )];
+            let streamed = crate::testing::bwa_provenance("keep-alt");
+            // The final resolution of the loaded evidence compares the stream instead.
+            check_loaded_alignment(Path::new("evidence.fifo"), Some(&streamed), &checked, true)
+                .unwrap();
+            let error =
+                check_loaded_alignment(Path::new("regular.tsv"), Some(&streamed), &checked, true)
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("changed alignment provenance since scoring preflight"));
+        }
+
+        /// Paths that display alike (a non-UTF-8 byte and a literal replacement character) keep
+        /// their own snapshots.
+        #[cfg(unix)]
+        #[test]
+        fn pr38_snapshots_are_keyed_by_native_path() {
+            use std::os::unix::ffi::OsStrExt as _;
+            let lossy = PathBuf::from(std::ffi::OsStr::from_bytes(b"evidence-\xff.tsv"));
+            let literal = PathBuf::from("evidence-\u{fffd}.tsv");
+            assert_eq!(lossy.display().to_string(), literal.display().to_string());
+            let (primary, keep_alt) = (
+                crate::testing::bwa_provenance("primary"),
+                crate::testing::bwa_provenance("keep-alt"),
+            );
+            let checked = vec![(literal.clone(), Some(primary)), (lossy.clone(), Some(keep_alt))];
+            let keep_alt = checked[1].1.as_ref();
+            check_loaded_alignment(&lossy, keep_alt, &checked, true).unwrap();
+            assert!(check_loaded_alignment(&literal, keep_alt, &checked, true).is_err());
+            // Only the other path was observed, so this one's read may still establish provenance.
+            let lossy = std::slice::from_ref(&lossy);
+            assert!(required_alignment_pending(&[(lossy, true)], &checked[..1]));
+        }
+
+        /// Strict deferral follows what preflight observed: a skipped stream stays pending even if
+        /// its path is now a regular file, and an observed file never becomes pending.
+        #[test]
+        fn pr38_strict_deferral_uses_the_preflight_observation() {
+            let dir = tempfile::tempdir().unwrap();
+            let replaced = dir.path().join("replaced.tsv");
+            std::fs::write(&replaced, "").unwrap();
+            let observed = dir.path().join("observed.tsv");
+            let checked = vec![(observed.clone(), None)];
+            let (replaced, observed) =
+                (std::slice::from_ref(&replaced), std::slice::from_ref(&observed));
+            assert!(required_alignment_pending(&[(replaced, true)], &checked));
+            assert!(!required_alignment_pending(&[(replaced, false)], &checked));
+            assert!(!required_alignment_pending(&[(observed, true)], &checked));
+            assert!(required_alignment_pending(&[(observed, true), (replaced, true)], &checked));
+        }
+
+        /// A real pileup-feature model and VCF for exercising the complete scoring flow.
+        fn scoring_evidence_inputs(dir: &Path, alignment: Option<AlignmentProvenance>) {
+            write_default_mode_calls(dir);
+            let mut model = crate::testing::separable_model_of(
+                Task::Genotype,
+                VariantType::Snp,
+                "pu_alt_mqhigh",
+            );
+            model.info.feature_source = FeatureSource::Vcf;
+            model.info.alignment = alignment;
+            model.save(dir.join("model.winnowr.json")).unwrap();
+        }
+
+        fn scoring_pileup_text(alignment: Option<&AlignmentProvenance>) -> String {
+            let alignment = alignment
+                .map(|alignment| format!("##alignment={}\n", alignment.to_json()))
+                .unwrap_or_default();
+            format!(
+                "{}default\n{alignment}{}\nchr1\t1000\tA\tC\t3\t0\t0\t2\t0\t0\t1\t0\t0\t0\n",
+                crate::pileup::SETTINGS_PREFIX,
+                crate::pileup::PILEUP_COLUMNS.join("\t"),
+            )
+        }
+
+        /// What [`fifo_scoring_child`] runs, in a child process, against a FIFO.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        enum FifoOperation {
+            /// `winnowr` with these arguments.
+            Score(Vec<String>),
+            /// Replace the consumed BAM with an unread FIFO just before the output audit.
+            ReplaceScoredAlignments(Vec<String>),
+        }
+
+        /// Child of [`run_fifo_operation`]: runs the requested operation, writing its error and
+        /// logs as JSON to the response path.
+        #[test]
+        fn fifo_scoring_child() {
+            let Some(request) = std::env::var_os("WINNOWR_FIFO_REQUEST") else { return };
+            let operation: FifoOperation =
+                serde_json::from_str(&request.to_string_lossy()).unwrap();
+            let (result, logs) = captured_logs::capture(|| match operation {
+                FifoOperation::Score(args) => {
+                    try_run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+                }
+                FifoOperation::ReplaceScoredAlignments(args) => {
+                    let Command::Score(args) =
+                        parse(&args.iter().map(String::as_str).collect::<Vec<_>>())
+                            .unwrap()
+                            .command
+                    else {
+                        panic!("not score")
+                    };
+                    score_with(&args, NonZeroUsize::MIN, || {
+                        let path = args.alignments.as_ref().unwrap();
+                        std::fs::remove_file(path).unwrap();
+                        assert!(
+                            std::process::Command::new("mkfifo")
+                                .arg(path)
+                                .status()
+                                .unwrap()
+                                .success()
+                        );
+                    })
+                }
+            });
+            let error = result.err().map(|error| format!("{error:#}"));
+            let logs: Vec<String> = logs.into_iter().map(|(_, message)| message).collect();
+            let response = std::env::var_os("WINNOWR_FIFO_RESPONSE").unwrap();
+            std::fs::write(response, serde_json::to_vec(&(error, logs)).unwrap()).unwrap();
+            crate::testing::child_body_ran();
+        }
+
+        /// Runs `operation` in a child, waiting for it and for the FIFO producers already in
+        /// `processes` under one deadline, so that a FIFO opened but never read, or read but
+        /// never opened, fails the test instead of hanging it. Returns the operation's result
+        /// and log messages.
+        fn run_fifo_operation(
+            operation: FifoOperation,
+            processes: &mut crate::testing::TestProcesses,
+        ) -> (Result<()>, Vec<String>) {
+            let dir = tempfile::tempdir().unwrap();
+            let response = dir.path().join("response.json");
+            let log = dir.path().join("child.log");
+            let envs = [
+                ("WINNOWR_FIFO_REQUEST", serde_json::to_string(&operation).unwrap().into()),
+                ("WINNOWR_FIFO_RESPONSE", response.clone().into_os_string()),
+            ];
+            processes.spawn_test("cli::tests::end_to_end::fifo_scoring_child", envs, &log);
+            processes.wait_for_success(std::time::Duration::from_secs(30));
+            let (error, logs): (Option<String>, Vec<String>) =
+                serde_json::from_slice(&std::fs::read(response).unwrap()).unwrap();
+            (error.map_or(Ok(()), |error| Err(anyhow::anyhow!(error))), logs)
+        }
+
+        /// [`run_fifo_operation`] for `winnowr` with `args`.
+        fn run_fifo_score(
+            args: &[&str],
+            processes: &mut crate::testing::TestProcesses,
+        ) -> (Result<()>, Vec<String>) {
+            let args = args.iter().map(|arg| (*arg).to_string()).collect();
+            run_fifo_operation(FifoOperation::Score(args), processes)
+        }
+
+        /// Makes the FIFO `path` and starts a process (owned by `processes`) that writes `text`
+        /// to it once, exiting successfully only if the whole text is read.
+        fn scoring_fifo_writer(
+            processes: &mut crate::testing::TestProcesses,
+            path: &Path,
+            text: &str,
+        ) {
+            assert!(std::process::Command::new("mkfifo").arg(path).status().unwrap().success());
+            processes.spawn(
+                std::process::Command::new("sh")
+                    .args(["-c", "printf '%s' \"$1\" > \"$2\"", "fifo-writer", text])
+                    .arg(path),
+            );
+        }
+
+        #[rstest]
+        #[case::fifo_only_match(false, Some("primary"), true, None, true)]
+        #[case::fifo_only_mismatch(false, Some("keep-alt"), true, None, false)]
+        #[case::fifo_only_unknown(false, None, true, None, false)]
+        #[case::fifo_only_warns(false, Some("keep-alt"), false, None, true)]
+        #[case::partial_match(true, Some("primary"), true, None, true)]
+        #[case::partial_mismatch(true, Some("keep-alt"), true, None, false)]
+        #[case::partial_unknown(true, None, true, None, true)]
+        #[case::overridden(true, Some("keep-alt"), true, Some("alt-project=primary"), true)]
+        #[case::disabled(false, Some("keep-alt"), false, Some("none"), true)]
+        #[case::mixed(false, Some("mixed"), true, None, false)]
+        #[case::incomplete_strict(false, Some("incomplete"), true, None, false)]
+        #[case::incomplete_warns(false, Some("incomplete"), false, None, true)]
+        fn scoring_checks_required_fifo_against_models(
+            #[case] regular: bool,
+            #[case] actual: Option<&str>,
+            #[case] strict: bool,
+            #[case] tags: Option<&str>,
+            #[case] accepted: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            let expected = crate::testing::bwa_provenance(if actual == Some("mixed") {
+                "mixed"
+            } else {
+                "primary"
+            });
+            scoring_evidence_inputs(dir.path(), Some(expected));
+            let partial = crate::testing::provenance(&[("aligner", "bwa-mem3")], true);
+            let regular_path = path("regular.tsv");
+            std::fs::write(&regular_path, scoring_pileup_text(Some(&partial))).unwrap();
+            let fifo = dir.path().join("evidence.fifo");
+            let actual = actual.map(|value| {
+                if value == "incomplete" {
+                    let mut provenance = crate::testing::bwa_provenance("primary");
+                    provenance.0.insert("options-inference".to_string(), "incomplete".to_string());
+                    provenance
+                } else {
+                    crate::testing::bwa_provenance(value)
+                }
+            });
+            let mut processes = crate::testing::TestProcesses::default();
+            scoring_fifo_writer(&mut processes, &fifo, &scoring_pileup_text(actual.as_ref()));
+            let (vcf, model, output) =
+                (path("default.vcf.gz"), path("model.winnowr.json"), path("scored.vcf.gz"));
+            let fifo = fifo.display().to_string();
+            let mut args =
+                vec!["score", "--vcf", &vcf, "--models", &model, "-o", &output, "--pileup", &fifo];
+            if regular {
+                args.push(&regular_path);
+            }
+            if strict {
+                args.push("--strict-provenance");
+            }
+            if let Some(tags) = tags {
+                args.extend(["--alignment-tags", tags]);
+            }
+            let (result, _) = run_fifo_score(&args, &mut processes);
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+            if let Err(error) = result {
+                let error = format!("{error:#}");
+                assert!(error.contains("alignment") || error.contains("aligned"), "{error}");
+            } else {
+                assert!(read_gzip(Path::new(&output)).contains("WINNOWR_P="));
+            }
+        }
+
+        #[test]
+        fn scoring_loaded_regular_provenance_replaces_its_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            scoring_evidence_inputs(dir.path(), Some(crate::testing::bwa_provenance("keep-alt")));
+            let regular = path("regular.tsv");
+            std::fs::write(
+                &regular,
+                scoring_pileup_text(Some(&crate::testing::bwa_provenance("primary"))),
+            )
+            .unwrap();
+            let replacement =
+                scoring_pileup_text(Some(&crate::testing::bwa_provenance("keep-alt")));
+            let fifo = path("evidence.fifo");
+            assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+            // The group redirection opens the FIFO first: replacing the regular file therefore
+            // cannot happen until scoring has finished preflight and starts its required row read.
+            let mut processes = crate::testing::TestProcesses::default();
+            processes.spawn(std::process::Command::new("sh").args([
+                "-c",
+                "{ printf '%s' \"$1\" > \"$3\"; printf '%s' \"$1\"; } > \"$2\"",
+                "fifo-replacement",
+                &replacement,
+                &fifo,
+                &regular,
+            ]));
+            let (result, logs) = run_fifo_score(
+                &[
+                    "score",
+                    "--vcf",
+                    &path("default.vcf.gz"),
+                    "--models",
+                    &path("model.winnowr.json"),
+                    "-o",
+                    &path("scored.vcf.gz"),
+                    "--pileup",
+                    &fifo,
+                    &regular,
+                ],
+                &mut processes,
+            );
+            result.unwrap();
+            let changed = |name: &str| {
+                logs.iter().any(|message| {
+                    message.contains(name)
+                        && message.contains("changed alignment provenance since scoring preflight")
+                })
+            };
+            // Only the regular file had a preflight snapshot to have changed from.
+            assert!(changed("regular.tsv"), "{logs:?}");
+            assert!(!changed("evidence.fifo"), "{logs:?}");
+            // The stream agrees with the evidence actually loaded: it is not compared with the
+            // replaced table's stale preflight provenance.
+            assert!(
+                !logs.iter().any(|message| message.contains("disagrees with the other reads")),
+                "{logs:?}"
+            );
+            // Without --strict-provenance, the reads are compared with the models once, on the
+            // evidence loaded: no mismatch from the replaced table's preflight snapshot.
+            assert!(
+                !logs.iter().any(|message| message.contains("were not aligned as")),
+                "{logs:?}"
+            );
+            assert!(
+                logs.iter().any(|message| message.contains("comparable alignment tags match")
+                    && message.contains("alt-project=keep-alt")),
+                "{logs:?}"
+            );
+        }
+
+        #[test]
+        fn scoring_required_fifo_retains_unused_regular_provenance() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            scoring_evidence_inputs(dir.path(), Some(crate::testing::bwa_provenance("primary")));
+            std::fs::write(
+                path("unused.strlen"),
+                format!(
+                    "##alignment={}\nunused\n",
+                    crate::testing::bwa_provenance("primary").to_json()
+                ),
+            )
+            .unwrap();
+            let fifo = dir.path().join("evidence.fifo");
+            let mut processes = crate::testing::TestProcesses::default();
+            scoring_fifo_writer(
+                &mut processes,
+                &fifo,
+                &scoring_pileup_text(Some(&crate::testing::bwa_provenance("keep-alt"))),
+            );
+            let (result, _) = run_fifo_score(
+                &[
+                    "score",
+                    "--vcf",
+                    &path("default.vcf.gz"),
+                    "--models",
+                    &path("model.winnowr.json"),
+                    "-o",
+                    &path("scored.vcf.gz"),
+                    "--pileup",
+                    fifo.to_str().unwrap(),
+                    "--strlen",
+                    &path("unused.strlen"),
+                ],
+                &mut processes,
+            );
+            assert!(
+                result.unwrap_err().to_string().contains(
+                    "the --strlen tables and the --pileup tables were aligned differently"
+                )
+            );
+        }
+
+        /// Without a comparison against preflight provenance, a stream that disagrees with an
+        /// unchanged table still fails the resolution of the evidence loaded, strict or not.
+        #[rstest]
+        #[case::strict(true)]
+        #[case::warn(false)]
+        fn pr38_a_disagreeing_stream_fails_the_loaded_evidence_merge(#[case] strict: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            scoring_evidence_inputs(dir.path(), Some(crate::testing::bwa_provenance("primary")));
+            let regular = path("regular.tsv");
+            let primary = crate::testing::bwa_provenance("primary");
+            std::fs::write(&regular, scoring_pileup_text(Some(&primary))).unwrap();
+            let fifo = dir.path().join("evidence.fifo");
+            let mut processes = crate::testing::TestProcesses::default();
+            scoring_fifo_writer(
+                &mut processes,
+                &fifo,
+                &scoring_pileup_text(Some(&crate::testing::bwa_provenance("keep-alt"))),
+            );
+            let (vcf, model, output) =
+                (path("default.vcf.gz"), path("model.winnowr.json"), path("scored.vcf.gz"));
+            let fifo = fifo.display().to_string();
+            let mut args = vec![
+                "score", "--vcf", &vcf, "--models", &model, "-o", &output, "--pileup", &fifo,
+                &regular,
+            ];
+            if strict {
+                args.push("--strict-provenance");
+            }
+            let (result, _) = run_fifo_score(&args, &mut processes);
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("were aligned differently"), "{error}");
+            assert!(error.contains("alt-project"), "{error}");
+        }
+
+        #[test]
+        fn scoring_unused_fifo_is_not_opened() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            scoring_evidence_inputs(dir.path(), Some(crate::testing::bwa_provenance("primary")));
+            std::fs::write(
+                path("required.tsv"),
+                scoring_pileup_text(Some(&crate::testing::bwa_provenance("primary"))),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(path("unused.fifo"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut processes = crate::testing::TestProcesses::default();
+            let (result, logs) = run_fifo_score(
+                &[
+                    "score",
+                    "--vcf",
+                    &path("default.vcf.gz"),
+                    "--models",
+                    &path("model.winnowr.json"),
+                    "-o",
+                    &path("scored.vcf.gz"),
+                    "--pileup",
+                    &path("required.tsv"),
+                    "--strlen",
+                    &path("unused.fifo"),
+                    "--strict-provenance",
+                ],
+                &mut processes,
+            );
+            result.unwrap();
+            assert!(
+                !logs.iter().any(|message| message.contains("record no alignment provenance")),
+                "{logs:?}"
+            );
+            assert!(read_gzip(Path::new(&path("scored.vcf.gz"))).contains("WINNOWR_P="));
+        }
+
+        #[rstest]
+        #[case::conflicting_tags(false, "default", false, false, true)]
+        #[case::malformed_tags(true, "default", false, false, true)]
+        #[case::different_settings(false, "mapq30", false, false, false)]
+        #[case::malformed_settings(true, "invalid", false, false, false)]
+        #[case::malformed_header(true, "default", true, false, false)]
+        #[case::malformed_row(true, "default", false, true, false)]
+        fn scoring_legacy_required_evidence_skips_only_provenance(
+            #[case] malformed_tags: bool,
+            #[case] settings: &str,
+            #[case] bad_header: bool,
+            #[case] bad_row: bool,
+            #[case] accepted: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            scoring_evidence_inputs(dir.path(), None);
+            let first = scoring_pileup_text(Some(&crate::testing::bwa_provenance("primary")));
+            std::fs::write(path("first.tsv"), first).unwrap();
+            let second = scoring_pileup_text(Some(&crate::testing::bwa_provenance("keep-alt")));
+            let mut second = second.replace("settings=default", &format!("settings={settings}"));
+            if malformed_tags {
+                second = second
+                    .lines()
+                    .map(|line| {
+                        if line.starts_with("##alignment=") { "##alignment=invalid" } else { line }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            if bad_header {
+                second = second.replace("chrom\tpos", "wrong\tpos");
+            }
+            if bad_row {
+                second.push_str("\nmalformed-row\n");
+            }
+            std::fs::write(path("second.tsv"), second).unwrap();
+            let result = try_run(&[
+                "score",
+                "--vcf",
+                &path("default.vcf.gz"),
+                "--models",
+                &path("model.winnowr.json"),
+                "-o",
+                &path("scored.vcf.gz"),
+                "--pileup",
+                &path("first.tsv"),
+                &path("second.tsv"),
+                "--strict-provenance",
+            ]);
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+            if let Err(error) = result {
+                assert!(!format!("{error:#}").contains("alignment"), "{error:#}");
+            }
+        }
+
+        #[rstest]
+        #[case::reads_strict(false, true, true, false, false)]
+        #[case::reads_warn(false, true, false, false, true)]
+        #[case::model_strict(true, false, true, false, false)]
+        #[case::both_strict(true, true, true, false, false)]
+        #[case::reads_declared(false, true, true, true, true)]
+        #[case::model_stays_incomplete(true, true, true, true, false)]
+        fn scoring_incomplete_persisted_provenance_is_not_agreement(
+            #[case] model_incomplete: bool,
+            #[case] reads_incomplete: bool,
+            #[case] strict: bool,
+            #[case] declared: bool,
+            #[case] accepted: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            let provenance = |incomplete| {
+                let mut provenance = crate::testing::bwa_provenance("primary");
+                if incomplete {
+                    provenance.0.insert("options-inference".to_string(), "incomplete".to_string());
+                }
+                provenance
+            };
+            scoring_evidence_inputs(dir.path(), Some(provenance(model_incomplete)));
+            std::fs::write(
+                path("required.tsv"),
+                scoring_pileup_text(Some(&provenance(reads_incomplete))),
+            )
+            .unwrap();
+            let (vcf, model, output, evidence) = (
+                path("default.vcf.gz"),
+                path("model.winnowr.json"),
+                path("scored.vcf.gz"),
+                path("required.tsv"),
+            );
+            let mut args = vec![
+                "score",
+                "--vcf",
+                &vcf,
+                "--models",
+                &model,
+                "-o",
+                &output,
+                "--pileup",
+                &evidence,
+                "--alignment-tags",
+                "version=9",
+            ];
+            if declared {
+                args.extend(["options-inference=explicit", "alt-project=primary"]);
+            }
+            if strict {
+                args.push("--strict-provenance");
+            }
+            let (result, logs) = captured_logs::capture(|| try_run(&args));
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("incomplete alignment settings"), "{error:#}");
+            }
+            let affirmative =
+                logs.iter().any(|(_, message)| message.contains("comparable alignment tags match"));
+            assert_eq!(affirmative, declared && !model_incomplete, "{logs:?}");
+            if accepted && !declared {
+                assert!(
+                    logs.iter().any(|(level, message)| *level == log::Level::Warn
+                        && message.contains("incomplete alignment settings")),
+                    "{logs:?}"
+                );
+            }
+        }
+
+        #[rstest]
+        #[case::disjoint(&[("alt-project", "primary")], "aligner=bwa-mem3", false)]
+        #[case::comparable(&[("aligner", "bwa-mem3")], "aligner=bwa-mem3", true)]
+        #[case::metadata_only(&[("version", "1")], "aligner=bwa-mem3", false)]
+        fn scoring_logs_only_actual_comparisons(
+            #[case] model_tags: &[(&str, &str)],
+            #[case] reads_tags: &str,
+            #[case] affirmative: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_default_mode_calls(dir.path());
+            let mut model =
+                crate::testing::separable_model_of(Task::Genotype, VariantType::Snp, "mq");
+            model.info.feature_source = FeatureSource::Vcf;
+            model.info.alignment = Some(crate::testing::provenance(model_tags, true));
+            model.save(path("model.winnowr.json")).unwrap();
+            let (result, logs) = captured_logs::capture(|| {
+                try_run(&[
+                    "score",
+                    "--vcf",
+                    &path("default.vcf.gz"),
+                    "--models",
+                    &path("model.winnowr.json"),
+                    "-o",
+                    &path("scored.vcf.gz"),
+                    "--alignment-tags",
+                    reads_tags,
+                    "--strict-provenance",
+                ])
+            });
+            result.unwrap();
+            assert_eq!(
+                logs.iter().any(|(_, message)| message.contains("comparable alignment tags match")),
+                affirmative,
+                "{logs:?}"
+            );
+            assert_eq!(
+                logs.iter().any(|(_, message)| message.contains("no tags were comparable")),
+                !affirmative,
+                "{logs:?}"
+            );
+        }
+
+        #[rstest]
+        #[case::alignments("--alignments", "alignments")]
+        #[case::pileup("--pileup", "pileup table")]
+        #[case::strlen("--strlen", "strlen table")]
+        fn provenance_only_inputs_are_protected_from_score_outputs(
+            #[case] option: &str,
+            #[case] what: &str,
+            #[values(false, true)] sidecar: bool,
+            #[values(false, true)] tags_none: bool,
+        ) {
+            let setup = VcfSourceModel::new();
+            let model_path = setup.model();
+            let mut model = WinnowrModel::load(&model_path, NonZeroUsize::new(1).unwrap()).unwrap();
+            model.info.alignment = Some(crate::testing::bwa_provenance("primary"));
+            model.save(&model_path).unwrap();
+            let vcf = setup.path("default.vcf.gz");
+            let input = setup.path("provenance-only");
+            let output = setup.path("scored.vcf.gz");
+            let target = format!("{output}{}", if sidecar { ".tbi" } else { "" });
+            let before: &[u8] = if option == "--alignments" {
+                b"@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:10000\n"
+            } else {
+                b"unused\n"
+            };
+            std::fs::write(&input, before).unwrap();
+            std::os::unix::fs::symlink(&input, &target).unwrap();
+            let mut args = vec![
+                "score",
+                "--vcf",
+                &vcf,
+                "--models",
+                &model_path,
+                "-o",
+                &output,
+                option,
+                &input,
+            ];
+            let reference = setup.path("unused.fa");
+            if option == "--alignments" {
+                args.extend(["--reference", &reference]);
+            }
+            if tags_none {
+                args.extend(["--alignment-tags", "none"]);
+                try_run(&args).unwrap();
+                assert!(read_gzip(Path::new(&output)).contains("WINNOWR_P="));
+            } else {
+                let error = format!("{:#}", try_run(&args).unwrap_err());
+                assert!(
+                    error.ends_with(&format!("is the input {what}; write to another path")),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read(&input).unwrap(), before);
+                assert_eq!(std::fs::read(&target).unwrap(), before);
+            }
+        }
+
+        #[test]
+        fn review_measured_reads_log_only_the_preflight_header_result() {
+            let mut model =
+                crate::testing::separable_model_of(Task::Genotype, VariantType::Snp, "mq");
+            model.info.alignment = Some(crate::testing::bwa_provenance("primary"));
+            let (_, logs) = captured_logs::capture(|| {
+                log_alignment_check(&[&model.info], model.info.alignment.as_ref(), &[], true);
+            });
+            assert!(
+                logs.iter().any(|(_, text)| text.contains("preflight alignment header")),
+                "{logs:?}"
+            );
+            assert!(
+                !logs.iter().any(|(_, text)| text.contains("The reads were aligned as")),
+                "{logs:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn review_final_audit_does_not_reopen_consumed_alignments() {
+            let setup = AlignmentsModel::new();
+            let args = vec![
+                "score".to_string(),
+                "--vcf".to_string(),
+                setup.path("default.vcf.gz"),
+                "--models".to_string(),
+                setup.path("reads.winnowr.json"),
+                "-o".to_string(),
+                setup.path("scored.vcf.gz"),
+                "--alignments".to_string(),
+                setup.path("reads.bam"),
+                "--reference".to_string(),
+                setup.path("ref.fa"),
+            ];
+            let mut processes = crate::testing::TestProcesses::default();
+            let (result, _) =
+                run_fifo_operation(FifoOperation::ReplaceScoredAlignments(args), &mut processes);
+            result.unwrap();
+            assert!(read_gzip(Path::new(&setup.path("scored.vcf.gz"))).contains("WINNOWR_P="));
+        }
+
+        #[test]
+        fn review_partial_agreement_logs_only_comparable_tags() {
+            let mut model =
+                crate::testing::separable_model_of(Task::Genotype, VariantType::Snp, "mq");
+            model.info.alignment = Some(crate::testing::provenance(
+                &[("aligner", "bwa-mem3"), ("alt-project", "primary")],
+                true,
+            ));
+            let reads = crate::testing::provenance(&[("aligner", "bwa-mem3")], true);
+            for preflight in [false, true] {
+                let (_, logs) = captured_logs::capture(|| {
+                    log_alignment_check(&[&model.info], Some(&reads), &[], preflight);
+                });
+                assert!(
+                    logs.iter().any(|(_, text)| text.contains("comparable alignment tags match")),
+                    "{logs:?}"
+                );
+                assert!(
+                    !logs
+                        .iter()
+                        .any(|(_, text)| text.contains("aligned as the models' training reads")),
+                    "{logs:?}"
+                );
+            }
+        }
+
+        #[rstest]
+        #[case::required("--pileup", false)]
+        #[case::provenance_only_shards("--strlen", true)]
+        #[case::provenance_only_group("--strlen", false)]
+        fn review_scoring_missing_provenance_warns_once(
+            #[case] option: &str,
+            #[case] known_unused_shard: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            let alignment = crate::testing::bwa_provenance("primary");
+            scoring_evidence_inputs(dir.path(), Some(alignment.clone()));
+            let known = path("known.pileup");
+            let missing = path("missing.tsv");
+            let unused = path("known.strlen");
+            std::fs::write(&known, scoring_pileup_text(Some(&alignment))).unwrap();
+            std::fs::write(&unused, format!("##alignment={}\nunused\n", alignment.to_json()))
+                .unwrap();
+            std::fs::write(
+                &missing,
+                if option == "--pileup" { scoring_pileup_text(None) } else { "unused\n".into() },
+            )
+            .unwrap();
+            let (vcf, model, output) =
+                (path("default.vcf.gz"), path("model.winnowr.json"), path("scored.vcf.gz"));
+            let mut arguments =
+                vec!["score", "--vcf", &vcf, "--models", &model, "-o", &output, "--pileup", &known];
+            if option != "--pileup" {
+                arguments.push(option);
+            }
+            arguments.push(&missing);
+            if known_unused_shard {
+                arguments.push(&unused);
+            }
+            let (result, logs) = captured_logs::capture(|| try_run(&arguments));
+            result.unwrap();
+            let warnings: Vec<_> = logs
+                .iter()
+                .filter(|(_, text)| text.contains("record no alignment provenance"))
+                .collect();
+            assert_eq!(warnings.len(), 1, "{logs:?}");
+            assert!(read_gzip(Path::new(&output)).contains("WINNOWR_P="));
+        }
+
+        #[rstest]
+        #[case::still_missing(false)]
+        #[case::declaration_added(true)]
+        fn review_scoring_required_shard_warns_only_on_loaded_provenance(
+            #[case] gains_declaration: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let known = dir.path().join("known.tsv");
+            let missing = dir.path().join("missing.tsv");
+            let alignment = crate::testing::bwa_provenance("primary");
+            let write = |path: &Path, provenance: Option<&AlignmentProvenance>| {
+                crate::evidence::write_table::<PileupOptions>(
+                    path,
+                    PileupOptions::default(),
+                    provenance,
+                    std::iter::empty(),
+                )
+                .unwrap();
+            };
+            write(&known, Some(&alignment));
+            write(&missing, None);
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                "v",
+                "--models",
+                "m",
+                "-o",
+                "o",
+                "--pileup",
+                known.to_str().unwrap(),
+                missing.to_str().unwrap(),
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let ((reads, checked), preflight) =
+                captured_logs::capture(|| score_reads_alignment(&args).unwrap());
+            if gains_declaration {
+                write(&missing, Some(&alignment));
+            }
+            let (loaded, final_logs) = captured_logs::capture(|| {
+                let pileup = crate::evidence::read_tables_checked::<PileupOptions>(
+                    &args.pileup,
+                    None,
+                    |path, actual| check_loaded_alignment(path, actual, &checked, false),
+                )
+                .unwrap();
+                loaded_score_alignment(&args, &reads, &checked, None, Some(&pileup)).unwrap()
+            });
+            assert_eq!(loaded.provenance, Some(alignment));
+            let missing_warnings = |logs: &[(log::Level, String)]| {
+                logs.iter()
+                    .filter(|(level, text)| {
+                        *level == log::Level::Warn
+                            && text.contains("record no alignment provenance")
+                    })
+                    .count()
+            };
+            assert_eq!(missing_warnings(&preflight), 0, "{preflight:?}");
+            assert_eq!(
+                missing_warnings(&final_logs),
+                usize::from(!gains_declaration),
+                "{final_logs:?}"
+            );
+            if !gains_declaration {
+                assert!(
+                    final_logs.iter().any(|(_, text)| text.contains("missing.tsv")),
+                    "{final_logs:?}"
+                );
+            }
+        }
+
+        #[rstest]
+        #[case::required_gains_declaration(true)]
+        #[case::provenance_only_stays_unknown(false)]
+        fn review_scoring_cross_group_missing_warning_is_final(#[case] required_unknown: bool) {
+            use crate::evidence::AlignmentObservation;
+            let alignment = crate::testing::bwa_provenance("primary");
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                "v",
+                "--models",
+                "m",
+                "-o",
+                "o",
+                "--strlen",
+                "unused.strlen",
+                "--pileup",
+                "required.pileup",
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let ((reads, checked), preflight) = captured_logs::capture(|| {
+                score_reads_alignment_with(&args, |path, _| {
+                    let unknown = (path == Path::new("required.pileup")) == required_unknown;
+                    Ok(AlignmentObservation::Regular((!unknown).then(|| alignment.clone())))
+                })
+                .unwrap()
+            });
+            let pileup = PileupTables {
+                options: PileupOptions::default(),
+                rows: Vec::new(),
+                alignment: Some(alignment.clone()),
+            };
+            let (loaded, final_logs) = captured_logs::capture(|| {
+                loaded_score_alignment(&args, &reads, &checked, None, Some(&pileup)).unwrap()
+            });
+            assert_eq!(loaded.provenance, Some(alignment));
+            let warnings = |logs: &[(log::Level, String)]| {
+                logs.iter()
+                    .filter(|(_, text)| text.contains("record no alignment provenance"))
+                    .count()
+            };
+            assert_eq!(warnings(&preflight), 0, "{preflight:?}");
+            assert_eq!(warnings(&final_logs), usize::from(!required_unknown), "{final_logs:?}");
+        }
+
+        #[rstest]
+        #[case::within_group(false)]
+        #[case::across_groups(true)]
+        fn review_scoring_preflight_keeps_known_conflicts_early(#[case] across_groups: bool) {
+            use crate::evidence::AlignmentObservation;
+            let option = if across_groups { "--strlen" } else { "--pileup" };
+            let mut arguments = vec![
+                "score",
+                "--vcf",
+                "v",
+                "--models",
+                "m",
+                "-o",
+                "o",
+                option,
+                "primary.tsv",
+                "missing.tsv",
+            ];
+            if across_groups {
+                arguments.push("--pileup");
+            }
+            arguments.push("other.tsv");
+            let Command::Score(args) = parse(&arguments).unwrap().command else {
+                panic!("not score")
+            };
+            let (result, logs) = captured_logs::capture(|| {
+                score_reads_alignment_with(&args, |path, _| {
+                    Ok(AlignmentObservation::Regular(match path.to_str().unwrap() {
+                        "missing.tsv" => None,
+                        "primary.tsv" => Some(crate::testing::bwa_provenance("primary")),
+                        _ => Some(crate::testing::bwa_provenance("keep-alt")),
+                    }))
+                })
+            });
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("aligned differently") && error.contains("alt-project"),
+                "{error}"
+            );
+            assert!(
+                !logs.iter().any(|(_, text)| text.contains("record no alignment provenance")),
+                "{logs:?}"
+            );
+        }
+
+        #[rstest]
+        #[case::unread(false)]
+        #[case::read_without_provenance(true)]
+        fn review_preflight_distinguishes_unread_from_missing_provenance(#[case] read: bool) {
+            use crate::evidence::AlignmentObservation;
+            let dir = tempfile::tempdir().unwrap();
+            let fifo = dir.path().join("unread.fifo");
+            let regular = dir.path().join("pileup.tsv");
+            let tags = crate::testing::provenance(&[("alt-project", "primary")], true);
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                "v",
+                "--models",
+                "m",
+                "-o",
+                "o",
+                "--pileup",
+                fifo.to_str().unwrap(),
+                regular.to_str().unwrap(),
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let ((resolved, checked), logs) = captured_logs::capture(|| {
+                score_reads_alignment_with(&args, |path, _| {
+                    Ok(if path == fifo {
+                        if read {
+                            AlignmentObservation::Regular(None)
+                        } else {
+                            AlignmentObservation::Skipped
+                        }
+                    } else {
+                        AlignmentObservation::Regular(Some(tags.clone()))
+                    })
+                })
+                .unwrap()
+            });
+            assert_eq!(checked.len(), if read { 2 } else { 1 });
+            assert_eq!(resolved.provenance, Some(tags));
+            assert!(
+                !logs.iter().any(|(_, text)| text.contains("record no alignment provenance")),
+                "{logs:?}"
+            );
+            // These inputs are retained for provenance only, so their one warning comes from
+            // the final snapshot merge rather than a required row read.
+            let (_, final_logs) = captured_logs::capture(|| {
+                loaded_score_alignment(&args, &resolved, &checked, None, None).unwrap()
+            });
+            let missing = final_logs
+                .iter()
+                .filter(|(_, text)| text.contains("record no alignment provenance"))
+                .count();
+            assert_eq!(missing, usize::from(read), "{final_logs:?}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn review_provenance_alias_is_rechecked_before_writing() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            scoring_evidence_inputs(dir.path(), Some(crate::testing::bwa_provenance("primary")));
+            let retained = path("unused.strlen");
+            let before = format!(
+                "##alignment={}\nunused\n",
+                crate::testing::bwa_provenance("primary").to_json()
+            );
+            std::fs::write(&retained, &before).unwrap();
+            let fifo = path("evidence.fifo");
+            assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+            let output = path("scored.vcf.gz");
+            let text = scoring_pileup_text(Some(&crate::testing::bwa_provenance("primary")));
+            let mut processes = crate::testing::TestProcesses::default();
+            // Opening the FIFO releases this producer only after scoring preflight has finished.
+            processes.spawn(std::process::Command::new("sh").args([
+                "-c",
+                "{ ln -s \"$1\" \"$2\"; printf '%s' \"$3\"; } > \"$4\"",
+                "alias-after-preflight",
+                &retained,
+                &output,
+                &text,
+                &fifo,
+            ]));
+            let (result, _) = run_fifo_score(
+                &[
+                    "score",
+                    "--vcf",
+                    &path("default.vcf.gz"),
+                    "--models",
+                    &path("model.winnowr.json"),
+                    "-o",
+                    &output,
+                    "--strlen",
+                    &retained,
+                    "--pileup",
+                    &fifo,
+                ],
+                &mut processes,
+            );
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("write to another path"), "{error}");
+            assert_eq!(std::fs::read_to_string(retained).unwrap(), before);
+        }
+
+        #[cfg(unix)]
+        #[rstest]
+        #[case::loaded_model(true)]
+        #[case::unrelated(false)]
+        fn review_final_alias_check_retains_loaded_model_identity(
+            #[case] alias_model: bool,
+            #[values(false, true)] sidecar: bool,
+            #[values(false, true)] hard_link: bool,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            write_default_mode_calls(dir.path());
+            let mut model =
+                crate::testing::separable_model_of(Task::Genotype, VariantType::Snp, "mq");
+            model.info.feature_source = FeatureSource::Vcf;
+            let model_path = dir.path().join("model.winnowr.json");
+            model.save(&model_path).unwrap();
+            let original = std::fs::read(&model_path).unwrap();
+            let retained = dir.path().join("loaded-model.json");
+            let unrelated = dir.path().join("unrelated");
+            std::fs::write(&unrelated, b"old output").unwrap();
+            let output = dir.path().join(if sidecar { "scored.vcf.gz" } else { "scored.vcf" });
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                dir.path().join("default.vcf.gz").to_str().unwrap(),
+                "--models",
+                model_path.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let result = score_with(&args, NonZeroUsize::MIN, || {
+                std::fs::rename(&model_path, &retained).unwrap();
+                std::fs::write(&model_path, b"replacement model").unwrap();
+                let destination = if sidecar {
+                    crate::scoring::scored_vcf_index(&output).unwrap()
+                } else {
+                    output.clone()
+                };
+                let target = if alias_model { &retained } else { &unrelated };
+                if hard_link {
+                    std::fs::hard_link(target, destination).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(target, destination).unwrap();
+                }
+            });
+            if alias_model {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("is the input model; write to another path"), "{error}");
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(std::fs::read(&retained).unwrap(), original);
+            assert_eq!(std::fs::read(&model_path).unwrap(), b"replacement model");
+        }
+
+        #[cfg(unix)]
+        #[rstest]
+        #[case::model(true)]
+        #[case::header(false)]
+        fn review_final_alias_check_protects_models_and_headers(#[case] overwrite_model: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            write_default_mode_calls(dir.path());
+            let mut model =
+                crate::testing::separable_model_of(Task::Genotype, VariantType::Snp, "mq");
+            model.info.feature_source = FeatureSource::Vcf;
+            model.info.region_names = vec!["gate".to_string()];
+            model.info.alignment = Some(crate::testing::provenance(&[("aligner", "mapper")], true));
+            let model_path = path("model.winnowr.json");
+            model.save(&model_path).unwrap();
+            let sam = path("reads.sam");
+            std::fs::write(
+                &sam,
+                "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:10000\n\
+                @PG\tID:m\tPN:mapper\tCL:mapper ref.fa reads.fq\n",
+            )
+            .unwrap();
+            let target = if overwrite_model { &model_path } else { &sam };
+            let before = std::fs::read(target).unwrap();
+            let fifo = path("gate.bed");
+            assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+            let output = path("scored.vcf");
+            let mut processes = crate::testing::TestProcesses::default();
+            processes.spawn(std::process::Command::new("sh").args([
+                "-c",
+                "{ ln -s \"$1\" \"$2\"; printf 'chr1\\t0\\t1000\\n'; } > \"$3\"",
+                "alias-during-regions",
+                target,
+                &output,
+                &fifo,
+            ]));
+            let (result, _) = run_fifo_score(
+                &[
+                    "score",
+                    "--vcf",
+                    &path("default.vcf.gz"),
+                    "--models",
+                    &model_path,
+                    "-o",
+                    &output,
+                    "--alignments",
+                    &sam,
+                    "--reference",
+                    &path("unused.fa"),
+                    "--regions",
+                    &format!("gate={fifo}"),
+                    "--alignment-tags",
+                    "options-inference=explicit",
+                ],
+                &mut processes,
+            );
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("write to another path"), "{error}");
+            assert_eq!(std::fs::read(target).unwrap(), before);
+        }
+
+        #[test]
+        fn review_observed_provenance_inputs_cannot_alias_output() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("scored.vcf.gz");
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                "v",
+                "--models",
+                "m",
+                "-o",
+                output.to_str().unwrap(),
+                "--strlen",
+                output.to_str().unwrap(),
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            // Initially absent, as with a skipped FIFO; published before the observation opens it.
+            let before = b"##alignment={}\nunused\n";
+            let result = score_reads_alignment_with(&args, |path, tags| {
+                std::fs::write(path, before).unwrap();
+                crate::evidence::observe_alignment_with_tags(path, tags)
+            });
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("write to another path"), "{error}");
+            assert_eq!(std::fs::read(output).unwrap(), before);
+        }
+
+        #[test]
+        fn pr38_score_skips_provenance_only_inputs_for_legacy_models() {
+            let tables = MixedTables::new(&[]);
+            let model = tables.train(
+                &[tables.extract("S4", &["chr1", "chr2"]), tables.extract("S5", &["chr1", "chr2"])],
+                "legacy",
+            );
+            assert!(model.info.alignment.is_none());
+            let (vcf, model, output) = (
+                tables.path("calls.vcf.gz"),
+                tables.path("legacy.winnowr.json"),
+                tables.path("legacy.vcf.gz"),
+            );
+            let unused = tables.path("unused.tsv");
+            std::fs::write(&unused, "##alignment=not-json\nunused\n").unwrap();
+            try_run(&[
+                "score",
+                "--vcf",
+                &vcf,
+                "--models",
+                &model,
+                "-o",
+                &output,
+                "--pileup",
+                &unused,
+                "--strict-provenance",
+            ])
+            .unwrap();
+            try_run(&[
+                "score",
+                "--vcf",
+                &vcf,
+                "--models",
+                &model,
+                "-o",
+                &output,
+                "--alignments",
+                "absent-unused.bam",
+                "--reference",
+                "absent-unused.fa",
+                "--strict-provenance",
+            ])
+            .unwrap();
+            // The same unused table is still read when any model records provenance.
+            let mut bearing = WinnowrModel::load(&model, NonZeroUsize::new(1).unwrap()).unwrap();
+            bearing.info.alignment = Some(crate::testing::bwa_provenance("primary"));
+            bearing.save(&model).unwrap();
+            let error = try_run(&[
+                "score", "--vcf", &vcf, "--models", &model, "-o", &output, "--pileup", &unused,
+            ])
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("malformed ##alignment="), "{error:#}");
+        }
+
+        #[rstest]
+        #[case::mixed_warns("mixed", false, true, false)]
+        #[case::mixed_strict_fails("mixed", true, false, false)]
+        #[case::agreement_is_logged("primary", false, false, true)]
+        fn pr38_indeterminate_score_logs(
+            #[case] alignment: &str,
+            #[case] strict: bool,
+            #[case] warns: bool,
+            #[case] affirmative: bool,
+        ) {
+            let tables = MixedTables::new(&[]);
+            let mut model = tables.train(
+                &[tables.extract("S4", &["chr1", "chr2"]), tables.extract("S5", &["chr1", "chr2"])],
+                "logging",
+            );
+            model.info.alignment = Some(crate::testing::bwa_provenance(alignment));
+            let (vcf, model_path, output) = (
+                tables.path("calls.vcf.gz"),
+                tables.path("logging.winnowr.json"),
+                tables.path("logged.vcf.gz"),
+            );
+            model.save(&model_path).unwrap();
+            let tag = format!("alt-project={alignment}");
+            let mut args = vec![
+                "score",
+                "--vcf",
+                &vcf,
+                "--models",
+                &model_path,
+                "-o",
+                &output,
+                "--alignment-tags",
+                "aligner=bwa-mem3",
+                &tag,
+            ];
+            if strict {
+                args.push("--strict-provenance");
+            }
+            let (result, logs) = captured_logs::capture(|| try_run(&args));
+            assert_eq!(result.is_ok(), !strict, "{result:?}");
+            assert_eq!(
+                logs.iter().any(|(level, message)| *level == log::Level::Warn
+                    && message.contains("indeterminate")),
+                warns,
+                "{logs:?}"
+            );
+            assert_eq!(
+                logs.iter().any(|(level, message)| *level == log::Level::Info
+                    && message.contains("comparable alignment tags match")),
+                affirmative,
+                "{logs:?}"
+            );
+        }
+
+        /// The reads' alignment provenance goes from their header through `pileup` and `extract`
+        /// into the model, which `score` compares with the reads it scores: a mismatch warns, and
+        /// fails with --strict-provenance, as do reads whose alignment is not known.
+        #[test]
+        fn the_alignment_provenance_goes_from_the_reads_to_the_model() {
+            let unresolved = AlignmentsModel::new();
+            let model = ModelInfo::read(unresolved.path("reads.winnowr.json")).unwrap();
+            let incomplete = model.alignment.as_ref().unwrap();
+            assert!(incomplete_options_reason(incomplete).is_some());
+            assert_eq!(
+                FeatureTable::read_info(unresolved.path("S1.parquet")).unwrap().alignment.as_ref(),
+                Some(incomplete)
+            );
+            assert_eq!(
+                crate::evidence::read_alignment(&[unresolved.path("pileup.tsv.gz")])
+                    .unwrap()
+                    .as_ref(),
+                Some(incomplete)
+            );
+            let raw_reads = unresolved.reads();
+            let raw_reads: Vec<&str> = raw_reads.iter().map(String::as_str).collect();
+            let error = unresolved
+                .score("unresolved.vcf.gz", &[&raw_reads[..], &["--strict-provenance"]].concat())
+                .unwrap_err();
+            assert!(error.to_string().contains("incomplete alignment settings"), "{error:#}");
+
+            let declared = [
+                "--alignment-tags",
+                "options-inference=explicit",
+                "command=mem",
+                "t=8",
+                "alt-project=primary",
+            ];
+            let setup = AlignmentsModel::new_with_tags(&declared);
+            let expected = [
+                ("aligner", "bwa-mem3"),
+                ("alt-project", "primary"),
+                ("command", "mem"),
+                ("options-inference", "explicit"),
+                ("source", "header"),
+                ("sq-alt", "no"),
+                ("t", "8"),
+                ("version", "0.16.0"),
+            ];
+            let expected = crate::testing::provenance(&expected, false);
+            let pileup = [setup.path("pileup.tsv.gz")];
+            assert_eq!(crate::evidence::read_alignment(&pileup).unwrap().as_ref(), Some(&expected));
+            let table = FeatureTable::read_info(setup.path("S1.parquet")).unwrap();
+            assert_eq!(table.alignment.as_ref(), Some(&expected));
+            let model_path = setup.path("reads.winnowr.json");
+            let model = WinnowrModel::load(&model_path, NonZeroUsize::new(1).unwrap()).unwrap();
+            assert_eq!(model.info.alignment.as_ref(), Some(&expected));
+
+            let reads = setup.reads();
+            let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+            let strict = [&reads[..], &["--strict-provenance"]].concat();
+            setup.score("matching.vcf.gz", &[&strict[..], &declared].concat()).unwrap();
+            let keep_alt = [
+                "--alignment-tags",
+                "options-inference=explicit",
+                "command=mem",
+                "t=8",
+                "alt-project=keep-alt",
+            ];
+            setup.score("warned.vcf.gz", &[&reads[..], &keep_alt].concat()).unwrap();
+            let error =
+                setup.score("failed.vcf.gz", &[&strict[..], &keep_alt].concat()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "the reads were not aligned as the models' training reads were: alt-project: \
+                 models primary, reads keep-alt. Calls may be scored worse (see the user guide: \
+                 Alignment provenance). Pass --alignment-tags if the reads' recorded alignment is \
+                 wrong."
+            );
+            let unknown = ["--alignment-tags", "none"];
+            let error =
+                setup.score("unknown.vcf.gz", &[&strict[..], &unknown].concat()).unwrap_err();
+            assert!(error.to_string().contains("but the reads' alignment is not known"), "{error}");
+
+            // The reads' header and the evidence tables of the same reads must agree.
+            let (vcf, other) = (setup.path("default.vcf.gz"), setup.path("other.tsv.gz"));
+            let base = ["pileup", "--vcf", &vcf, "--regions", "chr1", "-o", &other];
+            run(&[&base[..], &reads, &["--alignment-tags", "aligner=other"]].concat());
+            let table = setup.path("disagree.parquet");
+            let (happy, sample) =
+                (setup.path("happy.vcf"), ["--sample", "S1", "--contigs", "chr1"]);
+            let extract =
+                ["extract", "--vcf", &vcf, "--happy", &happy, "-o", &table, "--pileup", &other];
+            let error = try_run(&[&extract[..], &sample, &reads].concat()).unwrap_err().to_string();
+            let bam = setup.path("reads.bam");
+            assert_eq!(
+                error,
+                format!(
+                    "the --pileup tables and --alignments {bam} were aligned differently: \
+                     aligner: the --pileup tables other, --alignments {bam} bwa-mem3. They \
+                     should be of the same reads: measure the tables again from them, pass \
+                     --alignment-tags to set (KEY=VALUE) or remove (KEY!) the tags they disagree \
+                     on, or pass --alignment-tags none to record nothing"
+                )
+            );
+            // --alignment-tags applies over each source before they must agree.
+            let tagged = [&extract[..], &sample, &reads, &["--alignment-tags", "aligner=bwa-mem3"]];
+            run(&tagged.concat());
+
+            // A model trained with --mixed-alignments on reads aligned two ways records the tags
+            // they share, and scores reads aligned either way, even with --strict-provenance.
+            let s3 = setup.extract(
+                "S3",
+                "S3",
+                &[&["--pileup", pileup[0].as_str()][..], &keep_alt].concat(),
+            );
+            let train =
+                ["train", "--variant-type", "snp", "--max-rounds", "10", "--pileup-features"];
+            let mixed = setup.path("mixed");
+            let tables = [setup.path("S1.parquet"), s3];
+            let error = try_run(
+                &[&train[..], &["-o", &mixed, "--tables", &tables[0], &tables[1]]].concat(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("are of reads aligned differently"), "{error}");
+            run(&[
+                &train[..],
+                &["-o", &mixed, "--mixed-alignments", "--tables", &tables[0], &tables[1]],
+            ]
+            .concat());
+            let model = setup.path("mixed.winnowr.json");
+            let recorded = ModelInfo::read(&model).unwrap().alignment.unwrap();
+            assert!(!recorded.to_string().contains("alt-project"), "{recorded}");
+            let score = |extra: &[&str]| {
+                let out = setup.path("mixed.vcf.gz");
+                let tags = if extra.is_empty() { &declared[..] } else { extra };
+                try_run(
+                    &[
+                        &["score", "--vcf", &vcf, "--models", &model, "-o", &out][..],
+                        &reads,
+                        &["--strict-provenance"],
+                        tags,
+                    ]
+                    .concat(),
+                )
+            };
+            score(&[]).unwrap();
+            score(&keep_alt).unwrap();
+        }
+
+        /// `--alignment-tags` records provenance in tables extracted without reads; `train` fails
+        /// on tables aligned differently unless --mixed-alignments, which records the tags they
+        /// share; `score` compares the tags given with the models'; and a model that records none
+        /// is not checked, even with --strict-provenance.
+        #[test]
+        fn alignment_tags_are_recorded_and_compared() {
+            let tables = MixedTables::new(&[]);
+            let extract = |sample: &str, tags: &[&str]| {
+                let table = tables.path(&format!("{sample}.parquet"));
+                let (vcf, happy) = (tables.path("calls.vcf.gz"), tables.path("happy.vcf"));
+                let base = ["extract", "--vcf", &vcf, "--happy", &happy, "--sample", sample];
+                let rest = ["-o", &table, "--contigs", "chr1", "chr2", "--alignment-tags"];
+                run(&[&base[..], &rest, tags].concat());
+                table
+            };
+            let primary = ["aligner=bwa-mem3", "alt-project=primary"];
+            let keep_alt = ["aligner=bwa-mem3", "alt-project=keep-alt"];
+            let a = extract("S1", &primary);
+            let b = extract("S2", &primary);
+            let c = extract("S3", &keep_alt);
+            let model = tables.train(&[a.clone(), b], "same");
+            let recorded = model.info.alignment.unwrap();
+            assert_eq!(recorded.to_string(), "aligner=bwa-mem3 alt-project=primary source=tags");
+
+            let model_path = tables.path("conflict");
+            let train = ["train", "--variant-type", "snp", "--max-rounds", "10", "-o", &model_path];
+            let error =
+                try_run(&[&train[..], &["--tables", &a, &c]].concat()).unwrap_err().to_string();
+            assert!(
+                error.starts_with(
+                    "the tables of S1 and S3 are of reads aligned differently: alt-project: S1 \
+                     primary, S3 keep-alt"
+                ),
+                "{error}"
+            );
+            run(&[&train[..], &["--mixed-alignments", "--tables", &a, &c]].concat());
+            let mixed = WinnowrModel::load(
+                format!("{model_path}{MODEL_SUFFIX}"),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(mixed.info.alignment.unwrap().to_string(), "aligner=bwa-mem3 source=tags");
+
+            let score = |model: &str, extra: &[&str]| {
+                let (vcf, model) = (tables.path("calls.vcf.gz"), tables.path(model));
+                let out = tables.path("scored.vcf.gz");
+                try_run(
+                    &[&["score", "--vcf", &vcf, "--models", &model, "-o", &out][..], extra]
+                        .concat(),
+                )
+            };
+            let strict = ["--strict-provenance", "--alignment-tags"];
+            score("same.winnowr.json", &[&strict[..], &primary].concat()).unwrap();
+            let error = score("same.winnowr.json", &[&strict[..], &keep_alt].concat()).unwrap_err();
+            assert!(error.to_string().contains("alt-project: models primary, reads keep-alt"));
+            let error = score("same.winnowr.json", &["--strict-provenance"]).unwrap_err();
+            assert!(error.to_string().contains("but the reads' alignment is not known"));
+            score("same.winnowr.json", &[]).unwrap();
+            // A model that records none is not checked.
+            tables.train(
+                &[tables.extract("S4", &["chr1", "chr2"]), tables.extract("S5", &["chr1", "chr2"])],
+                "unknown",
+            );
+            score("unknown.winnowr.json", &["--strict-provenance"]).unwrap();
         }
 
         /// How a model of the alignments source is misused: `score` without the reads, or a table
@@ -4479,9 +7177,11 @@ mod tests {
             ]);
             let options: StrlenOptions = "mapq0,mates".parse().unwrap();
             let inputs = ReadInputs {
+                observed_indexes: None,
                 vcf: Path::new(&vcf),
                 alignments: Path::new(&bam),
                 reference: Path::new(&fasta),
+                expected_alignment: None,
             };
             let measured =
                 |options| sites_to_rows(&measure_regions(&inputs, &["chr1"], options).unwrap());
@@ -4491,7 +7191,7 @@ mod tests {
             assert_ne!(rows, measured(&StrlenOptions::default()));
             assert_eq!(
                 read_tables::<StrlenOptions>(&[&table]).unwrap(),
-                StrlenTables { options, rows }
+                StrlenTables::new(options, rows)
             );
         }
     }
@@ -4603,6 +7303,125 @@ mod tests {
         );
     }
 
+    /// `evaluate` and `stratify` warn about a table whose reads were not aligned as a model's
+    /// training reads were, or whose alignment is not known; a model that records none is not
+    /// checked.
+    #[test]
+    fn tables_aligned_otherwise_than_the_models_warn() {
+        let provenance = crate::testing::bwa_provenance;
+        let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+        let paths = [PathBuf::from("m.winnowr.json")];
+        let mut info = crate::testing::call_table(&[]).info().clone();
+        let table = Path::new("t.parquet");
+        let warnings = |model: &WinnowrModel, info: &FeatureTableInfo| {
+            table_alignment_warnings(table, info, std::slice::from_ref(model), &paths)
+        };
+        assert!(warnings(&model, &info).is_empty());
+        model.info.alignment = Some(provenance("primary"));
+        assert_eq!(
+            warnings(&model, &info),
+            [
+                "model m.winnowr.json records how its training reads were aligned, but feature table \
+              t.parquet records no alignment provenance, so it is not checked"
+            ]
+        );
+        info.alignment = Some(provenance("primary"));
+        assert!(warnings(&model, &info).is_empty());
+        info.alignment = Some(provenance("keep-alt"));
+        assert_eq!(
+            warnings(&model, &info),
+            ["feature table t.parquet is of reads not aligned as model m.winnowr.json's training \
+              reads were: alt-project: model primary, table keep-alt"]
+        );
+    }
+
+    #[rstest]
+    #[case::single(&[&[("aligner", "bwa"), ("alt-project", "mixed")]], &[("aligner", "bwa"), ("alt-project", "mixed")], true)]
+    #[case::merged(&[&[("alt-project", "mixed"), ("source", "tags")], &[("aligner", "bwa"), ("source", "tags")]], &[("aligner", "bwa"), ("alt-project", "mixed")], true)]
+    #[case::conflicting(&[&[("aligner", "bwa"), ("alt-project", "mixed")], &[("aligner", "other"), ("alt-project", "mixed")]], &[("aligner", "bwa"), ("alt-project", "mixed")], true)]
+    #[case::version_ignored(&[&[("aligner", "bwa"), ("version", "mixed")]], &[("aligner", "bwa"), ("version", "mixed")], false)]
+    #[case::source_ignored(&[&[("aligner", "bwa"), ("source", "mixed")]], &[("aligner", "bwa"), ("source", "mixed")], false)]
+    #[case::subset(&[&[("aligner", "bwa"), ("source", "tags")]], &[("aligner", "bwa"), ("alt-project", "mixed")], false)]
+    fn pr38_indeterminate_table_warnings(
+        #[case] model_tags: &[&[(&str, &str); 2]],
+        #[case] table_tags: &[(&str, &str)],
+        #[case] indeterminate: bool,
+    ) {
+        let models: Vec<_> = model_tags
+            .iter()
+            .map(|tags| {
+                let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+                model.info.alignment = Some(tags.iter().copied().collect());
+                model
+            })
+            .collect();
+        let paths: Vec<_> =
+            (0..models.len()).map(|index| PathBuf::from(format!("m{index}.json"))).collect();
+        let info = FeatureTableInfo {
+            alignment: Some(table_tags.iter().copied().collect()),
+            ..FeatureTableInfo::default()
+        };
+        let warnings = table_alignment_warnings(Path::new("t.parquet"), &info, &models, &paths);
+        assert_eq!(
+            warnings.iter().filter(|warning| warning.contains("indeterminate")).count(),
+            usize::from(indeterminate),
+            "{warnings:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::model(true, false, true)]
+    #[case::table(false, true, true)]
+    #[case::both(true, true, true)]
+    #[case::legacy(false, true, false)]
+    fn scoring_table_warnings_include_incomplete_options(
+        #[case] model_incomplete: bool,
+        #[case] table_incomplete: bool,
+        #[case] model_known: bool,
+    ) {
+        let provenance = |incomplete| {
+            let mut provenance = crate::testing::provenance(&[("aligner", "bwa")], false);
+            if incomplete {
+                provenance.0.insert("options-inference".to_string(), "incomplete".to_string());
+            }
+            provenance
+        };
+        let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+        model.info.alignment = model_known.then(|| provenance(model_incomplete));
+        let info = FeatureTableInfo {
+            alignment: Some(provenance(table_incomplete)),
+            ..FeatureTableInfo::default()
+        };
+        let warnings = table_alignment_warnings(
+            Path::new("t.parquet"),
+            &info,
+            &[model],
+            &[PathBuf::from("model.json")],
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("incomplete alignment settings"))
+                .count(),
+            if model_known {
+                usize::from(model_incomplete) + usize::from(table_incomplete)
+            } else {
+                0
+            },
+            "{warnings:?}"
+        );
+        if model_known && model_incomplete {
+            assert!(
+                warnings.iter().any(|warning| {
+                    warning.starts_with("model ")
+                        && warning.contains("extract --alignment-tags options-inference=explicit")
+                        && warning.contains("then retrain")
+                }),
+                "{warnings:?}"
+            );
+        }
+    }
+
     /// `score` takes the models' feature source, and rejects models of different sources.
     #[test]
     fn score_takes_the_feature_source_of_the_models() {
@@ -4648,6 +7467,43 @@ mod tests {
     /// Runs a command line.
     fn run_command(args: &[&str]) -> Result<()> {
         dispatch(&parse(args).unwrap().command, NonZeroUsize::new(1).unwrap())
+    }
+
+    #[rstest]
+    #[case::invalid("badtag", false)]
+    #[case::reserved("winnowr-merged-complete=yes", false)]
+    #[case::valid("alt-project=primary", true)]
+    fn review_check_models_reports_alignment_tag_validation(
+        #[case] tags: &str,
+        #[case] valid: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let model = save_model(dir.path(), "model.winnowr.json", VariantType::Snp, &[], 100_000);
+        let Command::CheckModels(args) =
+            parse(&["check-models", "--models", &model, "--alignment-tags", tags, "--json"])
+                .unwrap()
+                .command
+        else {
+            panic!("not check-models")
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = check_models_with_writers(&args, &mut out, &mut err);
+        let report: serde_json::Value =
+            serde_json::from_slice(&out).expect("a JSON report even for invalid tags");
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+        assert_eq!(report["ok"], valid);
+        assert_eq!(report["models"][0]["readable"], true);
+        let problems = report["problems"].as_array().unwrap();
+        assert_eq!(
+            problems.iter().any(|p| p["check"] == "input_unreadable"
+                && p["message"].as_str().unwrap().contains("--alignment-tags")),
+            !valid,
+            "{report}"
+        );
+        if valid {
+            assert_eq!(report["inputs"]["alignment"]["alt-project"], "primary");
+        }
     }
 
     /// `check-models` succeeds on a good set, and fails on a bad one; `score` reports every

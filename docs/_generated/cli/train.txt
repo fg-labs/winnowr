@@ -22,6 +22,12 @@ Options:
   -o, --output <OUTPUT>
           The model file to write (`.winnowr.json` is appended if missing)
 
+      --mixed-alignments
+          Train on tables of reads aligned differently (e.g. to make a model of both): the model
+          records only the alignment tags the tables share, and score compares it with the reads on
+          those tags only. Without it, tables whose recorded alignment provenance differs are an
+          error
+
       --task <TASK>
           genotype trains on PASS calls (drop/keep/flip; needs hap.py labels); promote trains on
           non-PASS calls (stay/promote/promote+flip; needs tables extracted with --truth-vcf)

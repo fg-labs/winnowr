@@ -9,12 +9,17 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::alignment_provenance::{
+    AlignmentProvenance, AlignmentTags, ProvenanceFrom, ReadsAlignment, UnknownReason,
+    resolve_reads,
+};
 use crate::feature_source::FeatureSource;
 use crate::model::{ModelInfo, ReferenceContigs, UnsupportedFormatVersion};
 use crate::model_evidence::ModelEvidence;
 use crate::model_set::{
-    Check, ModelSet, Problem, SetInputs, Severity, check_model_set, check_region_beds,
-    evidence_settings, lossy_path, merged_reference_contigs, models_feature_source,
+    Check, ModelSet, Problem, ReadsCheck, SetInputs, Severity, check_model_set, check_region_beds,
+    evidence_settings, lossy_path, merged_reference_contigs, models_alignment,
+    models_feature_source,
 };
 use crate::pileup::PileupOptions;
 use crate::policy::{NOT_DIFFICULT_REGIONS, is_indel_genotype};
@@ -37,6 +42,12 @@ pub struct CheckInputs<'a> {
     pub reference: Option<&'a Path>,
     /// The VCF to be scored: its header's contig lengths.
     pub vcf: Option<&'a Path>,
+    /// The BAM or CRAM of the reads to be scored: its header's alignment provenance.
+    pub alignments: Option<&'a Path>,
+    /// `--alignment-tags`: the reads' alignment provenance, or tags over the header's.
+    pub alignment_tags: Option<&'a AlignmentTags>,
+    /// Whether alignment provenance problems are errors.
+    pub strict_provenance: bool,
 }
 
 /// The JSON summary of a model set (schema version [`SCHEMA_VERSION`]).
@@ -107,6 +118,8 @@ pub struct ModelDetails {
     pub needs: Needs,
     /// The versions that trained the model.
     pub trained_with: TrainedWith,
+    /// How its training reads were aligned (`null` if unknown).
+    pub alignment: Option<AlignmentProvenance>,
 }
 
 /// What scoring with models needs besides the VCF.
@@ -189,6 +202,9 @@ pub struct SetSummary {
     pub needs: Needs,
     /// The not-difficult regions of `score`'s default policy.
     pub not_difficult_regions: NotDifficultRegions,
+    /// How the models' training reads were aligned: `null` if a model records none, or two
+    /// record different provenance.
+    pub alignment: Option<AlignmentProvenance>,
 }
 
 /// Whether `score`'s default policy uses the not-difficult regions, and whether they were given.
@@ -213,6 +229,13 @@ pub struct InputsSummary {
     pub vcf: Option<PathBuf>,
     /// `--regions`.
     pub regions: Vec<RegionInput>,
+    /// `--alignments`.
+    #[serde(serialize_with = "lossy_path::option")]
+    pub alignments: Option<PathBuf>,
+    /// The reads' alignment provenance, if known.
+    pub alignment: Option<AlignmentProvenance>,
+    /// Where it came from: `header`, `tags` or `header+tags`.
+    pub alignment_from: Option<&'static str>,
 }
 
 /// A region BED given.
@@ -253,7 +276,8 @@ fn read_models(paths: &[PathBuf]) -> Vec<Result<ModelInfo, Problem>> {
 /// has no not-difficult regions ([`Check::NotDifficultMissing`]).
 #[must_use]
 pub fn check_models(inputs: &CheckInputs<'_>) -> Report {
-    // The models, the reference index and the VCF header are read in parallel.
+    // The models, the reference index and the VCF header are read in parallel (the reads'
+    // header, a few KB, is read after).
     let (read, (reference, vcf)) = rayon::join(
         || read_models(inputs.models),
         || {
@@ -308,10 +332,50 @@ pub fn check_models(inputs: &CheckInputs<'_>) -> Report {
         );
         problems.push(Problem::warning(Check::NotDifficultMissing, None, message));
     }
+    // With --alignment-tags none, the header is not read.
+    let reads = resolve_reads(inputs.alignment_tags, inputs.alignments, Vec::new()).unwrap_or_else(
+        |error| {
+            let message = format!("{error:#}");
+            problems.push(Problem::error(Check::InputUnreadable, None, message));
+            ReadsAlignment { unknown: UnknownReason::Unreadable, ..ReadsAlignment::default() }
+        },
+    );
+    if let (Some(path), Some(header)) = (inputs.alignments, &reads.header) {
+        match header {
+            Ok(header) => {
+                if let Some(warning) = header.unprofiled_warning(path) {
+                    log::warn!("{warning}");
+                }
+                if let Some(message) = header.mixed_warning(path) {
+                    problems.push(Problem::warning(Check::AlignmentHeaderMixed, None, message));
+                }
+            }
+            Err(error) => {
+                let message = format!("--alignments {} cannot be read: {error}", path.display());
+                problems.push(Problem::error(Check::InputUnreadable, None, message));
+            }
+        }
+    }
+    let ReadsAlignment { provenance: reads_alignment, from: alignment_from, unknown, .. } = reads;
+    for (path, info) in paths.iter().zip(&infos) {
+        if info.alignment.is_none() {
+            let message = format!(
+                "{} records no alignment provenance, so the reads' alignment cannot be checked \
+                 against it",
+                path.display()
+            );
+            problems.push(Problem::warning(Check::AlignmentProvenanceUnknown, Some(path), message));
+        }
+    }
     let set_inputs = SetInputs {
         regions: inputs.regions,
         contigs,
         unreadable_models: infos.len() < inputs.models.len(),
+        reads: ReadsCheck {
+            alignment: reads_alignment.as_ref(),
+            unknown,
+            strict: inputs.strict_provenance,
+        },
     };
     let set = ModelSet { paths: &paths, infos: &infos };
     problems.extend(check_model_set(&set, &set_inputs));
@@ -337,6 +401,9 @@ pub fn check_models(inputs: &CheckInputs<'_>) -> Report {
         inputs: InputsSummary {
             reference: inputs.reference.map(Path::to_path_buf),
             vcf: inputs.vcf.map(Path::to_path_buf),
+            alignments: inputs.alignments.map(Path::to_path_buf),
+            alignment: reads_alignment.clone(),
+            alignment_from: alignment_from.map(ProvenanceFrom::as_str),
             regions: inputs
                 .regions
                 .iter()
@@ -391,6 +458,7 @@ fn model_details(info: &ModelInfo) -> ModelDetails {
             winnowr: info.winnowr_version.clone(),
             xgboost: info.xgboost_version.clone(),
         },
+        alignment: info.alignment.clone(),
     }
 }
 
@@ -415,6 +483,11 @@ fn set_summary(set: &ModelSet<'_>, not_difficult: NotDifficultRegions) -> SetSum
         pileup_settings: settings::<PileupOptions>(set),
         needs: infos.iter().fold(Needs::default(), |needs, info| needs.or(Needs::of(info))),
         not_difficult_regions: not_difficult,
+        alignment: infos
+            .iter()
+            .all(|info| info.alignment.is_some())
+            .then(|| models_alignment(infos))
+            .flatten(),
     }
 }
 
@@ -477,20 +550,38 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::alignment_provenance::MIXED;
     use crate::common::{Task, VariantType};
+    use crate::testing::bwa_provenance as provenance;
 
-    /// Saves a genotype model of `variant_type` on chr1 (of 1000 bp) as `name`.
+    /// `--alignment-tags` matching the test models' provenance, so that the tests of other
+    /// checks see no alignment provenance problem.
+    static MATCHING_TAGS: std::sync::LazyLock<AlignmentTags> = std::sync::LazyLock::new(|| {
+        AlignmentTags::parse(&["aligner=bwa-mem3", "alt-project=primary"]).unwrap().unwrap()
+    });
+
+    /// Saves a genotype model of `variant_type` on chr1 (of 1000 bp), trained on reads aligned
+    /// with `alt-project=primary`, as `name`.
     fn save(dir: &TempDir, name: &str, variant_type: VariantType) -> PathBuf {
         let mut model = crate::testing::separable_model(Task::Genotype, variant_type);
         model.info.reference_contigs =
             Some([("chr1".to_string(), Some(1000))].into_iter().collect());
+        model.info.alignment = Some(provenance("primary"));
         let path = dir.path().join(name);
         model.save(&path).unwrap();
         path
     }
 
     fn inputs<'a>(models: &'a [PathBuf]) -> CheckInputs<'a> {
-        CheckInputs { models, regions: &[], reference: None, vcf: None }
+        CheckInputs {
+            models,
+            regions: &[],
+            reference: None,
+            vcf: None,
+            alignments: None,
+            alignment_tags: Some(&MATCHING_TAGS),
+            strict_provenance: false,
+        }
     }
 
     /// The checks of a report's problems, in order.
@@ -715,6 +806,7 @@ mod tests {
         assert_eq!(
             keys(&json["models"][0]),
             [
+                "alignment",
                 "alignment_settings",
                 "contigs",
                 "feature_source",
@@ -737,6 +829,7 @@ mod tests {
         assert_eq!(
             keys(&json["set"]),
             [
+                "alignment",
                 "alignment_settings",
                 "contigs",
                 "feature_source",
@@ -751,7 +844,13 @@ mod tests {
         assert_eq!(keys(&json["models"][0]["needs"]), ["alignments", "gvcf", "pileup", "strlen"]);
         assert_eq!(keys(&json["models"][0]["trained_with"]), ["winnowr", "xgboost"]);
         assert_eq!(keys(&json["set"]["not_difficult_regions"]), ["given", "name", "used"]);
-        assert_eq!(keys(&json["inputs"]), ["reference", "regions", "vcf"]);
+        assert_eq!(
+            keys(&json["inputs"]),
+            ["alignment", "alignment_from", "alignments", "reference", "regions", "vcf"]
+        );
+        assert_eq!(json["models"][0]["alignment"]["alt-project"], "primary");
+        assert_eq!(json["set"]["alignment"]["alt-project"], "primary");
+        assert_eq!(json["inputs"]["alignment_from"], "tags");
         assert_eq!(keys(&json["problems"][0]), ["check", "message", "model", "severity"]);
     }
 
@@ -803,6 +902,7 @@ mod tests {
         let mut snp = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
         snp.info.reference_contigs = Some(lengths(&[("chr1", Some(1000))]));
         snp.info.region_names = vec!["segdups".to_string()];
+        snp.info.alignment = Some(provenance("primary"));
         let snp_path = dir.path().join("snp.winnowr.json");
         snp.save(&snp_path).unwrap();
         let models = [snp_path.clone(), save(&dir, "indel.winnowr.json", VariantType::Indel)];
@@ -820,6 +920,228 @@ mod tests {
         assert_eq!(not_difficult.name, NOT_DIFFICULT_REGIONS);
         assert!(not_difficult.used && not_difficult.given);
         assert_eq!(report.set.region_names, ["segdups"]);
+    }
+
+    /// The checks of a report's alignment provenance problems, with their severities.
+    fn alignment_problems(report: &Report) -> Vec<(Check, Severity)> {
+        report
+            .problems
+            .iter()
+            .filter(|problem| problem.check.as_str().starts_with("alignment_"))
+            .map(|problem| (problem.check, problem.severity))
+            .collect()
+    }
+
+    /// Models that record no provenance are each a warning; models that record it are checked
+    /// against the reads', or say that they are not.
+    #[test]
+    fn the_alignment_provenance_is_checked() {
+        let dir = TempDir::new().unwrap();
+        let primary = save(&dir, "snp.winnowr.json", VariantType::Snp);
+        let mut unknown = crate::testing::separable_model(Task::Genotype, VariantType::Indel);
+        unknown.info.reference_contigs = Some(lengths(&[("chr1", Some(1000))]));
+        let unknown_path = dir.path().join("indel.winnowr.json");
+        unknown.save(&unknown_path).unwrap();
+        let models = [primary.clone(), unknown_path.clone()];
+        let report = check_models(&inputs(&models));
+        assert_eq!(
+            alignment_problems(&report),
+            [(Check::AlignmentProvenanceUnknown, Severity::Warning)]
+        );
+        assert_eq!(report.problems.last().unwrap().model.as_deref(), Some(unknown_path.as_path()));
+        assert_eq!(report.set.alignment, None);
+
+        // Not checked: a warning, an error when strict.
+        let models = [primary];
+        let unchecked = CheckInputs { alignment_tags: None, ..inputs(&models) };
+        let report = check_models(&unchecked);
+        assert_eq!(
+            alignment_problems(&report),
+            [(Check::AlignmentProvenanceNotChecked, Severity::Warning)]
+        );
+        assert!(report.ok);
+        let report = check_models(&CheckInputs { strict_provenance: true, ..unchecked });
+        assert_eq!(
+            alignment_problems(&report),
+            [(Check::AlignmentProvenanceNotChecked, Severity::Error)]
+        );
+        assert!(!report.ok);
+
+        // A mismatch names the differing tags, also in the JSON.
+        let keep_alt =
+            AlignmentTags::parse(&["aligner=bwa-mem3", "alt-project=keep-alt"]).unwrap().unwrap();
+        let mismatched = CheckInputs { alignment_tags: Some(&keep_alt), ..inputs(&models) };
+        let report = check_models(&mismatched);
+        assert_eq!(
+            alignment_problems(&report),
+            [(Check::AlignmentProvenanceMismatch, Severity::Warning)]
+        );
+        let problem =
+            report.problems.iter().find(|p| p.check == Check::AlignmentProvenanceMismatch).unwrap();
+        assert!(
+            problem.message.starts_with(
+                "the reads were not aligned as the models' training reads were: alt-project: \
+                 models primary, reads keep-alt."
+            ),
+            "{}",
+            problem.message
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        let mismatch = json["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["check"] == "alignment_provenance_mismatch")
+            .unwrap();
+        assert_eq!(
+            mismatch["differences"],
+            serde_json::json!([{"tag": "alt-project", "models": "primary", "reads": "keep-alt"}])
+        );
+        let report = check_models(&CheckInputs { strict_provenance: true, ..mismatched });
+        assert!(!report.ok);
+    }
+
+    /// Models that record different provenance are a problem of their own, and each is compared
+    /// with the reads.
+    #[test]
+    fn models_aligned_differently_are_a_problem() {
+        let dir = TempDir::new().unwrap();
+        let snp = save(&dir, "snp.winnowr.json", VariantType::Snp);
+        let mut indel = crate::testing::separable_model(Task::Genotype, VariantType::Indel);
+        indel.info.reference_contigs = Some(lengths(&[("chr1", Some(1000))]));
+        indel.info.alignment = Some(provenance("keep-alt"));
+        let indel_path = dir.path().join("indel.winnowr.json");
+        indel.save(&indel_path).unwrap();
+        let models = [snp, indel_path.clone()];
+        let report = check_models(&inputs(&models));
+        assert_eq!(
+            alignment_problems(&report),
+            [
+                (Check::AlignmentProvenanceDiffers, Severity::Warning),
+                (Check::AlignmentProvenanceMismatch, Severity::Warning)
+            ]
+        );
+        let mismatch = &report.problems[report.problems.len() - 1];
+        assert_eq!(mismatch.model.as_deref(), Some(indel_path.as_path()));
+        assert_eq!(report.set.alignment, None);
+    }
+
+    /// The reads' header is read for their provenance (no reference needed); aligner records
+    /// that disagree are a warning.
+    #[test]
+    fn the_reads_header_is_read() {
+        let dir = TempDir::new().unwrap();
+        let models = [save(&dir, "snp.winnowr.json", VariantType::Snp)];
+        let bwa = "@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:0.16.0\tCL:bwa-mem3 mem --alt-project primary ref.fa a.fq";
+        let bam = crate::testing::write_bam_with_header(dir.path(), "a.bam", 1000, &[], &[bwa]);
+        let header =
+            CheckInputs { alignments: Some(&bam), alignment_tags: None, ..inputs(&models) };
+        let report = check_models(&header);
+        assert_eq!(
+            alignment_problems(&report),
+            [
+                (Check::AlignmentProvenanceMismatch, Severity::Warning),
+                (Check::AlignmentProvenanceIncomplete, Severity::Warning),
+            ]
+        );
+        let mismatch = report
+            .problems
+            .iter()
+            .find(|problem| problem.check == Check::AlignmentProvenanceMismatch)
+            .unwrap();
+        assert_eq!(
+            mismatch
+                .differences
+                .iter()
+                .map(|difference| difference.tag.as_str())
+                .collect::<Vec<_>>(),
+            ["sq-alt"]
+        );
+        assert_eq!(report.inputs.alignment_from, Some("header"));
+        let alignment = report.inputs.alignment.as_ref().unwrap();
+        assert_eq!(alignment.0["aligner"], "bwa-mem3");
+        assert_eq!(alignment.0["version"], "0.16.0");
+        assert_eq!(alignment.0["options-inference"], "incomplete");
+        assert!(!alignment.0.contains_key("alt-project"));
+        let strict = check_models(&CheckInputs { strict_provenance: true, ..header });
+        assert_eq!(
+            alignment_problems(&strict),
+            [
+                (Check::AlignmentProvenanceMismatch, Severity::Error),
+                (Check::AlignmentProvenanceIncomplete, Severity::Error),
+            ]
+        );
+        let declared =
+            AlignmentTags::parse(&["options-inference=explicit", "alt-project=primary", "sq-alt!"])
+                .unwrap()
+                .unwrap();
+        let explicit = check_models(&CheckInputs {
+            alignment_tags: Some(&declared),
+            strict_provenance: true,
+            ..header
+        });
+        assert!(alignment_problems(&explicit).is_empty(), "{:?}", explicit.problems);
+
+        // PN provides a reliable difference even though neither command line proves its options.
+        let other = "@PG\tID:bwa-other\tPN:bwa\tCL:bwa mem ref.fa b.fq";
+        let mixed =
+            crate::testing::write_bam_with_header(dir.path(), "m.bam", 1000, &[], &[bwa, other]);
+        let report = check_models(&CheckInputs { alignments: Some(&mixed), ..header });
+        let problems = alignment_problems(&report);
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        for expected in [
+            (Check::AlignmentProvenanceMismatch, Severity::Warning),
+            (Check::AlignmentHeaderMixed, Severity::Warning),
+            (Check::AlignmentProvenanceIncomplete, Severity::Warning),
+        ] {
+            assert!(problems.contains(&expected), "{problems:?}");
+        }
+        assert_eq!(report.inputs.alignment.as_ref().unwrap().0["aligner"], MIXED);
+    }
+
+    /// With --alignment-tags none, the reads' header is not read: an unreadable one is no
+    /// problem.
+    #[test]
+    fn the_header_is_not_read_with_alignment_tags_none() {
+        let dir = TempDir::new().unwrap();
+        let models = [save(&dir, "snp.winnowr.json", VariantType::Snp)];
+        let absent = dir.path().join("absent.bam");
+        let report = check_models(&CheckInputs {
+            alignments: Some(&absent),
+            alignment_tags: None,
+            ..inputs(&models)
+        });
+        assert!(checks(&report).contains(&Check::InputUnreadable), "{:?}", report.problems);
+        // The unreadable header is the problem: the reads' alignment is not also "not checked".
+        assert!(alignment_problems(&report).is_empty(), "{:?}", report.problems);
+        let none = AlignmentTags::None;
+        let report = check_models(&CheckInputs {
+            alignments: Some(&absent),
+            alignment_tags: Some(&none),
+            ..inputs(&models)
+        });
+        assert!(!checks(&report).contains(&Check::InputUnreadable), "{:?}", report.problems);
+        assert_eq!(
+            alignment_problems(&report),
+            [(Check::AlignmentProvenanceNotChecked, Severity::Warning)]
+        );
+        assert_eq!(report.inputs.alignment, None);
+    }
+
+    /// --alignment-tags alone is compared on the tags given only.
+    #[test]
+    fn tags_alone_are_compared_on_the_tags_given() {
+        let dir = TempDir::new().unwrap();
+        let models = [save(&dir, "snp.winnowr.json", VariantType::Snp)];
+        let given = AlignmentTags::parse(&["alt-project=primary"]).unwrap().unwrap();
+        let report = check_models(&CheckInputs { alignment_tags: Some(&given), ..inputs(&models) });
+        assert!(alignment_problems(&report).is_empty(), "{:?}", report.problems);
+        let other = AlignmentTags::parse(&["alt-project=keep-alt"]).unwrap().unwrap();
+        let report = check_models(&CheckInputs { alignment_tags: Some(&other), ..inputs(&models) });
+        assert_eq!(
+            alignment_problems(&report),
+            [(Check::AlignmentProvenanceMismatch, Severity::Warning)]
+        );
     }
 
     /// Paths that are not UTF-8 are written lossily, and the JSON is whole.
