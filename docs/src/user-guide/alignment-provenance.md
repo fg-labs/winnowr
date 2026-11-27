@@ -76,7 +76,7 @@ Batch size affects insert-size estimation. When declaring effective BWA `mem` se
 
 ### Unknown tools
 
-The fallback for tools without a profile remains conservative: the command line is split on whitespace, and only explicit `--name=value` options are retained as hints, including explicit empty values (`--name=`). Bare long options and all short options are omitted entirely: `--mode fast`, `--mode`, `-m fast` and `-mfast` do not record a setting. Their values are unknown, not empty, so they cannot conflict with a later explicit declaration such as `mode=fast`. Separate values are never recovered by consuming the next token, which could be a positional reference/read filename. This loses sensitivity to separate values and short options. The result records `options-inference=incomplete`: these hints are not proof of complete settings. Strict checking requires `options-inference=explicit` with the intended settings. Differing retained values or explicit declarations still conflict.
+The fallback for tools without a profile remains conservative: the command line is split into arguments as the shell splits them (quotes and backslash escapes keep whitespace inside an argument), and only explicit `--name=value` options are retained as hints, including explicit empty values (`--name=`). Bare long options and all short options are omitted entirely: `--mode fast`, `--mode`, `-m fast` and `-mfast` do not record a setting. Their values are unknown, not empty, so they cannot conflict with a later explicit declaration such as `mode=fast`. Separate values are never recovered by consuming the next token, which could be a positional reference/read filename. This loses sensitivity to separate values and short options. An option whose argument has quoting or an escaped space in it is left uncompared, as the same run could show its value differently; option text inside another argument's quoted value is not an option. A quote left open omits the rest of the command line. The result records `options-inference=incomplete`: these hints are not proof of complete settings. Strict checking requires `options-inference=explicit` with the intended settings. Differing retained values or explicit declarations still conflict.
 
 Thread/output/read-group/verbosity options (`--threads`, `--output`, `--rg*`, `--verbose`, `--tmp-dir` and their short-name equivalents) are omitted even with explicit values. All short options, including attached values such as `-t8`, `-@8` and `-o/path/out.sam`, are omitted too. Retained explicit values accumulate as JSON arrays in the tag string so a value containing a comma cannot alias two values; a single value that itself looks like a JSON string array is escaped too. Paths with either `/` or `\` separators are reduced to file names, positional arguments are omitted, and `--` ends option parsing. Options named like winnowr's own tags (`aligner`, `version`, `source`, `sq-alt`, `options-inference`, `winnowr-merged-complete`, `winnowr-literal-mixed-tags`) are omitted too, so a tool's own `--options-inference=explicit` is never read as a declaration. Option names containing path syntax (`/` or `\`) are omitted rather than disclosing a path. The raw command line is never stored.
 
@@ -161,7 +161,8 @@ loaded rows and any provenance-only inputs. An unknown-provenance decision waits
 stream that could supply its declaration; other checks still run early. Without
 `--strict-provenance`, warnings about the reads' provenance are reported once, from the comparison
 of the loaded evidence, so a table replaced after startup is not reported against its earlier
-contents; with it, an error found at startup stops scoring there. Models that agree are
+contents, and required tables that disagree at startup are compared again as loaded, failing only
+if they still disagree; with it, an error found at startup stops scoring there. Models that agree are
 compared as one, the union of their tags (whatever the order of `--models`); models that differ
 are each compared. A "not checked" problem says why the reads' provenance is not known: neither
 `--alignments` nor `--alignment-tags` was given, the header identifies no aligner (and the tables
@@ -174,7 +175,8 @@ record no provenance), or `--alignment-tags none` was given.
 | record it | alike | logged | the same |
 | record disjoint partial tags | record no tags comparable with the models | logged: no tags were comparable, not proof of agreement | succeeds; omitted settings were not checked |
 | record it | different | warning naming each tag with both values | error |
-| either models or reads retain `options-inference=incomplete` | | warning: settings cannot be established; supply explicit declarations | error, even if both markers match |
+| record it, with `options-inference=incomplete` | any | warning: settings cannot be established; supply explicit declarations | error, even if both markers match |
+| record it | `options-inference=incomplete` | warning: settings cannot be established; supply explicit declarations | error, even if both markers match |
 | record equal `mixed` values on a compared tag | `mixed` on that tag | warning: indeterminate, not proof of agreement | error |
 | differ from each other | | warning, and each model is compared with the reads | error |
 

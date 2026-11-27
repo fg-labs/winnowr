@@ -559,26 +559,102 @@ fn record(
 }
 
 /// Unprofiled hints come only from explicit --name=value, including explicit empty values. Bare
-/// and short options are omitted: their values are unknown, not empty. Separate tokens are never
-/// consumed as values, since they may be positional reference/read filenames.
+/// and short options are omitted: their values are unknown, not empty. Separate arguments are
+/// never consumed as values, since they may be positional reference/read filenames.
+///
+/// The command line is split into arguments as the shell splits them (see [`shell_words`]). A
+/// value with quoting or an escaped space in it is omitted: a command line that does not show
+/// how its value was quoted could otherwise read as different settings for the same run (e.g. a
+/// different directory with spaces in it). An option such an argument names is left uncompared,
+/// even where another occurrence of it is recorded. A quote left open (e.g. an apostrophe in a
+/// value) omits the rest of the command line, as where its span ends is not known. A command line
+/// that joins its arguments with spaces and no quoting shows nothing of this: a fragment is then
+/// recorded.
 fn fallback_tags(command_line: &str) -> BTreeMap<String, String> {
     let ignored = |name: &str| {
         FALLBACK_IGNORED.contains(&name) || METADATA_TAGS.contains(&name) || name.starts_with("rg")
     };
     let mut tags = BTreeMap::new();
     let mut repeated = BTreeMap::new();
-    for token in command_line.split_whitespace().skip(1) {
-        if token == "--" {
+    let mut omitted = BTreeSet::new();
+    // The first argument is the program.
+    for word in shell_words(command_line).into_iter().skip(1) {
+        if word.unquoted == "--" {
             break;
         }
+        if word.quoted {
+            // Only an argument that is an option names one, without its quote syntax.
+            let option = word.unquoted.strip_prefix("--");
+            if let Some((name, _)) = option.and_then(|option| option.split_once('=')) {
+                omitted.insert(name.to_string());
+            }
+            continue;
+        }
         let Some((name, value)) =
-            token.strip_prefix("--").and_then(|option| option.split_once('='))
+            word.raw.strip_prefix("--").and_then(|option| option.split_once('='))
         else {
             continue;
         };
         record(&mut tags, &mut repeated, name, value, &ignored);
     }
+    for name in &omitted {
+        tags.remove(name);
+    }
     tags
+}
+
+/// An argument of a command line, as [`shell_words`] splits it.
+#[derive(Debug, Default)]
+struct ShellWord {
+    /// Its text as written.
+    raw: String,
+    /// Its text with the shell's quoting removed.
+    unquoted: String,
+    /// True if it has a quote (escaped or not) or an escaped whitespace in it, or is left inside
+    /// an open quote: its value may not be what the command line shows.
+    quoted: bool,
+}
+
+/// Splits `command_line` into arguments as the shell does: at whitespace outside quotes, with a
+/// backslash escaping the next character outside quotes and inside double quotes (so an escaped
+/// quote neither opens nor closes a quote, and an escaped space joins its argument to the next
+/// text), and literal inside single quotes. A backslash inside double quotes is removed only before
+/// a character it escapes there (`"`, `\`, `$` or a backtick).
+fn shell_words(command_line: &str) -> Vec<ShellWord> {
+    let mut words = Vec::new();
+    let mut word: Option<ShellWord> = None;
+    let mut quote: Option<char> = None;
+    let mut chars = command_line.chars();
+    while let Some(c) = chars.next() {
+        if quote.is_none() && c.is_whitespace() {
+            words.extend(word.take());
+            continue;
+        }
+        let current = word.get_or_insert_with(ShellWord::default);
+        current.raw.push(c);
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => current.unquoted.push(c),
+            (_, '\\') => {
+                let Some(next) = chars.next() else { continue };
+                current.raw.push(next);
+                if next.is_whitespace() || next == '"' || next == '\'' {
+                    current.quoted = true;
+                }
+                if quote == Some('"') && !matches!(next, '"' | '\\' | '$' | '`') {
+                    current.unquoted.push(c);
+                }
+                current.unquoted.push(next);
+            }
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                current.quoted = true;
+            }
+            _ => current.unquoted.push(c),
+        }
+    }
+    words.extend(word);
+    words
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -601,25 +677,28 @@ struct Program {
 
 impl Program {
     /// The program, lower-cased: `PN`, else a recognized aligner executable in `CL`, else `ID`
-    /// without a merge (`-XXXXXXXX`) or `.N` suffix, else the first `CL` word's file name.
+    /// without a merge (`-XXXXXXXX`) or `.N` suffix, else the first `CL` word's file name. A `PN` or
+    /// `ID` that is a path is reduced to its file name, so no directory is recorded.
     fn program(&self) -> String {
-        if let Some(name) = self.name.as_deref().filter(|name| !name.is_empty()) {
+        if let Some(name) = self.name.as_deref().map(normalized_value).filter(|n| !n.is_empty()) {
             return name.to_ascii_lowercase();
         }
         if let Some(command) = self.command().filter(|command| profile(command).is_some()) {
             return command;
         }
-        let id = strip_id_suffix(&self.id);
+        let id = normalized_value(strip_id_suffix(&self.id));
         if !id.is_empty() {
             return id.to_ascii_lowercase();
         }
         self.command().unwrap_or_default()
     }
 
-    /// The file name of the first word of `CL`, lower-cased.
+    /// The file name of the first argument of `CL`, lower-cased. Quoting and escaped spaces
+    /// follow [`shell_words`]; otherwise preserve backslashes as Windows path separators.
     fn command(&self) -> Option<String> {
-        let first = self.command_line.as_deref().and_then(|cl| cl.split_whitespace().next())?;
-        Some(normalized_value(first).to_ascii_lowercase())
+        let first = shell_words(self.command_line.as_deref()?).into_iter().next()?;
+        let executable = if first.quoted { &first.unquoted } else { &first.raw };
+        Some(normalized_value(executable).to_ascii_lowercase())
     }
 
     /// The program's profile: that of [`Program::program`], else that of its command (e.g. a
@@ -2213,6 +2292,133 @@ mod tests {
         }
     }
 
+    /// A value that continues past whitespace is never recorded as a fragment: directories of
+    /// different runs must not read as different settings. Hints around it are kept.
+    #[rstest]
+    #[case::double(r#"mapper --index="/data/first run/ref.idx" --mode=fast"#)]
+    #[case::single("mapper --index='/data/first run/ref.idx' --mode=fast")]
+    #[case::quoted_option(r#"mapper "--index=/data/first run/ref.idx" --mode=fast"#)]
+    #[case::option_inside_quotes(r#"mapper --index="/data/first run --hidden=1 x" --mode=fast"#)]
+    #[case::other_quote_inside(r#"mapper --index="/data/first run's --hidden=1 x" --mode=fast"#)]
+    #[case::escaped_space(r"mapper --index=/data/first\ run/ref.idx --mode=fast")]
+    #[case::quoted_program(r#""/opt/my first run/mapper" --mode=fast"#)]
+    #[case::escaped_program(r"/opt/my\ first\ run/mapper --mode=fast")]
+    fn continued_fallback_values_are_omitted(#[case] command: &str) {
+        assert_eq!(fallback_tags(command), map(&[("mode", "fast")]));
+        let other = command.replace("first", "second");
+        assert_ne!(other, command);
+        assert_eq!(fallback_tags(&other), fallback_tags(command));
+    }
+
+    /// Quotes follow the shell's escapes: a backslash escapes the next character outside quotes
+    /// and inside double quotes, but not inside single quotes. An escaped quote neither opens nor
+    /// closes a span, so the tokens inside the span are omitted and those after it are kept.
+    #[rstest]
+    #[case::escaped_in_double(r#"mapper --output="a \" --hidden=one tail" --mode=fast"#)]
+    #[case::escaped_backslash_in_double(r#"mapper --output="a b\\" --mode=fast"#)]
+    #[case::literal_backslash_in_single(r"mapper --output='a b\' --mode=fast")]
+    #[case::escaped_outside(r#"mapper --label=a\"b --mode=fast"#)]
+    #[case::escaped_single_outside(r"mapper --label=O\'Brien --mode=fast")]
+    fn escaped_quotes_do_not_change_the_quoted_span(#[case] command: &str) {
+        assert_eq!(fallback_tags(command), map(&[("mode", "fast")]));
+    }
+
+    /// Arguments are split as the shell splits them: an escaped space joins its argument to the
+    /// next text, and only an unescaped space separates arguments.
+    #[rstest]
+    #[case::escaped_then_separator(r"mapper --label=a\  --mode=fast")]
+    #[case::escaped_joins(r"mapper --label=a\ b --mode=fast")]
+    fn escaped_whitespace_joins_only_its_own_argument(#[case] command: &str) {
+        assert_eq!(fallback_tags(command), map(&[("mode", "fast")]));
+    }
+
+    /// Only an argument that is an option names an omitted option: an option's text inside
+    /// another argument's value does not, though a quoted occurrence of the option itself does.
+    #[rstest]
+    #[case::inside_a_value(r#"mapper --mode=fast --output="notes --mode=slow here""#, true)]
+    #[case::inside_a_single_quoted_value("mapper --mode=fast --output='a --mode=slow b'", true)]
+    #[case::quoted_occurrence(r#"mapper --mode=fast --mode="slow mode""#, false)]
+    fn option_text_inside_a_value_is_not_an_option(#[case] command: &str, #[case] kept: bool) {
+        let expected = if kept { map(&[("mode", "fast")]) } else { BTreeMap::new() };
+        assert_eq!(fallback_tags(command), expected);
+    }
+
+    /// An omitted occurrence is named without its quote syntax, so the option is uncompared.
+    #[rstest]
+    #[case::quoted_inside_name(r#"mapper --custom=a --cu"st"om="b c" --mode=fast"#)]
+    #[case::single_quoted_name("mapper --custom=a --'custom'='b c' --mode=fast")]
+    #[case::escaped_name(r"mapper --custom=a --cus\tom=b\ c --mode=fast")]
+    fn omitted_options_are_named_without_quote_syntax(#[case] command: &str) {
+        assert_eq!(fallback_tags(command), map(&[("mode", "fast")]));
+    }
+
+    /// A backslash that escapes no whitespace or quote leaves the argument as written: a Windows
+    /// path's value is recorded by its file name.
+    #[test]
+    fn windows_path_values_are_recorded_by_file_name() {
+        assert_eq!(
+            fallback_tags(r"mapper --ref=C:\data\ref.idx --mode=fast"),
+            map(&[("mode", "fast"), ("ref", "ref.idx")])
+        );
+    }
+
+    /// An option one of whose occurrences is omitted is left uncompared, not recorded as the
+    /// occurrences that remain.
+    #[rstest]
+    #[case::quoted_last(r#"mapper --custom=a --custom="b c" --mode=fast"#)]
+    #[case::quoted_first(r#"mapper --custom="b c" --custom=a --mode=fast"#)]
+    #[case::fully_quoted(r#"mapper --custom=a "--custom=b c" --mode=fast"#)]
+    #[case::escaped(r"mapper --custom=a --custom=b\ c --mode=fast")]
+    fn an_option_with_an_omitted_occurrence_is_uncompared(#[case] command: &str) {
+        assert_eq!(fallback_tags(command), map(&[("mode", "fast")]));
+    }
+
+    /// An unclosed quote omits the hints after it, as where its span ends is not known.
+    #[test]
+    fn an_unclosed_quote_omits_the_later_hints() {
+        assert_eq!(
+            fallback_tags("mapper --mode=fast --label=O'Brien --other=x"),
+            map(&[("mode", "fast")])
+        );
+    }
+
+    #[test]
+    fn explicit_empty_hints_are_kept_beside_quotes() {
+        assert_eq!(fallback_tags(r#"mapper --empty= --index="a b""#), map(&[("empty", "")]));
+    }
+
+    /// A `PN` or `ID` that is a path records only its file name as the aligner.
+    #[rstest]
+    #[case::pn("@PG\tID:m\tPN:/opt/internal/Mapper\tCL:mapper --mode=fast\n")]
+    #[case::id("@PG\tID:/opt/internal/mapper\tCL:/opt/internal/mapper --mode=fast\n")]
+    #[case::windows("@PG\tID:m\tPN:C:\\internal\\mapper\tCL:mapper --mode=fast\n")]
+    fn aligner_names_do_not_disclose_directories(#[case] header: &str) {
+        let provenance = of_header(header).provenance.unwrap();
+        assert_eq!(provenance.get("aligner"), Some("mapper"));
+        assert!(!provenance.to_json().contains("internal"), "{}", provenance.to_json());
+    }
+
+    /// Executable paths use either host's separators; quotes and escaped spaces still delimit
+    /// the first argument without becoming part of the aligner's name.
+    #[rstest]
+    #[case::quoted("@PG\tID:x\tCL:\"/opt/my tools/bwa\" mem ref.fa r.fq\n")]
+    #[case::escaped("@PG\tID:x\tCL:/opt/my\\ tools/bwa mem ref.fa r.fq\n")]
+    #[case::windows("@PG\tID:x\tCL:C:\\tools\\bwa mem ref.fa r.fq\n")]
+    #[case::windows_unc("@PG\tID:x\tCL:\\\\server\\tools\\bwa mem ref.fa r.fq\n")]
+    #[case::windows_double_quoted("@PG\tID:x\tCL:\"C:\\my tools\\bwa\" mem ref.fa r.fq\n")]
+    #[case::windows_single_quoted("@PG\tID:x\tCL:'C:\\my tools\\bwa' mem ref.fa r.fq\n")]
+    fn an_aligner_path_names_the_aligner(#[case] header: &str) {
+        let provenance = of_header(header).provenance.unwrap();
+        assert_eq!(provenance.get("aligner"), Some("bwa"));
+        assert!(!provenance.to_json().contains("tools"), "{}", provenance.to_json());
+    }
+
+    #[test]
+    fn plain_aligner_names_are_kept() {
+        let header = "@PG\tID:m\tPN:bwa-mem3\tCL:bwa-mem3 mem ref.fa r.fq\n";
+        assert_eq!(of_header(header).provenance.unwrap().get("aligner"), Some("bwa-mem3"));
+    }
+
     #[test]
     fn review_fallback_values_survive_bare_occurrences() {
         let before = fallback_tags("mapper --custom=a --custom --custom");
@@ -2547,10 +2753,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fallback_honors_the_end_of_options() {
+    #[rstest]
+    #[case::plain("--")]
+    #[case::single_quoted("'--'")]
+    #[case::double_quoted(r#""--""#)]
+    #[case::partly_quoted(r#"-"-""#)]
+    #[case::escaped(r"\--")]
+    #[case::both_escaped(r"\-\-")]
+    fn fallback_honors_the_end_of_options(#[case] terminator: &str) {
         assert_eq!(
-            fallback_tags("aligner --mode=fast -- --secret=sample ref.fa r.fq"),
+            fallback_tags(&format!(
+                "aligner --mode=fast {terminator} --secret=sample --mode=slow ref.fa r.fq"
+            )),
             map(&[("mode", "fast")])
         );
     }

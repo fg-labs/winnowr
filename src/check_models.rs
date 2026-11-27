@@ -49,6 +49,9 @@ pub struct CheckInputs<'a> {
     pub alignments: Option<&'a Path>,
     /// `--alignment-tags`: the reads' alignment provenance, or tags over the header's.
     pub alignment_tags: Option<&'a AlignmentTags>,
+    /// Why `--alignment-tags` cannot be read, if it cannot: then the reads' provenance is unknown
+    /// (unreadable), and the header of `--alignments` is not read, as how to read it is not known.
+    pub alignment_tags_error: Option<&'a str>,
     /// Whether alignment provenance problems are errors.
     pub strict_provenance: bool,
     /// Whether a region BED whose digest is not the models' is a warning, not an error.
@@ -417,14 +420,18 @@ pub fn check_models(inputs: &CheckInputs<'_>) -> Report {
         );
         problems.push(Problem::warning(Check::NotDifficultMissing, None, message));
     }
-    // With --alignment-tags none, the header is not read.
-    let reads = resolve_reads(inputs.alignment_tags, inputs.alignments, Vec::new()).unwrap_or_else(
-        |error| {
-            let message = format!("{error:#}");
-            problems.push(Problem::error(Check::InputUnreadable, None, message));
-            ReadsAlignment { unknown: UnknownReason::Unreadable, ..ReadsAlignment::default() }
-        },
-    );
+    let unreadable = |problems: &mut Vec<Problem>, message: String| {
+        problems.push(Problem::error(Check::InputUnreadable, None, message));
+        ReadsAlignment { unknown: UnknownReason::Unreadable, ..ReadsAlignment::default() }
+    };
+    // With --alignment-tags none, or tags that cannot be read, the header is not read.
+    let reads = match inputs.alignment_tags_error {
+        Some(error) => {
+            unreadable(&mut problems, format!("--alignment-tags cannot be read: {error}"))
+        }
+        None => resolve_reads(inputs.alignment_tags, inputs.alignments, Vec::new())
+            .unwrap_or_else(|error| unreadable(&mut problems, format!("{error:#}"))),
+    };
     if let (Some(path), Some(header)) = (inputs.alignments, &reads.header) {
         match header {
             Ok(header) => {
@@ -758,6 +765,7 @@ mod tests {
             vcf: None,
             alignments: None,
             alignment_tags: Some(&MATCHING_TAGS),
+            alignment_tags_error: None,
             strict_provenance: false,
             allow_region_mismatch: false,
         }
