@@ -17,6 +17,10 @@ pub struct TestProcesses {
     /// [`TestProcesses::spawn_test`]): counted per log, as each log holds only its own children's
     /// output, so this can be reused with the same or another log.
     tests: std::collections::HashMap<PathBuf, usize>,
+    /// What the last [`TestProcesses::stop`] reaped of each child: its status, or `None` if
+    /// waiting for it failed. Tests check this rather than waiting for the children themselves,
+    /// which would reap a child the harness left unreaped.
+    reaped: Vec<Option<std::process::ExitStatus>>,
 }
 
 impl TestProcesses {
@@ -98,9 +102,7 @@ impl TestProcesses {
         for child in &mut self.children {
             let _ = child.kill();
         }
-        for child in &mut self.children {
-            let _ = child.wait();
-        }
+        self.reaped = self.children.iter_mut().map(|child| child.wait().ok()).collect();
     }
 }
 
@@ -125,9 +127,10 @@ fn fifo_deadline_kills_and_reaps_both_blocked_processes() {
         .spawn(std::process::Command::new("sh").args(["-c", "printf x > \"$1\"", "w"]).arg(writer));
     let error = processes.wait(std::time::Duration::from_millis(100)).unwrap_err();
     assert!(error.to_string().contains("killed and reaped"), "{error}");
-    for child in &mut processes.children {
-        assert!(!child.try_wait().unwrap().expect("child must have been reaped").success());
-    }
+    // Checked from what `stop` recorded: `try_wait` here would reap an exited child itself,
+    // hiding a harness that killed its children without waiting for them.
+    assert_eq!(processes.reaped.len(), 2);
+    assert!(processes.reaped.iter().all(|status| status.is_some_and(|s| !s.success())));
 }
 
 #[cfg(unix)]
@@ -144,8 +147,9 @@ fn fifo_deadline_reaps_a_writer_when_the_reader_returns_early() {
     processes
         .spawn(std::process::Command::new("sh").args(["-c", "printf x > \"$1\"", "w"]).arg(fifo));
     assert!(processes.wait(std::time::Duration::from_millis(100)).is_err());
-    assert!(processes.children[0].try_wait().unwrap().unwrap().success());
-    assert!(!processes.children[1].try_wait().unwrap().unwrap().success());
+    let [reader, writer] = processes.reaped[..] else { panic!("{:?}", processes.reaped) };
+    assert!(reader.unwrap().success());
+    assert!(!writer.unwrap().success());
 }
 
 /// Printed by a test child once its body has run: passing alone does not show it, as a child run

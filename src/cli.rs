@@ -3138,8 +3138,10 @@ fn score_with<F: FnOnce()>(
     let checks_provenance = infos.iter().any(|info| info.alignment.is_some());
     let tags = args.provenance.alignment_tags.tags()?;
     let evidence_tags = if checks_provenance { tags.as_ref() } else { Some(&AlignmentTags::None) };
+    let required =
+        RequiredTables { strlen: !needs_strlen.is_empty(), pileup: !needs_pileup.is_empty() };
     let (checked_reads, checked_tables) = if checks_provenance {
-        score_reads_alignment(args)?
+        score_reads_alignment(args, required)?
     } else {
         // Required rows still load, but legacy models need no provenance parsing or agreement.
         (ReadsAlignment::default(), Vec::new())
@@ -3147,10 +3149,7 @@ fn score_with<F: FnOnce()>(
     let pending_alignment = checks_provenance
         && !matches!(evidence_tags, Some(AlignmentTags::None))
         && required_alignment_pending(
-            &[
-                (args.strlen.as_slice(), !needs_strlen.is_empty()),
-                (args.pileup.as_slice(), !needs_pileup.is_empty()),
-            ],
+            &[(args.strlen.as_slice(), required.strlen), (args.pileup.as_slice(), required.pileup)],
             &checked_tables,
         );
     let reads = &checked_reads;
@@ -3576,18 +3575,36 @@ fn check_no_output_is_input<'a, I: IntoIterator<Item = (&'a str, &'a Path)>>(
 /// [`crate::evidence::read_alignment`]). Missing-source warnings wait for the final resolution of
 /// loaded rows and retained provenance-only inputs.
 ///
+/// The snapshots of `required` tables, whose rows are read later with their provenance, may
+/// disagree without `--strict-provenance`: their conflict is left to the merge of the tables as
+/// loaded (see [`loaded_score_alignment`]).
+///
 /// # Errors
 ///
 /// Returns an error if the tags are malformed, the header or a table cannot be read, or the
-/// sources record different provenance.
-fn score_reads_alignment(args: &ScoreArgs) -> Result<(ReadsAlignment, AlignmentSnapshots)> {
-    score_reads_alignment_with(args, crate::evidence::observe_alignment_with_tags)
+/// sources record different provenance (other than required tables' snapshots, unless strict).
+fn score_reads_alignment(
+    args: &ScoreArgs,
+    required: RequiredTables,
+) -> Result<(ReadsAlignment, AlignmentSnapshots)> {
+    score_reads_alignment_with(args, required, crate::evidence::observe_alignment_with_tags)
+}
+
+/// Whether the `--strlen` and the `--pileup` tables are required (read for their rows): a
+/// required table's provenance is read again with its rows.
+#[derive(Debug, Clone, Copy, Default)]
+struct RequiredTables {
+    /// Whether the `--strlen` tables are.
+    strlen: bool,
+    /// Whether the `--pileup` tables are.
+    pileup: bool,
 }
 
 /// Scoring preflight with a supplied observer, allowing tests to replace a path after the initial
 /// classification but before the same-handle observation.
 fn score_reads_alignment_with<F>(
     args: &ScoreArgs,
+    required: RequiredTables,
     mut observe: F,
 ) -> Result<(ReadsAlignment, AlignmentSnapshots)>
 where
@@ -3612,8 +3629,12 @@ where
         crate::scoring::check_output_not_input(output, inputs.clone())?;
     }
     let mut checked = Vec::new();
-    let mut tables: Vec<(String, LazySource<'_>)> = Vec::new();
-    for (option, paths) in [("--strlen", &args.strlen), ("--pileup", &args.pileup)] {
+    // Each group's provenance (individual shards if they conflict), and whether it is required.
+    let mut groups: Vec<(String, Option<AlignmentProvenance>, bool)> = Vec::new();
+    for (option, paths, required) in
+        [("--strlen", &args.strlen, required.strlen), ("--pileup", &args.pileup, required.pileup)]
+    {
+        let snapshot_start = checked.len();
         let mut sources: Vec<(String, LazySource<'_>)> = Vec::new();
         for path in paths {
             let observation = observe(path, tags.as_ref())?;
@@ -3634,17 +3655,69 @@ where
         }
         if !sources.is_empty() {
             // Rows can acquire provenance before loading; missing-source warnings belong to the
-            // final merge, but conflicts between known sources must still fail preflight.
+            // final merge, but conflicts between known sources must still fail preflight, except
+            // between required tables without --strict-provenance: their rows' declarations
+            // replace these snapshots (e.g. of a shard replaced between two observations), and
+            // the merge of the tables loaded rejects shards that still disagree.
             let alignment =
-                crate::alignment_provenance::resolve_reads_quiet(None, None, sources)?.provenance;
-            tables.push((format!("the {option} tables"), Box::new(move || Ok(alignment))));
+                match crate::alignment_provenance::resolve_reads_quiet(None, None, sources) {
+                    Ok(resolved) => resolved.provenance,
+                    Err(error) if required && !args.provenance.strict_provenance => {
+                        info!(
+                            "The {option} tables record different alignment provenance at \
+                             startup ({error:#}); they are compared again as loaded"
+                        );
+                        // Keep every shard for startup comparisons with provenance-only groups.
+                        groups.extend(checked[snapshot_start..].iter().map(|(path, alignment)| {
+                            (path.display().to_string(), alignment.clone(), required)
+                        }));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            groups.push((format!("the {option} tables"), alignment, required));
         }
     }
+    let sources = |required: Option<bool>| -> Vec<(String, LazySource<'_>)> {
+        groups
+            .iter()
+            .filter(|(_, _, group_required)| required.is_none_or(|r| r == *group_required))
+            .map(|(name, alignment, _)| {
+                let alignment = alignment.clone();
+                (name.clone(), Box::new(move || Ok(alignment)) as LazySource<'_>)
+            })
+            .collect()
+    };
     let reads = if args.alignments.is_some() {
         // --alignments conflicts with evidence tables: retain the header's warnings and errors.
-        reads_alignment(tags.as_ref(), args.alignments.as_deref(), tables)?
+        reads_alignment(tags.as_ref(), args.alignments.as_deref(), sources(None))?
     } else {
-        crate::alignment_provenance::resolve_reads_quiet(tags.as_ref(), None, tables)?
+        let resolve = |sources| {
+            crate::alignment_provenance::resolve_reads_quiet(tags.as_ref(), None, sources)
+        };
+        match resolve(sources(None)) {
+            Ok(reads) => reads,
+            // As within a group: required groups that disagree only with each other are left to
+            // the tables loaded, which replace their snapshots. A conflict with a provenance-only
+            // group still fails preflight.
+            Err(error)
+                if !args.provenance.strict_provenance
+                    && groups.iter().filter(|(_, _, required)| *required).count() > 1 =>
+            {
+                for (name, alignment, _) in groups.iter().filter(|(_, _, required)| *required) {
+                    let alignment = alignment.clone();
+                    let mut with_others = sources(Some(false));
+                    with_others.push((name.clone(), Box::new(move || Ok(alignment))));
+                    resolve(with_others)?;
+                }
+                info!(
+                    "The required tables record different alignment provenance at \
+                     startup ({error:#}); they are compared again as loaded"
+                );
+                resolve(sources(Some(false)))?
+            }
+            Err(error) => return Err(error),
+        }
     };
     Ok((reads, checked))
 }
@@ -3753,25 +3826,18 @@ fn check_models_with_writers<W: std::io::Write, E: std::io::Write>(
 ) -> Result<()> {
     use crate::check_models::{CheckInputs, check_models, write_json, write_text};
     let tags = args.provenance.alignment_tags.tags();
-    let mut report = check_models(&CheckInputs {
+    let tags_error = tags.as_ref().err().map(|error| format!("{error:#}"));
+    let report = check_models(&CheckInputs {
         models: &args.models,
         regions: &args.regions,
         reference: args.reference.as_deref(),
         vcf: args.vcf.as_deref(),
         alignments: args.alignments.as_deref(),
         alignment_tags: tags.as_ref().ok().and_then(Option::as_ref),
+        alignment_tags_error: tags_error.as_deref(),
         strict_provenance: args.provenance.strict_provenance,
         allow_region_mismatch: args.allow_region_mismatch,
     });
-    if let Err(error) = tags {
-        report.problems.push(Problem::error(
-            Check::InputUnreadable,
-            None,
-            format!("--alignment-tags cannot be read: {error:#}"),
-        ));
-        report.problems.sort_by_key(|problem| problem.check);
-        report.ok = false;
-    }
     if args.json {
         write_json(&report, out)?;
     } else {
@@ -6123,7 +6189,7 @@ mod tests {
                     else {
                         panic!("not score")
                     };
-                    Ok(score_reads_alignment(&args)?.0.provenance)
+                    Ok(score_reads_alignment(&args, RequiredTables::default())?.0.provenance)
                 } else {
                     let output = setup.path("overridden.parquet");
                     let (vcf, happy, reads) =
@@ -6767,6 +6833,38 @@ mod tests {
             );
         }
 
+        /// Required regular shards that disagree as loaded fail scoring, strict or not: without
+        /// --strict-provenance their preflight conflict is deferred to the loaded tables, which
+        /// still reject it.
+        #[rstest]
+        #[case::strict(true)]
+        #[case::deferred(false)]
+        fn review_disagreeing_required_shards_fail_once_loaded(#[case] strict: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = |name: &str| dir.path().join(name).display().to_string();
+            scoring_evidence_inputs(dir.path(), Some(crate::testing::bwa_provenance("primary")));
+            let (a, b) = (path("a.tsv"), path("b.tsv"));
+            let primary = crate::testing::bwa_provenance("primary");
+            let keep_alt = crate::testing::bwa_provenance("keep-alt");
+            std::fs::write(&a, scoring_pileup_text(Some(&primary))).unwrap();
+            std::fs::write(&b, scoring_pileup_text(Some(&keep_alt))).unwrap();
+            let (vcf, model, output) =
+                (path("default.vcf.gz"), path("model.winnowr.json"), path("scored.vcf.gz"));
+            let mut args =
+                vec!["score", "--vcf", &vcf, "--models", &model, "-o", &output, "--pileup", &a, &b];
+            if strict {
+                args.push("--strict-provenance");
+            }
+            let (result, logs) = captured_logs::capture(|| run_command(&args));
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("were aligned differently"), "{error}");
+            assert!(error.contains("alt-project"), "{error}");
+            assert!(!Path::new(&output).exists());
+            // Without --strict-provenance, scoring defers the conflict of its required shards.
+            let deferred = logs.iter().any(|(_, text)| text.contains("compared again as loaded"));
+            assert_eq!(deferred, !strict, "{logs:?}");
+        }
+
         /// Without a comparison against preflight provenance, a stream that disagrees with an
         /// unchanged table still fails the resolution of the evidence loaded, strict or not.
         #[rstest]
@@ -7222,8 +7320,9 @@ mod tests {
             else {
                 panic!("not score")
             };
-            let ((reads, checked), preflight) =
-                captured_logs::capture(|| score_reads_alignment(&args).unwrap());
+            let ((reads, checked), preflight) = captured_logs::capture(|| {
+                score_reads_alignment(&args, RequiredTables::default()).unwrap()
+            });
             if gains_declaration {
                 write(&missing, Some(&alignment));
             }
@@ -7284,7 +7383,7 @@ mod tests {
                 panic!("not score")
             };
             let ((reads, checked), preflight) = captured_logs::capture(|| {
-                score_reads_alignment_with(&args, |path, _| {
+                score_reads_alignment_with(&args, RequiredTables::default(), |path, _| {
                     let unknown = (path == Path::new("required.pileup")) == required_unknown;
                     Ok(AlignmentObservation::Regular((!unknown).then(|| alignment.clone())))
                 })
@@ -7334,7 +7433,7 @@ mod tests {
                 panic!("not score")
             };
             let (result, logs) = captured_logs::capture(|| {
-                score_reads_alignment_with(&args, |path, _| {
+                score_reads_alignment_with(&args, RequiredTables::default(), |path, _| {
                     Ok(AlignmentObservation::Regular(match path.to_str().unwrap() {
                         "missing.tsv" => None,
                         "primary.tsv" => Some(crate::testing::bwa_provenance("primary")),
@@ -7351,6 +7450,172 @@ mod tests {
                 !logs.iter().any(|(_, text)| text.contains("record no alignment provenance")),
                 "{logs:?}"
             );
+        }
+
+        /// Without --strict-provenance, snapshots of required shards that disagree (one replaced
+        /// between observations) are left to the loaded tables, which replace them; a conflict
+        /// with a provenance-only table, or under --strict-provenance, still fails preflight.
+        #[rstest]
+        #[case::required_lenient(true, false, true)]
+        #[case::required_strict(true, true, false)]
+        #[case::provenance_only(false, false, false)]
+        fn review_scoring_defers_stale_required_shard_conflicts(
+            #[case] required: bool,
+            #[case] strict: bool,
+            #[case] deferred: bool,
+        ) {
+            use crate::evidence::AlignmentObservation;
+            let mut arguments = vec![
+                "score", "--vcf", "v", "--models", "m", "-o", "o", "--pileup", "a.tsv", "b.tsv",
+            ];
+            if strict {
+                arguments.push("--strict-provenance");
+            }
+            let Command::Score(args) = parse(&arguments).unwrap().command else {
+                panic!("not score")
+            };
+            let keep_alt = crate::testing::bwa_provenance("keep-alt");
+            let result = score_reads_alignment_with(
+                &args,
+                RequiredTables { strlen: false, pileup: required },
+                |path, _| {
+                    // a.tsv was observed before its replacement by a keep-alt shard.
+                    let stale = path == Path::new("a.tsv");
+                    Ok(AlignmentObservation::Regular(Some(if stale {
+                        crate::testing::bwa_provenance("primary")
+                    } else {
+                        keep_alt.clone()
+                    })))
+                },
+            );
+            if !deferred {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("aligned differently"), "{error}");
+                return;
+            }
+            let (reads, checked) = result.unwrap();
+            assert_eq!(reads.provenance, None, "the stale snapshots stand for nothing");
+            assert_eq!(checked.len(), 2);
+            // The shards loaded agree: their provenance is the reads'.
+            let pileup = PileupTables {
+                options: PileupOptions::default(),
+                rows: Vec::new(),
+                alignment: Some(keep_alt.clone()),
+            };
+            let loaded =
+                loaded_score_alignment(&args, &reads, &checked, None, Some(&pileup)).unwrap();
+            assert_eq!(loaded.provenance, Some(keep_alt));
+        }
+
+        /// Even when conflicting required shards are deferred, each must agree with the
+        /// provenance-only group during preflight, whichever group is processed first.
+        #[rstest]
+        #[case::strlen_shards(true)]
+        #[case::pileup_shards(false)]
+        fn review_scoring_required_shards_check_provenance_only_at_startup(
+            #[case] strlen_shards: bool,
+            #[values("primary", "keep-alt")] provenance_only: &str,
+        ) {
+            use crate::evidence::AlignmentObservation;
+            let (required_option, unused_option) =
+                if strlen_shards { ("--strlen", "--pileup") } else { ("--pileup", "--strlen") };
+            let Command::Score(args) = parse(&[
+                "score",
+                "--vcf",
+                "v",
+                "--models",
+                "m",
+                "-o",
+                "o",
+                required_option,
+                "a.tsv",
+                "b.tsv",
+                unused_option,
+                "unused.tsv",
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("not score")
+            };
+            let error = score_reads_alignment_with(
+                &args,
+                RequiredTables { strlen: strlen_shards, pileup: !strlen_shards },
+                |path, _| {
+                    let setting = match path.to_str().unwrap() {
+                        "a.tsv" => "primary",
+                        "b.tsv" => "keep-alt",
+                        _ => provenance_only,
+                    };
+                    Ok(AlignmentObservation::Regular(Some(crate::testing::bwa_provenance(setting))))
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("aligned differently") && error.contains("alt-project"),
+                "{error}"
+            );
+        }
+
+        /// Without --strict-provenance, required `--strlen` and `--pileup` tables whose snapshots
+        /// disagree are left to the loaded tables too; a conflict with a provenance-only group, or
+        /// under --strict-provenance, still fails preflight.
+        #[rstest]
+        #[case::both_required_lenient(true, true, false, true)]
+        #[case::both_required_strict(true, true, true, false)]
+        #[case::pileup_provenance_only(true, false, false, false)]
+        #[case::strlen_provenance_only(false, true, false, false)]
+        fn review_scoring_defers_required_conflicts_across_groups(
+            #[case] strlen: bool,
+            #[case] pileup: bool,
+            #[case] strict: bool,
+            #[case] deferred: bool,
+        ) {
+            use crate::evidence::AlignmentObservation;
+            let mut arguments = vec![
+                "score", "--vcf", "v", "--models", "m", "-o", "o", "--strlen", "s.tsv", "--pileup",
+                "p.tsv",
+            ];
+            if strict {
+                arguments.push("--strict-provenance");
+            }
+            let Command::Score(args) = parse(&arguments).unwrap().command else {
+                panic!("not score")
+            };
+            let keep_alt = crate::testing::bwa_provenance("keep-alt");
+            let result =
+                score_reads_alignment_with(&args, RequiredTables { strlen, pileup }, |path, _| {
+                    // s.tsv was observed before its replacement by a keep-alt table.
+                    Ok(AlignmentObservation::Regular(Some(if path == Path::new("s.tsv") {
+                        crate::testing::bwa_provenance("primary")
+                    } else {
+                        keep_alt.clone()
+                    })))
+                });
+            if !deferred {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("aligned differently"), "{error}");
+                return;
+            }
+            let (reads, checked) = result.unwrap();
+            assert_eq!(reads.provenance, None, "the stale snapshots stand for nothing");
+            assert_eq!(checked.len(), 2);
+            // The tables loaded agree: their provenance is the reads'.
+            let strlen = StrlenTables {
+                options: crate::strlen::StrlenOptions::default(),
+                rows: Vec::new(),
+                alignment: Some(keep_alt.clone()),
+            };
+            let pileup = PileupTables {
+                options: PileupOptions::default(),
+                rows: Vec::new(),
+                alignment: Some(keep_alt.clone()),
+            };
+            let loaded =
+                loaded_score_alignment(&args, &reads, &checked, Some(&strlen), Some(&pileup))
+                    .unwrap();
+            assert_eq!(loaded.provenance, Some(keep_alt));
         }
 
         #[rstest]
@@ -7380,7 +7645,7 @@ mod tests {
                 panic!("not score")
             };
             let ((resolved, checked), logs) = captured_logs::capture(|| {
-                score_reads_alignment_with(&args, |path, _| {
+                score_reads_alignment_with(&args, RequiredTables::default(), |path, _| {
                     Ok(if path == fifo {
                         if read {
                             AlignmentObservation::Regular(None)
@@ -7644,10 +7909,11 @@ mod tests {
             };
             // Initially absent, as with a skipped FIFO; published before the observation opens it.
             let before = b"##alignment={}\nunused\n";
-            let result = score_reads_alignment_with(&args, |path, tags| {
-                std::fs::write(path, before).unwrap();
-                crate::evidence::observe_alignment_with_tags(path, tags)
-            });
+            let result =
+                score_reads_alignment_with(&args, RequiredTables::default(), |path, tags| {
+                    std::fs::write(path, before).unwrap();
+                    crate::evidence::observe_alignment_with_tags(path, tags)
+                });
             let error = format!("{:#}", result.unwrap_err());
             assert!(error.contains("write to another path"), "{error}");
             assert_eq!(std::fs::read(output).unwrap(), before);
@@ -9561,6 +9827,56 @@ mod tests {
         if valid {
             assert_eq!(report["inputs"]["alignment"]["alt-project"], "primary");
         }
+    }
+
+    /// With tags that cannot be read, the alignment header is not read: only the tags' error is
+    /// reported, not one of an alignment file that is then never opened, nor that neither option
+    /// was given. The `--alignments` given is still reported as given.
+    #[rstest]
+    fn review_check_models_skips_the_header_with_invalid_alignment_tags(
+        #[values("badtag", "alt-project=primary")] tags: &str,
+        #[values(false, true)] strict: bool,
+    ) {
+        let valid = !tags.contains("badtag");
+        let dir = tempfile::tempdir().unwrap();
+        let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+        model.info.alignment = Some(crate::testing::bwa_provenance("primary"));
+        let model_path = dir.path().join("model.winnowr.json");
+        model.save(&model_path).unwrap();
+        let alignments = dir.path().join("absent.bam");
+        let mut arguments = vec![
+            "check-models",
+            "--models",
+            model_path.to_str().unwrap(),
+            "--alignments",
+            alignments.to_str().unwrap(),
+            "--alignment-tags",
+            tags,
+            "--json",
+        ];
+        if strict {
+            arguments.push("--strict-provenance");
+        }
+        let Command::CheckModels(args) = parse(&arguments).unwrap().command else {
+            panic!("not check-models")
+        };
+        let mut out = Vec::new();
+        let error = check_models_with_writers(&args, &mut out, Vec::new()).unwrap_err();
+        let report: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let problems = report["problems"].as_array().unwrap();
+        let unreadable: Vec<&str> = problems
+            .iter()
+            .filter(|p| p["check"] == "input_unreadable")
+            .map(|p| p["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(unreadable.iter().any(|m| m.contains("absent.bam")), valid, "{unreadable:?}");
+        assert_eq!(unreadable.iter().any(|m| m.contains("--alignment-tags")), !valid);
+        assert!(
+            !problems.iter().any(|p| p["check"] == "alignment_provenance_not_checked"),
+            "{report}"
+        );
+        assert_eq!(report["inputs"]["alignments"], alignments.display().to_string());
+        assert!(error.to_string().contains("1 error(s)"), "{error}");
     }
 
     /// `check-models` succeeds on a good set, and fails on a bad one; `score` reports every
