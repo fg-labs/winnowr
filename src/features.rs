@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::alleles::{Genotype, first_alt_index};
-use crate::common::{PASS, Task, VariantType};
+use crate::common::{PASS, PhaseTimer, Task, VariantType};
 use crate::neighbourhood::{Call, N_FEATURES, NEIGHBOURHOOD_FEATURES, neighbourhood_features};
 use crate::raw_records::RawRecord;
 use crate::regions::RegionSet;
@@ -203,16 +203,12 @@ pub fn derive_features(
     regions: &[RegionSet],
     dp_median: Option<f64>,
 ) -> DerivedFeatures {
+    let mut timer = PhaseTimer::start();
     let positive_or_nan = |value: f64| if value > 0.0 { value } else { f64::NAN };
     // Each column is computed in parallel over the records, keeping their order.
     let column = |f: &(dyn Fn(&RawRecord) -> f64 + Sync)| -> Vec<f64> {
         records.par_iter().map(f).collect()
     };
-    let ab = column(&|r| r.ad_alt / positive_or_nan(r.ad_ref + r.ad_alt));
-    let indel_len = column(&|r| {
-        first_alt_index(&r.alts)
-            .map_or(f64::NAN, |index| r.alts[index].len() as f64 - r.reference.len() as f64)
-    });
     debug_assert!(
         dp_median.is_none_or(|given| check_dp_median(given).is_ok()),
         "unchecked dp_median {dp_median:?}"
@@ -236,6 +232,12 @@ pub fn derive_features(
             given
         }
     };
+    timer.lap_in("deriving features", "the median depth");
+    let ab = column(&|r| r.ad_alt / positive_or_nan(r.ad_ref + r.ad_alt));
+    let indel_len = column(&|r| {
+        first_alt_index(&r.alts)
+            .map_or(f64::NAN, |index| r.alts[index].len() as f64 - r.reference.len() as f64)
+    });
     let mut derived = DerivedFeatures {
         sor: column(&|r| {
             let from_sb = strand_odds_ratio(r.sb_ref_fwd, r.sb_ref_rev, r.sb_alt_fwd, r.sb_alt_rev);
@@ -258,6 +260,7 @@ pub fn derive_features(
         ab,
         ..DerivedFeatures::default()
     };
+    timer.lap_in("deriving features", "the columns");
 
     derived.regions = regions
         .iter()
@@ -272,7 +275,9 @@ pub fn derive_features(
             (region_set.name().to_string(), flags)
         })
         .collect();
+    timer.lap_in("deriving features", "the region overlaps");
     derived.overlaps_pass = overlaps_pass(records);
+    timer.lap_in("deriving features", "the overlaps of PASS calls");
 
     let calls: Vec<Call<'_>> = records
         .iter()
@@ -285,7 +290,9 @@ pub fn derive_features(
             filtered: record.filter != PASS,
         })
         .collect();
+    timer.lap_in("deriving features", "the calls' neighbourhood keys");
     derived.neighbourhood = neighbourhood_features(&calls);
+    timer.lap_in("deriving features", "the neighbourhood features");
     derived
 }
 

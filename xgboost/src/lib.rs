@@ -260,6 +260,39 @@ mod cpu_usage {
     }
 }
 
+/// The CPU time this process has used so far, user and system, summed over all its threads
+/// (XGBoost's and htslib's included), or `None` where it cannot be read (`getrusage`, on macOS
+/// and Linux only). The difference of two readings is the CPU time the whole process used
+/// between them, whichever threads used it; winnowr logs it as it times its phases.
+///
+/// This has nothing to do with XGBoost: it is here because reading it is a C call, and this is
+/// winnowr's only crate that allows `unsafe` code, where the other operating-system probes (of
+/// the CPUs' load, for how OpenMP threads wait) already are.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[must_use]
+pub fn process_cpu_time() -> Option<std::time::Duration> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: the pointer is valid for writing the one `struct rusage` that getrusage writes.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: getrusage succeeded, so it wrote the whole struct.
+    let usage = unsafe { usage.assume_init() };
+    let duration = |time: libc::timeval| {
+        let seconds = u64::try_from(time.tv_sec).ok()?;
+        let micros = u64::try_from(time.tv_usec).ok()?;
+        Some(std::time::Duration::from_secs(seconds) + std::time::Duration::from_micros(micros))
+    };
+    Some(duration(usage.ru_utime)? + duration(usage.ru_stime)?)
+}
+
+/// The CPU time this process has used so far: `None`, as it is read on macOS and Linux only.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[must_use]
+pub fn process_cpu_time() -> Option<std::time::Duration> {
+    None
+}
+
 /// How OpenMP worker threads wait for the next parallel region, as chosen by
 /// [`wait_between_parallel_regions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2072,6 +2105,24 @@ mod tests {
         let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
         let busy = cpu_usage::busy_cores(cores).expect("the CPU time counters are readable");
         assert!(busy.is_finite() && busy >= 0.0, "{busy}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn reads_the_process_cpu_time() {
+        use std::time::{Duration, Instant};
+        let before = process_cpu_time().expect("the process CPU time is readable");
+        let started = Instant::now();
+        // Real work on this thread for about 50 ms, which the CPU time must count.
+        let mut sum = 0u64;
+        while started.elapsed() < Duration::from_millis(50) {
+            for i in 0..10_000u64 {
+                sum = std::hint::black_box(sum.wrapping_add(i));
+            }
+        }
+        std::hint::black_box(sum);
+        let after = process_cpu_time().expect("the process CPU time is readable");
+        assert!(after > before, "{after:?} <= {before:?}");
     }
 
     /// A `/proc/stat` of four CPUs, each with `busy` busy and 100 total ticks.

@@ -15,6 +15,14 @@ that is not a positive number is ignored, with a warning.
   took, is logged at info level. `score` writes and indexes its VCF within `-t` threads too:
   htslib's compression and decompression threads are counted in them (apart from an I/O thread
   per file, which mostly waits on the disk).
+- At debug level (`RUST_LOG=winnowr=debug`), every command logs how long each of its phases
+  took and the CPU time the process used meanwhile, e.g. `writing the VCF: writing the shards took
+  1.08s (cpu 12.31s)`. The CPU time is the whole process's, of every thread: phases that run at
+  the same time (measuring the reads and scoring the models that do not need them, in `score
+  --alignments`) each count the other's, and OpenMP threads polling between parallel steps count
+  as busy. So the CPU time over the time taken is how many cores a phase kept busy only for a
+  phase that runs alone. Phases nest: a line whose phase ends in "in all" is logged after the
+  phases it is made of, and its times include theirs.
 - Measured on a 16-core machine (an AWS c7a.4xlarge), `score --alignments` on a 30x whole-genome
   CRAM with four models (two of them needing the reads) took 554 s with `-t 1`, 287 s with `-t 2`,
   149 s with `-t 4`, 83 s with `-t 8` and 51 s with `-t 16`. The total CPU time stays about the

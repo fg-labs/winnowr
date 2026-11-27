@@ -134,21 +134,86 @@ named_enum!(Task, "task", { Genotype => "genotype", Promote => "promote" });
 named_enum!(VariantType, "variant type", { Snp => "snp", Indel => "indel" });
 
 /// Times the phases of a command, logging how long each took at debug level (enable with
-/// `RUST_LOG=winnowr=debug`), to find where time goes without a profiler.
+/// `RUST_LOG=winnowr=debug`), and the CPU time the process used meanwhile, to find where time
+/// goes without a profiler. Every command that times its phases logs both.
+///
+/// The CPU time is the whole process's, of every thread, not the phase's own: phases that run at
+/// the same time (e.g. measuring the reads while models score, in `score --alignments`) each
+/// count the other's CPU time, and OpenMP threads polling between parallel steps count as busy.
+/// So the CPU time over the time taken is how many cores a phase kept busy only for a phase that
+/// runs alone.
+///
+/// Laps nest: a phase that calls other timed phases is logged after theirs with
+/// [`PhaseTimer::lap_total`], which ends its name in "in all", as its time includes theirs.
+///
+/// With debug logging off, a lap only moves the timer on: it reads no CPU time and formats no
+/// message. The log level is taken to be fixed for the run.
 #[derive(Debug)]
-pub struct PhaseTimer(std::time::Instant);
+pub struct PhaseTimer {
+    /// When the current phase started.
+    started: std::time::Instant,
+    /// The process's CPU time when the current phase started, if it can be read (and debug
+    /// logging is on).
+    cpu: Option<std::time::Duration>,
+}
 
 impl PhaseTimer {
     /// Starts timing the first phase.
     #[must_use]
     pub fn start() -> PhaseTimer {
-        PhaseTimer(std::time::Instant::now())
+        PhaseTimer { started: std::time::Instant::now(), cpu: PhaseTimer::cpu_time() }
     }
 
-    /// Logs the time since the timer started or the previous phase ended, and starts the next.
-    pub fn lap(&mut self, phase: &str) {
-        log::debug!("{phase} took {:.2?}", self.0.elapsed());
-        self.0 = std::time::Instant::now();
+    /// The process's CPU time, read only when the laps are logged.
+    fn cpu_time() -> Option<std::time::Duration> {
+        log::log_enabled!(log::Level::Debug).then(winnowr_xgboost::process_cpu_time).flatten()
+    }
+
+    /// Logs the time since the timer started or the previous phase ended, and the CPU time the
+    /// process used meanwhile, and starts the next. Returns the time the phase took.
+    pub fn lap(&mut self, phase: impl std::fmt::Display) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        let elapsed = now - self.started;
+        self.started = now;
+        if log::log_enabled!(log::Level::Debug) {
+            let cpu = PhaseTimer::cpu_time();
+            log::debug!("{}", lap_message(phase, elapsed, self.cpu, cpu));
+            self.cpu = cpu;
+        }
+        elapsed
+    }
+
+    /// [`PhaseTimer::lap`] for a step of a larger phase, `what`: logged as "{what}: {phase}".
+    pub fn lap_in(
+        &mut self,
+        what: impl std::fmt::Display,
+        phase: impl std::fmt::Display,
+    ) -> std::time::Duration {
+        self.lap(format_args!("{what}: {phase}"))
+    }
+
+    /// [`PhaseTimer::lap`] for a phase made of other timed phases, logged after theirs: its time
+    /// includes theirs, so it is logged as "{phase} in all".
+    pub fn lap_total(&mut self, phase: impl std::fmt::Display) -> std::time::Duration {
+        self.lap(format_args!("{phase} in all"))
+    }
+}
+
+/// The message [`PhaseTimer::lap`] logs: how long a phase took, and the CPU time used between
+/// the readings `before` and `after` when both are known (e.g. "reading the calls took 1.08s (cpu
+/// 4.21s)"). A reading that went backwards counts as no CPU time.
+fn lap_message(
+    phase: impl std::fmt::Display,
+    elapsed: std::time::Duration,
+    before: Option<std::time::Duration>,
+    after: Option<std::time::Duration>,
+) -> String {
+    match before.zip(after) {
+        Some((before, after)) => {
+            let cpu = after.saturating_sub(before);
+            format!("{phase} took {elapsed:.2?} (cpu {cpu:.2?})")
+        }
+        None => format!("{phase} took {elapsed:.2?}"),
     }
 }
 
@@ -157,6 +222,30 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    /// Milliseconds, as a duration.
+    fn ms(millis: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn laps_log_the_cpu_time_between_the_readings() {
+        let message = lap_message("reading", ms(1080), Some(ms(500)), Some(ms(4710)));
+        assert_eq!(message, "reading took 1.08s (cpu 4.21s)");
+    }
+
+    #[test]
+    fn laps_log_only_the_time_taken_without_both_readings() {
+        assert_eq!(lap_message("reading", ms(1080), None, None), "reading took 1.08s");
+        assert_eq!(lap_message("reading", ms(1080), Some(ms(5)), None), "reading took 1.08s");
+        assert_eq!(lap_message("reading", ms(1080), None, Some(ms(5))), "reading took 1.08s");
+    }
+
+    #[test]
+    fn laps_count_a_reading_that_went_backwards_as_no_cpu_time() {
+        let message = lap_message("reading", ms(1080), Some(ms(900)), Some(ms(800)));
+        assert_eq!(message, "reading took 1.08s (cpu 0.00ns)");
+    }
 
     #[test]
     fn repeated_items_are_sorted_and_listed_once() {

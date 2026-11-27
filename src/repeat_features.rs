@@ -14,7 +14,7 @@ use log::{info, warn};
 use rayon::prelude::*;
 
 use crate::alleles::{Genotype, allele_deltas};
-use crate::common::VariantType;
+use crate::common::{PhaseTimer, VariantType};
 use crate::evidence::Evidence as _;
 use crate::numeric::pairwise_sum;
 use crate::strlen::{Histogram, StrlenOptions, StrlenRow, StrlenTables, parse_histogram};
@@ -188,9 +188,11 @@ pub fn histogram_features(
 /// Returns an error if the table has indel calls and none of them has evidence (the strlen
 /// tables come from another VCF), or a histogram is malformed.
 pub fn add_strlen_features(table: FeatureTable, strlen: &StrlenTables) -> Result<FeatureTable> {
+    let mut timer = PhaseTimer::start();
     let joined = table.join_calls(&strlen.rows, StrlenOptions::row_key)?;
     check_coverage(&table, &joined)?;
     let called = called_deltas_of(&table)?;
+    timer.lap_in("repeat-length features", "joining the calls");
 
     let number = |f: fn(&StrlenRow) -> f64| -> Vec<f64> {
         joined.iter().map(|row| row.map_or(f64::NAN, f)).collect()
@@ -209,6 +211,7 @@ pub fn add_strlen_features(table: FeatureTable, strlen: &StrlenTables) -> Result
         n_overlap.iter().zip(&n_spanning).map(|(&o, &s)| 1.0 - s / positive_or_nan(o)).collect();
     let tract_units: Vec<f64> =
         tract_len.iter().zip(&period).map(|(&l, &p)| l / positive_or_nan(p)).collect();
+    timer.lap_in("repeat-length features", "the strlen columns");
 
     // Histograms are parsed and summarized in parallel, then split into columns.
     let rows: Vec<[f64; HISTOGRAM_FEATURES.len()]> = joined
@@ -228,6 +231,7 @@ pub fn add_strlen_features(table: FeatureTable, strlen: &StrlenTables) -> Result
             column.push(value);
         }
     }
+    timer.lap_in("repeat-length features", "the histogram features");
 
     let mut table = table
         .with_f64_column("sl_period", period)?
@@ -247,6 +251,7 @@ pub fn add_strlen_features(table: FeatureTable, strlen: &StrlenTables) -> Result
     }
     table.info_mut().strlen = true;
     table.info_mut().strlen_settings = Some(strlen.options);
+    timer.lap_in("repeat-length features", "adding the columns");
     Ok(table)
 }
 

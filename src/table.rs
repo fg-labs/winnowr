@@ -37,7 +37,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::alignment_provenance::AlignmentProvenance;
-use crate::common::VariantType;
+use crate::common::{PhaseTimer, VariantType};
 use crate::feature_source::FeatureSource;
 use crate::features::{DerivedFeatures, DpNormDivisor, region_feature};
 use crate::neighbourhood::NEIGHBOURHOOD_FEATURES;
@@ -244,6 +244,7 @@ impl FeatureTable {
         info: FeatureTableInfo,
     ) -> Result<Self> {
         type Column<'a> = (&'static str, Box<dyn Fn() -> ArrayRef + Send + Sync + 'a>);
+        let mut timer = PhaseTimer::start();
         let number = |name: &'static str, f: fn(&RawRecord) -> f64| -> Column<'_> {
             (
                 name,
@@ -322,6 +323,7 @@ impl FeatureTable {
         for (name, array) in arrays {
             columns.push(name, array);
         }
+        timer.lap_in("building the table", "the raw columns");
 
         let floats = |values: Vec<f64>| -> ArrayRef { Arc::new(Float64Array::from(values)) };
         let flags = |values: Vec<bool>| -> ArrayRef { Arc::new(BooleanArray::from(values)) };
@@ -360,7 +362,9 @@ impl FeatureTable {
         for (k, name) in NEIGHBOURHOOD_FEATURES.iter().enumerate() {
             columns.push(name, floats(neighbourhood.iter().map(|row| row[k]).collect()));
         }
-        Ok(FeatureTable { batch: columns.finish(records.len())?, info })
+        let table = FeatureTable { batch: columns.finish(records.len())?, info };
+        timer.lap_in("building the table", "the derived columns");
+        Ok(table)
     }
 
     /// A table from columns and metadata.

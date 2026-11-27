@@ -294,7 +294,11 @@ fn measure_evidence(
 ) -> Result<Measured> {
     let strlen_rows = strlen
         .map(|options| {
-            Ok::<_, anyhow::Error>(sites_to_rows(&measure_regions(inputs, contigs, &options)?))
+            let sites = measure_regions(inputs, contigs, &options)?;
+            let mut timer = PhaseTimer::start();
+            let rows = sites_to_rows(&sites);
+            timer.lap_in("measuring the repeat lengths", "building the rows");
+            Ok::<_, anyhow::Error>(rows)
         })
         .transpose()?;
     let pileup = pileup
@@ -335,10 +339,8 @@ pub fn measure_and_decide(
     models: &mut [WinnowrModel],
     policy: &Policy,
     measure: &Measuring<'_>,
-    timer: &mut PhaseTimer,
 ) -> Result<HashMap<CallKey, Decision>> {
-    let (decisions, _) =
-        measure_and_decide_with(table, models, policy, measure, timer, Hooks::default())?;
+    let (decisions, _) = measure_and_decide_with(table, models, policy, measure, Hooks::default())?;
     Ok(decisions)
 }
 
@@ -369,10 +371,11 @@ fn measure_and_decide_with(
     models: &mut [WinnowrModel],
     policy: &Policy,
     measure: &Measuring<'_>,
-    timer: &mut PhaseTimer,
     hooks: Hooks,
 ) -> Result<(HashMap<CallKey, Decision>, bool)> {
     check_model_kinds(models.iter().map(|model| &model.info))?;
+    let mut timer = PhaseTimer::start();
+    let timer = &mut timer;
     // The pool the work runs on (called from outside a pool, the global one).
     let threads = rayon::current_num_threads();
     let shared = threads > 1 && models.iter().any(|model| !measure.is_needed_by(model));
@@ -384,25 +387,31 @@ fn measure_and_decide_with(
         measure_while_scoring(table, models, policy, measure, timer, hooks)?
     } else {
         info!("Measuring the evidence from the reads on -t {threads}, then scoring");
-        let started = Instant::now();
         let measured =
             measure_evidence(measure.inputs, measure.contigs, measure.strlen, measure.pileup)?;
-        info!("The reads were measured in {:.1?}", started.elapsed());
-        timer.lap("measuring the evidence from the reads");
-        (vec![None; models.len()], join_evidence(table, measure, measured)?)
+        let took = timer.lap_total("measuring the evidence from the reads");
+        info!("The reads were measured in {took:.1?}");
+        (vec![None; models.len()], join_evidence(table, measure, measured, timer)?)
     };
     for (slot, model) in per_model.iter_mut().zip(models.iter()) {
         if slot.is_none() {
             *slot = Some(decide_model_calls(&table, model, policy, Predicting::Whole)?);
         }
     }
-    Ok((merge_decisions(per_model.into_iter().flatten().collect()), shared))
+    timer.lap_total(if shared {
+        "scoring the models that need the evidence"
+    } else {
+        "scoring the models"
+    });
+    let decisions = merge_decisions(per_model.into_iter().flatten().collect());
+    timer.lap("merging the decisions");
+    Ok((decisions, shared))
 }
 
 /// Each model's decisions, `None` for those yet to score.
 type PerModel = Vec<Option<Vec<(CallKey, Decision)>>>;
 
-/// The evidence joined to the `table`, for the models that use it.
+/// The evidence joined to the `table`, for the models that use it, timing each join with `timer`.
 ///
 /// # Errors
 ///
@@ -411,14 +420,17 @@ fn join_evidence(
     table: FeatureTable,
     measure: &Measuring<'_>,
     measured: Measured,
+    timer: &mut PhaseTimer,
 ) -> Result<FeatureTable> {
     let (strlen_rows, pileup) = measured;
     let mut table = table;
     if let (Some(rows), Some(options)) = (strlen_rows, measure.strlen) {
         table = add_strlen_features(table, &StrlenTables::new(options, rows))?;
+        timer.lap_total("joining the repeat-length features");
     }
     if let Some(pileup) = pileup {
         table = add_pileup_features(table, &pileup)?;
+        timer.lap("joining the pileup features");
     }
     Ok(table)
 }
@@ -500,8 +512,8 @@ where
          {:.1?}",
         measured_for, scored_for
     );
-    timer.lap("measuring the evidence from the reads (while scoring other models)");
-    Ok((per_model, join_evidence(table, measure, measured)?))
+    timer.lap_total("measuring the evidence from the reads while scoring other models");
+    Ok((per_model, join_evidence(table, measure, measured, timer)?))
 }
 
 /// What [`measure_and_score`] returns: the decisions of the models that do not use the evidence
@@ -1033,14 +1045,7 @@ mod tests {
                 contigs: &contigs,
             };
             let policy = Policy::new(crate::rescore::Mode::Genotyper);
-            measure_and_decide_with(
-                Self::table(),
-                models,
-                &policy,
-                &measuring,
-                &mut PhaseTimer::start(),
-                hooks,
-            )
+            measure_and_decide_with(Self::table(), models, &policy, &measuring, hooks)
         }
 
         /// [`measure_and_score`] with `models` on a pool of one thread, calling `hooks`: the
@@ -1172,7 +1177,6 @@ mod tests {
                     &mut models,
                     &Policy::new(crate::rescore::Mode::Genotyper),
                     &matching_measure,
-                    &mut PhaseTimer::start(),
                 )
             })
             .unwrap();
@@ -1204,7 +1208,6 @@ mod tests {
                 &mut models,
                 &Policy::new(crate::rescore::Mode::Genotyper),
                 &changed_measure,
-                &mut PhaseTimer::start(),
             )
         });
         let error = format!("{:#}", changed.unwrap_err());
@@ -1363,7 +1366,6 @@ mod tests {
                     &mut models,
                     &Policy::new(crate::rescore::Mode::Genotyper),
                     &measuring,
-                    &mut PhaseTimer::start(),
                 )
             })
             .unwrap_err();
@@ -1576,7 +1578,6 @@ mod tests {
                     &mut models,
                     &Policy::new(crate::rescore::Mode::Genotyper),
                     &measure,
-                    &mut PhaseTimer::start(),
                     hooks,
                 )
             })
