@@ -3,11 +3,12 @@ Check a set of models before a run, and report what they need.
 Reads each model's information, but not its booster (which `score` loads, and this does not check),
 and runs the model-set checks `score` runs at startup, and more, reporting every problem: that the
 models can be scored together (one model per task and variant type, the same contigs and reference,
-one feature source, one setting of each evidence), that --regions has a BED for every region a model
-uses (each BED is read, and must have intervals on the models' contigs; for a BED `score` does not
-read, a problem is only a warning), and that the models' reference is that of --reference or --vcf.
-Warnings (e.g. a model trained by another winnowr version) do not fail it; errors do. With --json,
-prints a JSON summary (schema version 1) on stdout, also when it fails.
+one feature source, one setting of each evidence), that every region a model uses has a BED given
+with --regions or found beside the models as regions/NAME.bed.gz, .bed.bgz or .bed (each BED is
+read, and must have intervals on the models' contigs; for a BED `score` does not read, a problem is
+only a warning), and that the models' reference is that of --reference or --vcf. Warnings (e.g. a
+model trained by another winnowr version) do not fail it; errors do. With --json, prints a JSON
+summary (schema version 1) on stdout, also when it fails.
 
 Usage: winnowr check-models [OPTIONS] --models <MODELS>...
 
@@ -20,7 +21,8 @@ Options:
 
       --regions <NAME=PATH>...
           Region BEDs as NAME=PATH, as given to `score --regions`; each is read and checked (a
-          problem of one `score` does not read is a warning)
+          problem of one `score` does not read is a warning). A region not given is found beside the
+          models, as `score` finds it
 
       --reference <REFERENCE>
           The reference FASTA with its `.fai` beside it, or the `.fai` itself: only the index is
@@ -47,6 +49,11 @@ Options:
           Fail when the reads were not aligned as the models' training reads were, when the models
           disagree on it, or when the models record it and the reads' is not known; without it,
           these are warnings. Models that record no alignment provenance are not checked
+
+      --allow-region-mismatch
+          A region BED (given or found beside the models) whose digest is not the one the models
+          record is a warning, not an error (as `score --allow-region-mismatch`). Models that record
+          different digests of one region are still an error
 
       --json
           Print the summary as JSON on stdout (schema version 1), with every problem

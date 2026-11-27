@@ -125,15 +125,20 @@ impl Applied {
 ///   suffixes match in any case.
 /// * `decisions` - the decisions by call (see [`crate::policy::decide_calls`]).
 /// * `threads` - the extra htslib threads for decompressing the input and compressing the output.
+/// * `protected_beds` - the identities of the regular region BEDs consumed: the output, and its
+///   index, are checked not to be one of them on the handle opened, before it is truncated (see
+///   [`crate::io::create_output`]).
 ///
 /// # Errors
 ///
-/// Returns an error if a file cannot be read or written, or a record cannot be updated.
+/// Returns an error if a file cannot be read or written, a record cannot be updated, or the
+/// output or its index is a consumed region BED.
 pub fn write_scored_vcf(
     vcf: &Path,
     output: &Path,
     decisions: HashMap<CallKey, Decision>,
     threads: NonZeroUsize,
+    protected_beds: &[crate::io::FileIdentity],
 ) -> Result<()> {
     check_output_not_input(output, [("VCF", vcf)])?;
     let indexes = crate::vcf::index_candidates(vcf);
@@ -179,8 +184,8 @@ pub fn write_scored_vcf(
     });
     let index = DecisionIndex::new(&decisions);
     let (applied, n_applied) = match sharded {
-        Some(contigs) => write_sharded(vcf, output, &index, &contigs)?,
-        None => write_serial(vcf, output, &index, threads, format, uncompressed)?,
+        Some(contigs) => write_sharded(vcf, output, &index, &contigs, protected_beds)?,
+        None => write_serial(vcf, output, &index, threads, format, uncompressed, protected_beds)?,
     };
     let unmatched = decisions.len() - n_applied;
     if unmatched > 0 {
@@ -194,6 +199,11 @@ pub fn write_scored_vcf(
         // A dangling sidecar symlink may resolve only after the output has been written.
         if let Some(output_index) = scored_vcf_index(output) {
             check_output_not_input(&output_index, [("scored VCF", output)])?;
+            // htslib creates the index by its path: check the handle of the file it will
+            // truncate first.
+            if !protected_beds.is_empty() {
+                drop(crate::io::create_output(&output_index, protected_beds)?);
+            }
         }
         index::build(output, None, 1, index_type)
             .map_err(|e| anyhow::anyhow!("failed to index {}: {e}", output.display()))?;
@@ -289,12 +299,21 @@ fn write_serial(
     threads: NonZeroUsize,
     format: Format,
     uncompressed: bool,
+    protected_beds: &[crate::io::FileIdentity],
 ) -> Result<(Applied, usize)> {
     let mut reader =
         Reader::from_path(vcf).with_context(|| format!("failed to open {}", vcf.display()))?;
     reader.set_threads(threads.get()).context("failed to set the htslib threads")?;
     let header = scored_header(reader.header());
-    let mut writer = Writer::from_path(output, &header, uncompressed, format)
+    // htslib opens what it writes by path: give it the checked handle's descriptor, so a path
+    // redirected after the check cannot point it at a consumed BED.
+    let checked = if protected_beds.is_empty() {
+        None
+    } else {
+        Some(crate::io::create_output(output, protected_beds)?)
+    };
+    let target = checked.as_ref().map_or_else(|| output.to_path_buf(), checked_handle_path);
+    let mut writer = Writer::from_path(&target, &header, uncompressed, format)
         .with_context(|| format!("failed to create {}", output.display()))?;
     if !uncompressed {
         writer.set_threads(threads.get()).context("failed to set the htslib threads")?;
@@ -322,6 +341,13 @@ fn write_serial(
     Ok((applied, applied_keys.len()))
 }
 
+/// A path naming the open `file` itself (its descriptor, `/dev/fd/N`), for a library that opens
+/// what it writes by path.
+fn checked_handle_path(file: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
+}
+
 /// The span of the shards a scored VCF is written in, in parallel.
 const WRITE_SHARD_SPAN: u64 = 10_000_000;
 
@@ -345,6 +371,7 @@ fn write_sharded(
     output: &Path,
     decisions: &DecisionIndex<'_>,
     contigs: &[String],
+    protected_beds: &[crate::io::FileIdentity],
 ) -> Result<(Applied, usize)> {
     use std::io::Write as _;
 
@@ -399,10 +426,7 @@ fn write_sharded(
         })
         .collect::<Result<_>>()?;
 
-    let mut out = std::io::BufWriter::new(
-        std::fs::File::create(output)
-            .with_context(|| format!("failed to create {}", output.display()))?,
-    );
+    let mut out = std::io::BufWriter::new(crate::io::create_output(output, protected_beds)?);
     out.write_all(header_blocks)
         .with_context(|| format!("failed to write {}", output.display()))?;
     let mut applied = Applied::default();
@@ -575,6 +599,32 @@ pub fn check_output_not_indexes(output: &Path, what: &str, candidates: &[PathBuf
         {
             bail!(
                 "the output {} would mask the input {what}; write to another path",
+                output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Protects every prospective input candidate, including absent paths whose creation would change
+/// later discovery. Unlike index lookup, bundled BED discovery examines every candidate.
+///
+/// # Errors
+///
+/// Returns an error if writing `output` would overwrite or create an input candidate.
+pub fn check_output_not_prospective_inputs<'a, I>(output: &Path, inputs: I) -> Result<()>
+where
+    I: IntoIterator<Item = (&'a str, &'a Path)>,
+{
+    let destination = future_destination(output);
+    for (what, input) in inputs {
+        check_output_not_input(output, [(what, input)])?;
+        if let (Some(destination), Some(candidate)) =
+            (destination.as_deref(), future_destination(input))
+            && same_future_destination(destination, &candidate)?
+        {
+            bail!(
+                "the output {} would create a bundled {what} candidate; write to another path",
                 output.display()
             );
         }
@@ -1064,9 +1114,9 @@ mod tests {
             decisions
         };
         let serial = dir.path().join("serial.vcf");
-        write_scored_vcf(&vcf, &serial, decisions(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &serial, decisions(), THREADS, &[]).unwrap();
         let sharded = dir.path().join("sharded.vcf.gz");
-        write_scored_vcf(&vcf, &sharded, decisions(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &sharded, decisions(), THREADS, &[]).unwrap();
 
         let mut text = String::new();
         std::io::Read::read_to_string(
@@ -1113,7 +1163,7 @@ mod tests {
         decisions.insert(key(400, "GA", "G", PASS), regenotype);
         decisions.insert(key(999, "A", "T", PASS), genotype_decision([0.1, 0.8, 0.1, 0.0]));
         let output = dir.path().join("out.vcf.gz");
-        write_scored_vcf(&vcf, &output, decisions, THREADS).unwrap();
+        write_scored_vcf(&vcf, &output, decisions, THREADS, &[]).unwrap();
         assert!(dir.path().join("out.vcf.gz.tbi").exists());
 
         let mut reader = VcfReader::from_path(&output).unwrap();
@@ -1184,6 +1234,50 @@ mod tests {
         assert!(duplicate.info(b"WINNOWR_P").float().unwrap().is_none());
     }
 
+    /// The output, and its index, are checked on the handle opened not to be a consumed region
+    /// BED; an unrelated output is written as without protection, through that handle.
+    #[rstest]
+    fn the_scored_vcf_is_not_written_over_a_consumed_bed(
+        #[values("out.vcf", "out.bcf", "out.vcf.gz")] name: &str,
+        #[values("unrelated", "output", "index")] alias: &str,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let vcf = input(&dir);
+        let bed = dir.path().join("consumed.bed");
+        let original = b"chr1\t0\t100\n";
+        std::fs::write(&bed, original).unwrap();
+        let (_, identity) = crate::io::open_text_with_identity(&bed).unwrap();
+        let protected = [identity.unwrap()];
+        // Both writers are covered: the bgzipped VCF in shards, the others in one pass.
+        assert_eq!(writes_sharded(&vcf, name), name == "out.vcf.gz");
+        let output = dir.path().join(name);
+        let index = scored_vcf_index(&output);
+        let result = match (alias, &index) {
+            ("index", None) => return,
+            ("index", Some(index)) => {
+                std::os::unix::fs::symlink(&bed, index).unwrap();
+                write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &protected)
+            }
+            ("output", _) => {
+                std::os::unix::fs::symlink(&bed, &output).unwrap();
+                write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &protected)
+            }
+            _ => {
+                write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &protected).unwrap();
+                let unprotected = dir.path().join(format!("unprotected.{name}"));
+                write_scored_vcf(&vcf, &unprotected, HashMap::new(), THREADS, &[]).unwrap();
+                let count = |path: &Path| VcfReader::from_path(path).unwrap().records().count();
+                assert_eq!(count(&output), count(&unprotected));
+                assert!(count(&output) > 0);
+                assert!(index.is_none_or(|index| index.exists()));
+                return;
+            }
+        };
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("is the input region BED"), "{error}");
+        assert_eq!(std::fs::read(&bed).unwrap(), original);
+    }
+
     /// Whether `write_scored_vcf` writes `vcf` to `name` in parallel shards.
     fn writes_sharded(vcf: &Path, name: &str) -> bool {
         is_bgzf_path(Path::new(name))
@@ -1204,7 +1298,7 @@ mod tests {
             write_indexed_vcf(dir.path(), "in.vcf.gz", &vcf_header(&[FIELDS], &["S1"]), &lines);
         assert_eq!(writes_sharded(&vcf, name), sharded);
         let output = dir.path().join(name);
-        let error = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap_err();
+        let error = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]).unwrap_err();
         assert!(
             format!("{error:#}").contains(
                 "a FILTER of the record at chr1:200 is not declared with a ##FILTER line in the \
@@ -1224,7 +1318,7 @@ mod tests {
         let vcf =
             write_indexed_vcf(dir.path(), "in.vcf.gz", &vcf_header(&[FIELDS], &["S1"]), &lines);
         let output = dir.path().join(name);
-        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]).unwrap();
         let filters: Vec<String> = VcfReader::from_path(&output)
             .unwrap()
             .records()
@@ -1249,8 +1343,9 @@ mod tests {
         let line = format!("chr1\t100\t.\tA\tC\t50\tPASS\t{info}\t{format}\t{sample}");
         let vcf =
             write_indexed_vcf(dir.path(), "in.vcf.gz", &vcf_header(&[FIELDS], &["S1"]), &[&line]);
-        let error = write_scored_vcf(&vcf, &dir.path().join("out.bcf"), HashMap::new(), THREADS)
-            .unwrap_err();
+        let error =
+            write_scored_vcf(&vcf, &dir.path().join("out.bcf"), HashMap::new(), THREADS, &[])
+                .unwrap_err();
         assert!(
             format!("{error:#}").contains(
                 "the record at chr1:100 has a FILTER, INFO or FORMAT tag not declared in the VCF \
@@ -1260,8 +1355,9 @@ mod tests {
         );
         // Read by region, the tag is not flagged, and was written under one of winnowr's names.
         assert!(writes_sharded(&vcf, "out.vcf.gz"));
-        let error = write_scored_vcf(&vcf, &dir.path().join("out.vcf.gz"), HashMap::new(), THREADS)
-            .unwrap_err();
+        let error =
+            write_scored_vcf(&vcf, &dir.path().join("out.vcf.gz"), HashMap::new(), THREADS, &[])
+                .unwrap_err();
         assert!(
             format!("{error:#}").contains(
                 "the record at chr1:100 has an INFO or FORMAT tag not declared in the VCF header"
@@ -1286,7 +1382,7 @@ mod tests {
         assert_eq!(scan.pos0, Some(vec!["chr1".to_string()]));
         assert!(!writes_sharded(&vcf, "out.vcf.gz"));
         let output = dir.path().join("out.vcf.gz");
-        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]).unwrap();
         assert_eq!(positions(&output), [(0, -1), (0, 4), (1, 0)]);
         // Without them, nothing is found.
         let vcf = write_indexed_vcf(dir.path(), "none.vcf.gz", &header, &lines[1..]);
@@ -1309,7 +1405,7 @@ mod tests {
         assert_eq!(scan.pos0, Some(vec!["chr1".to_string()]));
         assert!(!writes_sharded(&vcf, "out.vcf.gz"));
         let output = dir.path().join("out.vcf.gz");
-        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]).unwrap();
         assert_eq!(positions(&output), [(0, -1), (0, 4)]);
     }
 
@@ -1333,7 +1429,7 @@ mod tests {
         let expected = [(0, -1), (0, 4)];
         let write = |vcf: &Path| {
             let output = dir.path().join("out.vcf.gz");
-            write_scored_vcf(vcf, &output, HashMap::new(), THREADS).unwrap();
+            write_scored_vcf(vcf, &output, HashMap::new(), THREADS, &[]).unwrap();
             positions(&output)
         };
         // A BCF: no tabix index.
@@ -1414,7 +1510,7 @@ mod tests {
         index::build(&path, None, 1, IndexType::Tbx).unwrap();
         assert!(writes_sharded(&path, "out.vcf.gz"));
         let output = dir.path().join("out.vcf.gz");
-        write_scored_vcf(&path, &output, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&path, &output, HashMap::new(), THREADS, &[]).unwrap();
         assert_eq!(positions(&output), [(0, 0), (0, 99)]);
         let mut reader = VcfReader::from_path(&output).unwrap();
         let record = reader.records().nth(1).unwrap().unwrap();
@@ -1463,7 +1559,7 @@ mod tests {
             _ => unreachable!(),
         };
         let error =
-            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap_err().to_string();
+            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]).unwrap_err().to_string();
         assert!(error.contains("would mask the input VCF index"), "{error}");
         assert_eq!(std::fs::read(&vcf).unwrap(), original);
         assert_eq!(std::fs::read(&tbi).unwrap(), index);
@@ -1486,7 +1582,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.path(), dir.path().join("alias")).unwrap();
         let selected = dir.path().join(if csi { "in.vcf.gz.csi" } else { "in.vcf.gz.tbi" });
         let before = std::fs::read(&selected).unwrap();
-        write_scored_vcf(&vcf, &dir.path().join(name), HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &dir.path().join(name), HashMap::new(), THREADS, &[]).unwrap();
         assert_eq!(std::fs::read(&selected).unwrap(), before);
         let mut reader = crate::vcf::open_indexed(&vcf).unwrap();
         reader.fetch(0, 0, None).unwrap();
@@ -1513,7 +1609,7 @@ mod tests {
         } else {
             dir.path().join("in.vcf.gz.CSI")
         };
-        let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS);
+        let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]);
         if insensitive {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("would mask the input VCF index"), "{error}");
@@ -1553,7 +1649,7 @@ mod tests {
                 panic!("unexpected permission probe error: {error}");
             }
         }
-        let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS);
+        let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]);
         std::fs::set_permissions(dir.path(), permissions).unwrap();
         result.unwrap();
         assert_eq!(VcfReader::from_path(&output).unwrap().records().count(), 5);
@@ -1568,7 +1664,7 @@ mod tests {
         let output = dir.path().join("alias/../in.vcf.gz.csi");
         let tbi = dir.path().join("in.vcf.gz.tbi");
         let before = std::fs::read(&tbi).unwrap();
-        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]).unwrap();
         assert!(dir.path().join("one/in.vcf.gz.csi").exists());
         assert!(!dir.path().join("in.vcf.gz.csi").exists());
         assert_eq!(std::fs::read(&tbi).unwrap(), before);
@@ -1579,9 +1675,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let indexed = input(&dir);
         let plain = dir.path().join("plain.vcf");
-        write_scored_vcf(&indexed, &plain, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&indexed, &plain, HashMap::new(), THREADS, &[]).unwrap();
         let before = std::fs::read(&plain).unwrap();
-        write_scored_vcf(&plain, &dir.path().join("plain.vcf.csi"), HashMap::new(), THREADS)
+        write_scored_vcf(&plain, &dir.path().join("plain.vcf.csi"), HashMap::new(), THREADS, &[])
             .unwrap();
         assert_eq!(std::fs::read(&plain).unwrap(), before);
     }
@@ -1591,20 +1687,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let vcf = input(&dir);
         let message =
-            write_scored_vcf(&vcf, &vcf, HashMap::new(), THREADS).unwrap_err().to_string();
+            write_scored_vcf(&vcf, &vcf, HashMap::new(), THREADS, &[]).unwrap_err().to_string();
         assert!(message.ends_with("is the input VCF; write to another path"), "{message}");
         // So is a hard link to it, which has another canonical path.
         let linked = dir.path().join("linked.vcf.gz");
         std::fs::hard_link(&vcf, &linked).unwrap();
         let message =
-            write_scored_vcf(&vcf, &linked, HashMap::new(), THREADS).unwrap_err().to_string();
+            write_scored_vcf(&vcf, &linked, HashMap::new(), THREADS, &[]).unwrap_err().to_string();
         assert!(message.ends_with("is the input VCF; write to another path"), "{message}");
         // Plain-text and BCF outputs are written too.
         let plain = dir.path().join("out.vcf");
-        write_scored_vcf(&vcf, &plain, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &plain, HashMap::new(), THREADS, &[]).unwrap();
         assert!(std::fs::read_to_string(&plain).unwrap().contains("##FILTER=<ID=WinnowrDrop"));
         let bcf = dir.path().join("out.bcf");
-        write_scored_vcf(&vcf, &bcf, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &bcf, HashMap::new(), THREADS, &[]).unwrap();
         assert!(dir.path().join("out.bcf.csi").exists());
         // Nor is the index written beside the output the input's index (a .tbi beside bgzipped
         // VCF, a .csi beside BCF), through a link to it.
@@ -1613,8 +1709,9 @@ mod tests {
         for (output, sidecar) in [("s.vcf.gz", "s.vcf.gz.tbi"), ("s.bcf", "s.bcf.csi")] {
             std::os::unix::fs::symlink(&index, dir.path().join(sidecar)).unwrap();
             let output = dir.path().join(output);
-            let message =
-                write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap_err().to_string();
+            let message = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[])
+                .unwrap_err()
+                .to_string();
             assert!(
                 message.ends_with("is the input VCF index; write to another path"),
                 "{message}"
@@ -1628,7 +1725,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let vcf = input(&dir);
         let bcf = dir.path().join("input.bcf");
-        write_scored_vcf(&vcf, &bcf, HashMap::new(), THREADS).unwrap();
+        write_scored_vcf(&vcf, &bcf, HashMap::new(), THREADS, &[]).unwrap();
         let csi = dir.path().join("input.bcf.csi");
         let before = std::fs::read(&csi).unwrap();
         for name in ["input.bcf.tbi", "input.tbi"] {
@@ -1637,13 +1734,13 @@ mod tests {
             let output = dir.path().join(format!("{name}.vcf.gz"));
             let sidecar = scored_vcf_index(&output).unwrap();
             std::os::unix::fs::symlink(&unused, sidecar).unwrap();
-            write_scored_vcf(&bcf, &output, HashMap::new(), THREADS).unwrap();
+            write_scored_vcf(&bcf, &output, HashMap::new(), THREADS, &[]).unwrap();
             assert!(crate::vcf::has_index(&output));
         }
         let output = dir.path().join("protected.vcf.gz");
         std::os::unix::fs::symlink(&csi, scored_vcf_index(&output).unwrap()).unwrap();
         let error =
-            write_scored_vcf(&bcf, &output, HashMap::new(), THREADS).unwrap_err().to_string();
+            write_scored_vcf(&bcf, &output, HashMap::new(), THREADS, &[]).unwrap_err().to_string();
         assert!(error.ends_with("is the input VCF index; write to another path"), "{error}");
         assert_eq!(std::fs::read(&csi).unwrap(), before);
     }
@@ -1668,7 +1765,7 @@ mod tests {
             std::os::unix::fs::symlink(name, &sidecar).unwrap();
         }
         let error =
-            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap_err().to_string();
+            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]).unwrap_err().to_string();
         assert!(error.ends_with("is the input scored VCF; write to another path"), "{error}");
         assert_eq!(std::fs::read(&output).unwrap(), before);
         assert_eq!(std::fs::read(&sidecar).unwrap(), before);
@@ -1682,12 +1779,12 @@ mod tests {
             let output = dir.path().join(name);
             let sidecar = scored_vcf_index(&output).unwrap();
             std::os::unix::fs::symlink(name, &sidecar).unwrap();
-            let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS);
+            let result = write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]);
             assert!(result.is_err(), "index overwrote {name}");
             let mut reader = rust_htslib::bcf::Reader::from_path(&output).unwrap();
             assert!(reader.records().next().unwrap().is_ok());
             std::fs::remove_file(sidecar).unwrap();
-            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS).unwrap();
+            write_scored_vcf(&vcf, &output, HashMap::new(), THREADS, &[]).unwrap();
             assert!(scored_vcf_index(&output).unwrap().exists());
         }
     }

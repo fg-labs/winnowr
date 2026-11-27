@@ -19,12 +19,12 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::common::{PhaseTimer, Task, VariantType};
-use crate::io::write_tsv;
+use crate::io::{FileIdentity, write_tsv_protecting};
 use crate::labels::{
     HappyFn, Label, PromoteLabel, TRUTH_DELTA_COLUMNS, labelled_mask, read_happy_fns,
 };
@@ -472,12 +472,16 @@ impl StratifiedReport {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
-    pub fn write_outcomes(&self, path: &Path) -> Result<()> {
+    /// Returns an error if the opened destination is a protected BED or cannot be written.
+    pub(crate) fn write_outcomes_protecting(
+        &self,
+        path: &Path,
+        protected_beds: &[FileIdentity],
+    ) -> Result<()> {
         let lines = self.outcome_rows().into_iter().map(|(truth, vt, stratum, o)| {
             outcome_fields(&self.sample, &self.names[truth], stratum, vt, self.mode, &o)
         });
-        write_tsv(path, &OUTCOME_COLUMNS, lines)
+        write_tsv_protecting(path, &OUTCOME_COLUMNS, lines, protected_beds)
     }
 
     /// Writes the P(keep) calibration (see [`CALIBRATION_COLUMNS`]): per truth set, variant type
@@ -486,8 +490,12 @@ impl StratifiedReport {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
-    pub fn write_calibration(&self, path: &Path) -> Result<()> {
+    /// Returns an error if the opened destination is a protected BED or cannot be written.
+    pub(crate) fn write_calibration_protecting(
+        &self,
+        path: &Path,
+        protected_beds: &[FileIdentity],
+    ) -> Result<()> {
         let mut lines = Vec::new();
         for truth in 0..2 {
             for vt in self.variant_types() {
@@ -513,7 +521,7 @@ impl StratifiedReport {
                 }
             }
         }
-        write_tsv(path, &CALIBRATION_COLUMNS, lines.into_iter())
+        write_tsv_protecting(path, &CALIBRATION_COLUMNS, lines.into_iter(), protected_beds)
     }
 
     /// Writes the action counts and rates of every scored call (see [`RATE_COLUMNS`]): per
@@ -521,8 +529,12 @@ impl StratifiedReport {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
-    pub fn write_rates(&self, path: &Path) -> Result<()> {
+    /// Returns an error if the opened destination is a protected BED or cannot be written.
+    pub(crate) fn write_rates_protecting(
+        &self,
+        path: &Path,
+        protected_beds: &[FileIdentity],
+    ) -> Result<()> {
         let mut lines = Vec::new();
         let strata: Vec<Option<Stratum>> =
             Stratum::ALL.into_iter().map(Some).chain(std::iter::once(None)).collect();
@@ -555,7 +567,7 @@ impl StratifiedReport {
                 }
             }
         }
-        write_tsv(path, &RATE_COLUMNS, lines.into_iter())
+        write_tsv_protecting(path, &RATE_COLUMNS, lines.into_iter(), protected_beds)
     }
 
     /// One log line per outcome row.
@@ -666,21 +678,29 @@ impl RegionReport {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
-    pub fn write_outcomes(&self, path: &Path) -> Result<()> {
+    /// Returns an error if the opened destination is a protected BED or cannot be written.
+    pub(crate) fn write_outcomes_protecting(
+        &self,
+        path: &Path,
+        protected_beds: &[FileIdentity],
+    ) -> Result<()> {
         let lines = self.outcome_rows().into_iter().map(|(truth, vt, region, o)| {
             outcome_fields(&self.sample, &self.names[truth], region, vt, self.mode, &o)
         });
-        write_tsv(path, &REGION_OUTCOME_COLUMNS, lines)
+        write_tsv_protecting(path, &REGION_OUTCOME_COLUMNS, lines, protected_beds)
     }
 
     /// Writes the P(keep) calibration (see [`REGION_CALIBRATION_COLUMNS`]): per truth set,
-    /// variant type and region with calls (and `all`), as [`StratifiedReport::write_calibration`].
+    /// variant type and region with calls (and `all`), as [`StratifiedReport::write_calibration_protecting`].
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
-    pub fn write_calibration(&self, path: &Path) -> Result<()> {
+    /// Returns an error if the opened destination is a protected BED or cannot be written.
+    pub(crate) fn write_calibration_protecting(
+        &self,
+        path: &Path,
+        protected_beds: &[FileIdentity],
+    ) -> Result<()> {
         let mut lines = Vec::new();
         for truth in 0..2 {
             for vt in self.variant_types() {
@@ -697,7 +717,7 @@ impl RegionReport {
                 }
             }
         }
-        write_tsv(path, &REGION_CALIBRATION_COLUMNS, lines.into_iter())
+        write_tsv_protecting(path, &REGION_CALIBRATION_COLUMNS, lines.into_iter(), protected_beds)
     }
 
     /// Writes the action counts and rates of every scored call (see [`REGION_RATE_COLUMNS`]):
@@ -705,8 +725,12 @@ impl RegionReport {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
-    pub fn write_rates(&self, path: &Path) -> Result<()> {
+    /// Returns an error if the opened destination is a protected BED or cannot be written.
+    pub(crate) fn write_rates_protecting(
+        &self,
+        path: &Path,
+        protected_beds: &[FileIdentity],
+    ) -> Result<()> {
         let mut lines = Vec::new();
         for (r, name) in self.regions.iter().enumerate() {
             for stratum in Stratum::ALL.into_iter().map(Some).chain(std::iter::once(None)) {
@@ -729,7 +753,7 @@ impl RegionReport {
                 }
             }
         }
-        write_tsv(path, &REGION_RATE_COLUMNS, lines.into_iter())
+        write_tsv_protecting(path, &REGION_RATE_COLUMNS, lines.into_iter(), protected_beds)
     }
 
     /// One log line per outcome row.
@@ -931,6 +955,15 @@ pub struct CallOutputs<'a> {
     /// columns, labels, and the call's `row` in the feature table) to
     /// `<sample>.<truth>.<variant type>.parquet`.
     pub labelled_dir: Option<&'a Path>,
+    /// Identities of consumed policy BEDs that no output may overwrite.
+    pub protected_beds: &'a [FileIdentity],
+}
+
+/// The file of [`CallOutputs::labelled_dir`] (`dir`) the labelled PASS calls of `sample`'s
+/// variant type `vt` by the truth set `truth` go to: `<sample>.<truth>.<vt>.parquet`.
+#[must_use]
+pub fn labelled_calls_path(dir: &Path, sample: &str, truth: &str, vt: VariantType) -> PathBuf {
+    dir.join(format!("{sample}.{truth}.{vt}.parquet"))
 }
 
 /// Scores a sample's calls with the models as `score` does, and reports the decisions, outcomes
@@ -1038,13 +1071,13 @@ pub fn stratify(
             let mask = labelled_mask(view, vt)?;
             let rows: Vec<usize> = (0..mask.len()).filter(|&row| mask[row]).collect();
             if let Some(dir) = outputs.labelled_dir {
-                let path = dir.join(format!(
-                    "{}.{}.{vt}.parquet",
-                    table.info().sample,
-                    truths.names[truth]
-                ));
+                let path = labelled_calls_path(dir, &table.info().sample, &truths.names[truth], vt);
                 let row_values: Vec<f64> = rows.iter().map(|&row| row as f64).collect();
-                calls.calls.clone().with_f64_column("row", row_values)?.write_parquet(&path)?;
+                calls
+                    .calls
+                    .clone()
+                    .with_f64_column("row", row_values)?
+                    .write_parquet_protecting(&path, outputs.protected_beds)?;
             }
             let flip_ok = calls.calls.bool_column("flip_ok")?;
             let regenotype_ok = calls.calls.bool_column("regenotype_ok")?;
@@ -1105,7 +1138,7 @@ pub fn stratify(
     if let Some(path) = outputs.calls {
         let indices: Vec<&RowIndex> =
             genotype.values().map(|(_, index)| index).chain(promote.values()).collect();
-        write_calls(path, &views, &strata, &indices, truths.names)?;
+        write_calls(path, &views, &strata, &indices, truths.names, outputs.protected_beds)?;
         timer.lap("writing the calls");
     }
     Ok((report, by_region))
@@ -1124,9 +1157,9 @@ fn write_calls(
     strata: &[Stratum],
     indices: &[&RowIndex],
     names: &[String; 2],
+    protected_beds: &[FileIdentity],
 ) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+    let file = crate::io::create_output(path, protected_beds)?;
     let mut out =
         std::io::BufWriter::new(flate2::write::GzEncoder::new(file, flate2::Compression::fast()));
     let table = &views[0];
@@ -1478,7 +1511,11 @@ mod tests {
             let models = [separable_model(Task::Genotype, VariantType::Snp)];
             let policy = Policy::new(Mode::Genotyper);
             let calls = dir.path().join("calls.tsv.gz");
-            let outputs = CallOutputs { calls: Some(&calls), labelled_dir: Some(dir.path()) };
+            let outputs = CallOutputs {
+                calls: Some(&calls),
+                labelled_dir: Some(dir.path()),
+                ..CallOutputs::default()
+            };
             let (report, by_region) =
                 stratify(&first, &second, &models, &policy, truths, &regions, outputs).unwrap();
 
@@ -1799,9 +1836,9 @@ mod tests {
 
         let prefix = dir.path().join("out");
         let path = |suffix: &str| PathBuf::from(format!("{}.{suffix}", prefix.display()));
-        report.write_outcomes(&path("strata.tsv")).unwrap();
-        report.write_rates(&path("rates.tsv")).unwrap();
-        report.write_calibration(&path("calibration.tsv")).unwrap();
+        report.write_outcomes_protecting(&path("strata.tsv"), &[]).unwrap();
+        report.write_rates_protecting(&path("rates.tsv"), &[]).unwrap();
+        report.write_calibration_protecting(&path("calibration.tsv"), &[]).unwrap();
         let read = |suffix: &str| std::fs::read_to_string(path(suffix)).unwrap();
         let strata = read("strata.tsv");
         let lines: Vec<&str> = strata.lines().collect();
@@ -1934,9 +1971,9 @@ mod tests {
         assert_eq!(rows, expected);
 
         let path = |suffix: &str| dir.path().join(format!("out.regions.{suffix}"));
-        report.write_outcomes(&path("strata.tsv")).unwrap();
-        report.write_rates(&path("rates.tsv")).unwrap();
-        report.write_calibration(&path("calibration.tsv")).unwrap();
+        report.write_outcomes_protecting(&path("strata.tsv"), &[]).unwrap();
+        report.write_rates_protecting(&path("rates.tsv"), &[]).unwrap();
+        report.write_calibration_protecting(&path("calibration.tsv"), &[]).unwrap();
         let read = |suffix: &str| std::fs::read_to_string(path(suffix)).unwrap();
         let strata = read("strata.tsv");
         let lines: Vec<&str> = strata.lines().collect();

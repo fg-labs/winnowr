@@ -77,7 +77,14 @@ Options:
       --regions <NAME=PATH>...
           The region BEDs `score` would get, as NAME=PATH: calls are decided as `score` decides them
           with these. Only the not-difficult regions (notinalldifficultregions) are read; the
-          models' region features come from the table. Not reported within: see --report-region
+          models' region features come from the table. Not reported within: see --report-region.
+          Without them, regions/notinalldifficultregions.bed.gz, .bed.bgz or .bed beside the models
+          is used
+
+      --allow-region-mismatch
+          Use a feature table, or a not-difficult regions BED (given or found beside the models),
+          whose region BED digests are not the ones the models record, with a warning, rather than
+          failing. Models that record different digests of one region are still an error
 
   -o, --output <OUTPUT>
           The prefix of the reports to write (<output>.strata.tsv, <output>.rates.tsv and

@@ -1773,9 +1773,7 @@ mod tests {
             vcf_header(&[CALL_FIELDS], &["S1"])
         );
         let gzipped = dir.path().join("gz.vcf.gz");
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut encoder, text.as_bytes()).unwrap();
-        std::fs::write(&gzipped, encoder.finish().unwrap()).unwrap();
+        crate::testing::write_gzip(&gzipped, text.as_bytes());
         std::fs::write(dir.path().join("gz.vcf.gz.tbi"), &index).unwrap();
         let message = error(&gzipped, None, &["chr1"]);
         assert!(

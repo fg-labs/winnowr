@@ -214,6 +214,58 @@ fn a_test_child_that_runs_no_test_fails() {
     processes.wait_for_success(std::time::Duration::from_secs(10));
 }
 
+/// Writes `text` gzipped (one gzip member, not BGZF) to `path`.
+pub fn write_gzip(path: &Path, text: &[u8]) {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(text).unwrap();
+    std::fs::write(path, encoder.finish().unwrap()).unwrap();
+}
+
+/// Writes `text` as BGZF (blocked gzip, as `bgzip` writes it) to `path`.
+pub fn write_bgzf(path: &Path, text: &[u8]) {
+    let mut writer = bgzf::Writer::from_path(path).unwrap();
+    writer.write_all(text).unwrap();
+}
+
+/// True if the file at `path` starts with a BGZF block: a gzip member whose complete extra field
+/// has a complete `BC` subfield (wherever among its subfields), which plain gzip lacks.
+pub fn is_bgzf(path: &Path) -> bool {
+    is_bgzf_bytes(&std::fs::read(path).unwrap())
+}
+
+/// [`is_bgzf`] of the bytes of a file.
+fn is_bgzf_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || bytes[..3] != [0x1f, 0x8b, 8] || bytes[3] & 4 == 0 {
+        return false;
+    }
+    let length = usize::from(u16::from_le_bytes([bytes[10], bytes[11]]));
+    bytes
+        .get(12..12 + length)
+        .is_some_and(|extra| crate::io::has_bgzf_subfield(extra).unwrap_or(false))
+}
+
+#[test]
+fn is_bgzf_walks_the_extra_subfields_and_rejects_incomplete_ones() {
+    let bc = [b'B', b'C', 2, 0, 0x1b, 0];
+    let header = |extra: &[u8], xlen: u16| {
+        let mut bytes = vec![0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 0xff];
+        bytes.extend_from_slice(&xlen.to_le_bytes());
+        bytes.extend_from_slice(extra);
+        bytes
+    };
+    assert!(is_bgzf_bytes(&header(&bc, 6)));
+    let xy_then_bc = [&[b'X', b'Y', 0, 0][..], &bc].concat();
+    assert!(is_bgzf_bytes(&header(&xy_then_bc, 10)));
+    // BC with no subfield length or payload, or a field shorter than its XLEN.
+    assert!(!is_bgzf_bytes(&header(b"BC", 6)));
+    assert!(!is_bgzf_bytes(&header(&bc[..4], 6)));
+    assert!(!is_bgzf_bytes(&header(&[b'B', b'C', 4, 0, 0, 0], 6)));
+    // Plain gzip (no FEXTRA).
+    let mut plain = header(&[], 0);
+    plain[3] = 0;
+    assert!(!is_bgzf_bytes(&plain));
+}
+
 /// The INFO and FORMAT declarations of a HaplotypeCaller VCF, without the raw annotations.
 pub const CALL_FIELDS: &str = "\
 ##FILTER=<ID=PASS,Description=\"All filters passed\">
@@ -539,6 +591,8 @@ pub fn separable_model_of(
             .then(crate::pileup::PileupOptions::default),
         feature_source: crate::feature_source::FeatureSource::Gvcf,
         alignment: None,
+        region_digests: std::collections::BTreeMap::new(),
+        policy_region_digests: std::collections::BTreeMap::new(),
         winnowr_version: env!("CARGO_PKG_VERSION").to_string(),
         xgboost_version: "test".to_string(),
     };
@@ -589,4 +643,13 @@ fn declared_bwa_fixtures_are_explicit_without_certifying_incomplete_or_tags_only
 /// Explicitly declared complete fixture settings for bwa-mem3 with `--alt-project alt_project`.
 pub fn bwa_provenance(alt_project: &str) -> crate::alignment_provenance::AlignmentProvenance {
     provenance(&[("aligner", "bwa-mem3"), ("alt-project", alt_project)], false)
+}
+
+/// The directories of model files `paths` as given (their parents), for a
+/// [`crate::model_set::ModelSet::given_dirs`] of models whose directories need no resolving.
+pub fn given_dirs(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    paths
+        .iter()
+        .map(|path| path.parent().map(std::path::Path::to_path_buf).unwrap_or_default())
+        .collect()
 }

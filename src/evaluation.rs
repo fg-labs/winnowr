@@ -5,7 +5,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::common::NEVER;
-use crate::io::write_tsv;
 use crate::labels::Label;
 use crate::numeric::metric_float;
 use crate::policy::withhold_promotions;
@@ -364,13 +363,22 @@ pub const POLICY_METRIC_COLUMNS: [&str; 25] = [
     "regenotypes_broke_tp",
 ];
 
-/// Writes metrics as a tab-separated file with a header line.
+/// Writes metrics, rejecting an opened destination that is a consumed policy BED.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be written.
-pub fn write_policy_metrics(path: &Path, metrics: &[PolicyMetric]) -> Result<()> {
-    write_tsv(path, &POLICY_METRIC_COLUMNS, metrics.iter().map(PolicyMetric::formatted_values))
+/// Returns an error if the destination is a protected BED or cannot be written.
+pub fn write_policy_metrics_protecting(
+    path: &Path,
+    metrics: &[PolicyMetric],
+    protected_beds: &[crate::io::FileIdentity],
+) -> Result<()> {
+    crate::io::write_tsv_protecting(
+        path,
+        &POLICY_METRIC_COLUMNS,
+        metrics.iter().map(PolicyMetric::formatted_values),
+        protected_beds,
+    )
 }
 
 #[cfg(test)]
@@ -628,7 +636,7 @@ mod tests {
             .unwrap();
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("metrics.tsv");
-            write_policy_metrics(&path, &metrics).unwrap();
+            write_policy_metrics_protecting(&path, &metrics, &[]).unwrap();
             let text = std::fs::read_to_string(&path).unwrap();
             let lines: Vec<&str> = text.lines().collect();
             assert_eq!(lines.len(), 1 + metrics.len());

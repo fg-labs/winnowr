@@ -6,7 +6,7 @@
 //! as Int64, flags as Boolean, and every other column as Float64 with NaN for missing values.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -43,6 +43,7 @@ use crate::features::{DerivedFeatures, DpNormDivisor, region_feature};
 use crate::neighbourhood::NEIGHBOURHOOD_FEATURES;
 use crate::pileup::PileupOptions;
 use crate::raw_records::RawRecord;
+use crate::regions::RegionDigest;
 use crate::strlen::StrlenOptions;
 
 /// A raw numeric column: its name, and its value in a record.
@@ -178,6 +179,10 @@ pub struct FeatureTableInfo {
     /// then, so that such tables are as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<AlignmentProvenance>,
+    /// The digest of each region BED flagged, by name (see [`RegionDigest`]). Empty for tables
+    /// written before digests were recorded, not written then, so that such tables are as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub region_digests: BTreeMap<String, RegionDigest>,
 }
 
 /// The part of the genome a restricted table's calls and truth FN counts are of.
@@ -572,7 +577,19 @@ impl FeatureTable {
     ///
     /// Returns an error if the file cannot be written.
     pub fn write_parquet<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
+        self.write_parquet_protecting(path.as_ref(), &[])
+    }
+
+    /// Writes the same zstd-compressed table, protecting consumed BEDs by opened file identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the opened destination is a protected BED or cannot be written.
+    pub(crate) fn write_parquet_protecting(
+        &self,
+        path: &Path,
+        protected_beds: &[crate::io::FileIdentity],
+    ) -> Result<()> {
         let metadata = serde_json::to_string(&self.info).context("failed to encode metadata")?;
         let schema = self
             .batch
@@ -581,8 +598,7 @@ impl FeatureTable {
             .clone()
             .with_metadata(HashMap::from([(METADATA_KEY.to_string(), metadata)]));
         let batch = self.batch.clone().with_schema(Arc::new(schema))?;
-        let file =
-            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+        let file = crate::io::create_output(path, protected_beds)?;
         let properties = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
             .build();
@@ -1314,6 +1330,26 @@ mod tests {
         let unknown = json.replace(r#""feature_source":"vcf""#, r#""feature_source":"bam""#);
         let error = serde_json::from_str::<FeatureTableInfo>(&unknown).unwrap_err().to_string();
         assert!(error.contains("unknown feature source 'bam'"), "{error}");
+    }
+
+    /// A table without region digests is written as before they were recorded; with them, it
+    /// round trips.
+    #[test]
+    fn region_digests_are_recorded_when_known() {
+        let unknown = info_with_divisor(None);
+        let json = serde_json::to_string(&unknown).unwrap();
+        assert!(!json.contains("region_digests"), "{json}");
+        let digest = RegionDigest { sha256: "ab".repeat(32), intervals: 2, bases: 30 };
+        let known = FeatureTableInfo {
+            region_digests: [("segdups".to_string(), digest)].into_iter().collect(),
+            ..unknown
+        };
+        let json = serde_json::to_string(&known).unwrap();
+        assert!(json.contains(r#""region_digests":{"segdups":{"sha256":"abab"#), "{json}");
+        assert_eq!(serde_json::from_str::<FeatureTableInfo>(&json).unwrap(), known);
+        let bad = json.replace(&"ab".repeat(32), "AB");
+        let error = serde_json::from_str::<FeatureTableInfo>(&bad).unwrap_err().to_string();
+        assert!(error.starts_with("sha256 must be 64 lower-case hexadecimal digits"), "{error}");
     }
 
     /// A table of unknown alignment provenance is written as before it was recorded; a known

@@ -17,6 +17,7 @@ use crate::model::{
     predict_probabilities, to_matrix,
 };
 use crate::pileup::PileupOptions;
+use crate::regions::RegionDigest;
 use crate::rescore::{Mode, Probabilities};
 use crate::samples::{PromoteSampleCalls, SampleCalls};
 use crate::strlen::StrlenOptions;
@@ -410,6 +411,10 @@ pub struct TrainingSpec<'a> {
     pub feature_source: FeatureSource,
     /// How the training tables' reads were aligned, if known.
     pub alignment: Option<AlignmentProvenance>,
+    /// The digest of each region BED the features use, as the training tables record it.
+    pub region_digests: BTreeMap<String, RegionDigest>,
+    /// The digest of each region BED of the policy (`--policy-regions`).
+    pub policy_region_digests: BTreeMap<String, RegionDigest>,
 }
 
 /// What a cross-validation fold holds out.
@@ -825,6 +830,8 @@ fn model_info(
         pileup_settings: spec.pileup_settings,
         feature_source: spec.feature_source,
         alignment: spec.alignment.clone(),
+        region_digests: spec.region_digests.clone(),
+        policy_region_digests: spec.policy_region_digests.clone(),
         winnowr_version: VERSION.clone(),
         xgboost_version: XGBOOST_VERSION.clone(),
     }
@@ -1059,6 +1066,8 @@ mod tests {
             pileup_settings: None,
             feature_source: FeatureSource::Gvcf,
             alignment: None,
+            region_digests: BTreeMap::new(),
+            policy_region_digests: BTreeMap::new(),
         }
     }
 
@@ -1149,6 +1158,8 @@ mod tests {
             pileup_settings: pileup,
             feature_source: FeatureSource::Gvcf,
             alignment: None,
+            region_digests: BTreeMap::new(),
+            policy_region_digests: BTreeMap::new(),
             ..toy_spec(&features, threads(1))
         };
         let thresholds =

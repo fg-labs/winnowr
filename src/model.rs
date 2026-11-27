@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
@@ -24,6 +24,7 @@ use crate::feature_source::FeatureSource;
 use crate::labels::{Label, PromoteLabel, UnfixableFlips};
 use crate::pileup::PileupOptions;
 use crate::pileup_features::PILEUP_FEATURES;
+use crate::regions::RegionDigest;
 use crate::rescore::{Mode, Probabilities};
 use crate::strlen::StrlenOptions;
 use crate::stutter::StutterModel;
@@ -211,6 +212,16 @@ pub struct ModelInfo {
     /// such models are as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<AlignmentProvenance>,
+    /// The digest of each region BED the features use, by name (of `region_names`), as the
+    /// training tables record it: `score` checks the BEDs it is given or finds against them.
+    /// Empty when unknown, not written then, so that such models are as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub region_digests: BTreeMap<String, RegionDigest>,
+    /// The digest of each region BED of the decision policy the model was trained to be scored
+    /// with (`train --policy-regions`, today only the not-difficult regions), by name. Empty when
+    /// none was given, not written then.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub policy_region_digests: BTreeMap<String, RegionDigest>,
     /// The winnowr version that trained the model.
     pub winnowr_version: String,
     /// The XGBoost version that trained the model.
@@ -334,18 +345,27 @@ impl ModelInfo {
         Ok((info, booster_json))
     }
 
-    /// Reads the information of a model file. Its booster is scanned past, never parsed or loaded
-    /// (see [`ModelInfo::from_model_json`]), so it is not checked.
+    /// Reads the information of the model file `path` (see [`ModelInfo::read_file`]).
     ///
     /// # Errors
     ///
-    /// Returns an error if the path does not end in `.winnowr.json`, or the file cannot be read or
-    /// fails [`ModelInfo::from_model_json`].
+    /// See [`ModelInfo::read_file`].
+    #[cfg(test)]
     pub fn read<P: AsRef<Path>>(path: P) -> Result<ModelInfo> {
-        let path = path.as_ref();
-        let text = read_model_file(path)?;
+        ModelInfo::read_file(&ModelFile::resolve(path.as_ref()))
+    }
+
+    /// Reads the information of a model file, from the file it resolved to. Its booster is scanned
+    /// past, never parsed or loaded (see [`ModelInfo::from_model_json`]), so it is not checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path given does not end in `.winnowr.json`, or the file cannot be
+    /// read or fails [`ModelInfo::from_model_json`].
+    pub fn read_file(file: &ModelFile) -> Result<ModelInfo> {
+        let text = file.read_text()?;
         let (info, _) = ModelInfo::from_model_json(&text)
-            .with_context(|| format!("failed to load model {}", path.display()))?;
+            .with_context(|| format!("failed to load model {}", file.path.display()))?;
         Ok(info)
     }
 
@@ -391,32 +411,99 @@ impl ModelWarnings {
     }
 }
 
-/// The text of a model file, after checking its name ends in [`MODEL_SUFFIX`].
-///
-/// # Errors
-///
-/// Returns an error if the path does not end in `.winnowr.json`, or the file cannot be read.
-pub fn read_model_file(path: &Path) -> Result<String> {
-    read_model_file_with_metadata(path).map(|(text, _)| text)
+/// A model file: the path given, and the file and the directory it resolved to (with their
+/// symlinks followed), resolved once. Pipelines stage models as symlinks, which may be retargeted
+/// while a command runs; reading the model from, and looking for its region BEDs beside, the one
+/// resolution keeps the model and its BEDs of one bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFile {
+    /// The path given, which messages name.
+    pub path: PathBuf,
+    /// The file it resolved to: its canonical path, or the unresolved path for diagnostics only
+    /// if resolution failed (reading then fails without following that path later).
+    pub resolved: PathBuf,
+    /// The directory of the path given, resolved with it: its canonical path. If it cannot be
+    /// resolved, this holds the given directory for diagnostics and reading the model fails.
+    pub given_dir: PathBuf,
+    /// A failure to resolve the parent or filename: never retry through unresolved paths.
+    resolution_error: Option<String>,
 }
 
-/// The model text and metadata from the same open file, so a later path replacement cannot
-/// hide the identity of the model that was read.
-///
-/// # Errors
-///
-/// Returns the errors of [`read_model_file`], or an error reading the opened file's metadata.
-pub fn read_model_file_with_metadata(path: &Path) -> Result<(String, fs::Metadata)> {
-    use std::io::Read as _;
-    if !path.to_string_lossy().ends_with(MODEL_SUFFIX) {
-        bail!("a model file must end in {MODEL_SUFFIX}: {}", path.display());
+impl ModelFile {
+    /// Resolves the model file `path`.
+    #[must_use]
+    pub fn resolve(path: &Path) -> Self {
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
+        // The directory of a bare file name is the working directory, which `""` does not name.
+        let named = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let given_dir = match named.canonicalize() {
+            Ok(dir) => dir,
+            Err(error) => {
+                return ModelFile {
+                    path: path.to_path_buf(),
+                    resolved: path.to_path_buf(),
+                    given_dir: dir.to_path_buf(),
+                    resolution_error: Some(format!(
+                        "cannot resolve model parent directory {}: {error}",
+                        named.display()
+                    )),
+                };
+            }
+        };
+        // Resolve the filename through the captured parent so retargeting a staging directory
+        // cannot pair a model from one bundle with the BEDs of another.
+        let captured =
+            path.file_name().map_or_else(|| path.to_path_buf(), |name| given_dir.join(name));
+        let (resolved, resolution_error) = match captured.canonicalize() {
+            Ok(resolved) => (resolved, None),
+            Err(error) => {
+                let reason = format!("cannot resolve model file {}: {error}", captured.display());
+                (captured, Some(reason))
+            }
+        };
+        ModelFile { path: path.to_path_buf(), resolved, given_dir, resolution_error }
     }
-    let context = || format!("failed to read model {}", path.display());
-    let mut file = fs::File::open(path).with_context(context)?;
-    let metadata = file.metadata().with_context(context)?;
-    let mut text = String::new();
-    file.read_to_string(&mut text).with_context(context)?;
-    Ok((text, metadata))
+
+    /// Resolves each of the model files `paths`, in order.
+    #[must_use]
+    pub fn resolve_all(paths: &[PathBuf]) -> Vec<Self> {
+        paths.iter().map(|path| ModelFile::resolve(path)).collect()
+    }
+
+    /// The text of the model file, read from the file it resolved to, after checking the path given
+    /// ends in [`MODEL_SUFFIX`] (the file a symlink names need not).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the path given if it does not end in `.winnowr.json`, or the file
+    /// cannot be read.
+    pub fn read_text(&self) -> Result<String> {
+        self.read_text_with_metadata().map(|(text, _)| text)
+    }
+
+    /// The text and metadata of the model file, from the same open file, so a later path
+    /// replacement cannot hide the identity of the model that was read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`ModelFile::read_text`], or an error reading the opened file's
+    /// metadata.
+    pub fn read_text_with_metadata(&self) -> Result<(String, fs::Metadata)> {
+        use std::io::Read as _;
+        let path = &self.path;
+        if !path.to_string_lossy().ends_with(MODEL_SUFFIX) {
+            bail!("a model file must end in {MODEL_SUFFIX}: {}", path.display());
+        }
+        if let Some(error) = &self.resolution_error {
+            bail!("failed to read model {}: {error}", path.display());
+        }
+        let context = || format!("failed to read model {}", path.display());
+        let mut file = fs::File::open(&self.resolved).with_context(context)?;
+        let metadata = file.metadata().with_context(context)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text).with_context(context)?;
+        Ok((text, metadata))
+    }
 }
 
 /// A trained booster with its model information.
@@ -429,26 +516,36 @@ pub struct WinnowrModel {
 }
 
 impl WinnowrModel {
-    /// Loads a model file, predicting with at most `threads` threads. Its information is read as
-    /// [`ModelInfo::read`] reads it; [`ModelInfo::warnings`] are not logged.
+    /// Loads the model file `path` (see [`WinnowrModel::load_file`]).
     ///
     /// # Errors
     ///
-    /// Returns an error if the path does not end in `.winnowr.json`, the file cannot be read, is
-    /// not of a supported format version, has unknown or invalid fields, or its booster does not
-    /// load or does not have the model's features and classes.
+    /// See [`WinnowrModel::load_file`].
+    #[cfg(test)]
     pub fn load<P: AsRef<Path>>(path: P, threads: NonZeroUsize) -> Result<Self> {
-        let path = path.as_ref();
-        let text = read_model_file(path)?;
+        Self::load_file(&ModelFile::resolve(path.as_ref()), threads)
+    }
+
+    /// Loads a model file, from the file it resolved to, predicting with at most `threads`
+    /// threads. Its information is read as [`ModelInfo::read_file`] reads it;
+    /// [`ModelInfo::warnings`] are not logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path given does not end in `.winnowr.json`, the file cannot be
+    /// read, is not of a supported format version, has unknown or invalid fields, or its booster
+    /// does not load or does not have the model's features and classes.
+    pub fn load_file(file: &ModelFile, threads: NonZeroUsize) -> Result<Self> {
+        let text = file.read_text()?;
         Self::from_json(&text, threads)
-            .with_context(|| format!("failed to load model {}", path.display()))
+            .with_context(|| format!("failed to load model {}", file.path.display()))
     }
 
     /// A model from the text of a model file.
     ///
     /// # Errors
     ///
-    /// See [`WinnowrModel::load`].
+    /// See [`WinnowrModel::load_file`].
     pub fn from_json(text: &str, threads: NonZeroUsize) -> Result<Self> {
         let (info, booster_json) = ModelInfo::from_model_json(text)?;
         WinnowrModel::from_parts(info, booster_json, threads)
@@ -828,6 +925,82 @@ mod tests {
 
     const THREADS: NonZeroUsize = NonZeroUsize::new(1).expect("1 is non-zero");
 
+    /// Even a missing filename stays anchored to the captured staging directory, rather than
+    /// becoming readable from a different bundle after that directory symlink is retargeted.
+    #[cfg(unix)]
+    #[test]
+    fn an_unresolved_model_filename_keeps_its_captured_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let staged = dir.path().join("staged");
+        std::os::unix::fs::symlink(&a, &staged).unwrap();
+        let model = ModelFile::resolve(&staged.join("model.winnowr.json"));
+        fs::write(b.join("model.winnowr.json"), "another bundle").unwrap();
+        fs::remove_file(&staged).unwrap();
+        std::os::unix::fs::symlink(&b, &staged).unwrap();
+        assert!(model.read_text().is_err(), "missing model was read from the new bundle");
+        assert_eq!(model.resolved, a.canonicalize().unwrap().join("model.winnowr.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unresolved_model_parent_never_becomes_readable_later() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+        let staged = dir.path().join("staged");
+        std::os::unix::fs::symlink(&missing, &staged).unwrap();
+        let file = ModelFile::resolve(&staged.join("model.winnowr.json"));
+        fs::create_dir(&missing).unwrap();
+        fs::write(missing.join("model.winnowr.json"), "new bundle").unwrap();
+        assert!(file.read_text().is_err(), "an unresolved parent was followed later");
+    }
+
+    /// A failed filename resolution stays a failure even if the target is published later.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::published_later(false)]
+    #[case::retargeted(true)]
+    fn review_unresolved_model_filename_cannot_be_followed_later(#[case] retargeted: bool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let staged = dir.path().join("stage");
+        fs::create_dir(&staged).unwrap();
+        let missing = dir.path().join("unpublished.json");
+        let path = staged.join("model.winnowr.json");
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+        let file = ModelFile::resolve(&path);
+        if retargeted {
+            let other = dir.path().join("another-bundle.json");
+            fs::write(&other, "other model").unwrap();
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(other, &path).unwrap();
+        } else {
+            fs::write(&missing, "newly published model").unwrap();
+        }
+        let error = file.read_text().unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("cannot resolve model file"), "{error}");
+    }
+
+    /// A captured directory still follows a symlink on the model filename itself.
+    #[cfg(unix)]
+    #[test]
+    fn resolving_a_model_follows_its_filename_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target.json");
+        fs::write(&target, "model text").unwrap();
+        let staged = dir.path().join("staged");
+        fs::create_dir(&staged).unwrap();
+        let path = staged.join("model.winnowr.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let file = ModelFile::resolve(&path);
+        assert_eq!(file.given_dir, staged.canonicalize().unwrap());
+        assert_eq!(file.resolved, target.canonicalize().unwrap());
+        assert_eq!(file.read_text().unwrap(), "model text");
+    }
+
     /// A table with Float64 columns.
     fn table(columns: &[(&str, Vec<f64>)]) -> FeatureTable {
         let fields: Vec<Field> =
@@ -882,6 +1055,8 @@ mod tests {
             pileup_settings: None,
             feature_source: FeatureSource::Gvcf,
             alignment: None,
+            region_digests: BTreeMap::new(),
+            policy_region_digests: BTreeMap::new(),
             winnowr_version: crate::version::VERSION.clone(),
             xgboost_version: "3.4.2".to_string(),
         }
@@ -1034,6 +1209,30 @@ mod tests {
         let unknown = text.replace(r#""feature_source":"vcf""#, r#""feature_source":"bam""#);
         let error = format!("{:#}", WinnowrModel::from_json(&unknown, THREADS).unwrap_err());
         assert!(error.contains("unknown feature source 'bam'"), "{error}");
+    }
+
+    /// A model without region digests is written as before they were recorded; with them (of
+    /// its features' regions and of the policy's), it round trips; a malformed digest is not
+    /// read.
+    #[test]
+    fn models_record_their_region_digests_when_known() {
+        let features = ["a", "b"];
+        let plain = WinnowrModel { booster: booster(&features, 3), info: genotype_info(&features) };
+        let text = plain.to_json().unwrap();
+        assert!(!text.contains("region_digests"), "{text}");
+        let mut info = genotype_info(&features);
+        let digest = RegionDigest { sha256: "ab".repeat(32), intervals: 2, bases: 30 };
+        info.region_digests = [("segdups".to_string(), digest.clone())].into_iter().collect();
+        info.policy_region_digests =
+            [("notinalldifficultregions".to_string(), digest)].into_iter().collect();
+        let known = WinnowrModel { booster: booster(&features, 3), info };
+        let text = known.to_json().unwrap();
+        assert!(text.contains(r#""region_digests":{"segdups":"#), "{text}");
+        assert!(text.contains(r#""policy_region_digests":{"notinalldifficultregions":"#));
+        assert_eq!(WinnowrModel::from_json(&text, THREADS).unwrap().info, known.info);
+        let bad = text.replace(&"ab".repeat(32), "not-a-digest");
+        let error = format!("{:#}", WinnowrModel::from_json(&bad, THREADS).unwrap_err());
+        assert!(error.contains("sha256 must be 64 lower-case hexadecimal digits"), "{error}");
     }
 
     /// A model of unknown alignment provenance is written without the field, as before it was

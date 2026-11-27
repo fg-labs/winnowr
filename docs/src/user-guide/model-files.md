@@ -25,6 +25,8 @@ information and, under `booster`, the XGBoost booster in XGBoost's JSON format. 
 | `strlen_settings`    | the read settings of the repeat-length evidence it was trained on              |
 | `pileup_settings`    | the settings of the pileup evidence it was trained on                          |
 | `feature_source`     | `vcf` for a model trained on features derived from the VCF, `alignments:` and the read settings for one trained on features measured from the reads too (see [Feature sources](feature-sources.md)); absent for `gvcf` |
+| `region_digests`     | the digest of each region BED the features use, by name, as the training tables record it: an object of `sha256` (of the merged intervals as text), `intervals` and `bases`; absent when unknown |
+| `policy_region_digests` | the digest of each region BED of the decision policy (`train --policy-regions`, today only `notinalldifficultregions`); absent when none was given |
 | `alignment`          | how the training reads were aligned: an object of tags (e.g. `{"aligner": "bwa-mem3", "alt-project": "primary", ...}`, see [Alignment provenance](alignment-provenance.md)); absent when unknown |
 | `winnowr_version`    | the winnowr version that trained it                                            |
 | `xgboost_version`    | the XGBoost version that trained it                                            |
@@ -46,8 +48,15 @@ set of models, without scoring, and reports every problem. When it loads a model
   the VCF's header or has another length there; `evaluate` and `stratify` stop with an error when a
   contig the feature table records has another length than in the model. A model that records no
   reference contigs is not checked, with a warning.
-- **Region names.** `score` stops with an error when a region name the model uses is not given to
-  `--regions`.
+- **Region names.** `score` stops with an error when a region name the model uses is neither
+  given to `--regions` nor found beside the models as `regions/NAME.bed.gz`, `.bed.bgz` or `.bed`.
+- **Region BEDs.** `score` checks each region BED it uses (given or found) against the model's
+  `region_digests` and `policy_region_digests`: a different BED is an error, unless
+  `--allow-region-mismatch` (which does not cover models recording different digests of one
+  region: an error). The digest is of the merged intervals, so a BED compressed, sorted or
+  split otherwise is the same BED. A model that records none (as models of older winnowr versions)
+  is not checked; older winnowr versions refuse a model that records digests. `evaluate` and
+  `stratify` compare the feature table's digests with the model's.
 - **Evidence settings.** A model with repeat-length features scores only strlen evidence measured
   with its `strlen_settings`, and a model with pileup features only pileup evidence measured with
   its `pileup_settings`. Models that record no strlen settings are read as measured with

@@ -28,10 +28,39 @@ reads it scores were aligned (from the header of `--alignments` and the `--strle
 tables, with `--alignment-tags` applied over each, which must then agree, or `--alignment-tags`
 alone) and warns where they differ; `--strict-provenance` makes that an error. See [Alignment provenance](alignment-provenance.md).
 
-`--regions` must name every region BED the models were trained with, under the same names. It
-also takes the not-difficult regions, `notinalldifficultregions=PATH`, described below. Models with
-repeat-length or pileup features need `--strlen` or `--pileup` tables, or `--alignments` and
-`--reference` to measure the reads while scoring (see
+`score` needs a BED for every region the models use as a feature, under the same names. It also
+reads the not-difficult regions (`notinalldifficultregions`, described below) when the decision
+policy uses them: for an indel genotype model's outside-indel drop threshold, or to withhold actions
+(`--abstain-actions` other than `none`). For each, it uses the BED `--regions NAME=PATH` gives, else
+the one beside the models: `regions/NAME.bed.gz`, `regions/NAME.bed.bgz` or `regions/NAME.bed` in
+the directory of a model file, as given or with its symlinks followed. So a directory of models and
+their region BEDs scores with no `--regions`:
+
+```text
+models/
+  snp.winnowr.json
+  indel.winnowr.json
+  regions/
+    segdups.bed.gz
+    notinalldifficultregions.bed.gz
+```
+
+Models record a digest of each region BED they were trained with (see [Model
+files](model-files.md)), and `score` checks the BED it uses, given or found, against it: a different
+BED is an error naming it (`--allow-region-mismatch` makes it a warning), and a BED no model records
+a digest of is used with a warning. Models that record different digests of one region are an error
+even with `--allow-region-mismatch`: no BED is the one all of them were trained with. A model's
+region name that is not a file name (e.g. holds a `/`) is not looked for beside the models. The
+not-difficult regions used for the policy are checked against the policy digest recorded by
+`train --policy-regions`; without it, their policy use is unchecked. If a model also uses them as a
+feature, their feature use is checked against its recorded feature digest independently of the
+policy record. A region a model uses as a feature that is neither given nor found is an
+error naming the directories looked in. The not-difficult regions are optional unless a model uses
+them as a feature: without them, withholding actions is an error, found before any reads are
+measured, and otherwise `score` warns and drops indel calls at the model's threshold everywhere (see
+below). A run of SNP models alone that withholds no actions reads no not-difficult regions unless a
+model uses them as a feature. Models with repeat-length or pileup features need `--strlen` or
+`--pileup` tables, or `--alignments` and `--reference` to measure the reads while scoring (see
 [Repeat-length features](repeat-length.md) and [Pileup features](pileup.md)).
 
 The models given to one run must share a feature source, which decides where the features of

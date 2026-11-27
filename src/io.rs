@@ -67,6 +67,120 @@ pub fn open_text<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
     Ok(Box::new(BufReader::new(reader)))
 }
 
+/// The device and inode of an opened regular input file, independent of its later pathname.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    /// Identifies a regular file from its handle's metadata; streams have no file identity.
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            metadata.is_file().then(|| Self { device: metadata.dev(), inode: metadata.ino() })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            None
+        }
+    }
+
+    /// True if `path` currently names this regular file, following symlinks.
+    pub(crate) fn matches_path(&self, path: &Path) -> bool {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|metadata| Self::from_metadata(&metadata))
+            .is_some_and(|identity| identity == *self)
+    }
+}
+
+/// Opens text and returns the identity of the regular file supplying its bytes, if any.
+///
+/// Like [`open_text`], accepts plain text, gzip, BGZF (with or without its EOF block), and pipes.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, its metadata cannot be read, or its compression
+/// prefix cannot be read. Further read or decompression errors are reported by the reader.
+pub fn open_text_with_identity<P: AsRef<Path>>(
+    path: P,
+) -> Result<(Box<dyn BufRead>, Option<FileIdentity>)> {
+    let path = path.as_ref();
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    text_reader_with_identity(file, path)
+}
+
+/// Opens a bundled text input without waiting for a stream producer, rejecting nonregular
+/// handles before reading even the compression prefix. Explicit streams use
+/// [`open_text_with_identity`] instead.
+///
+/// # Errors
+///
+/// Returns an error if opening, metadata inspection, or prefix reading fails, or the opened
+/// handle is not a regular file.
+pub fn open_regular_text_with_identity<P: AsRef<Path>>(
+    path: P,
+) -> Result<(Box<dyn BufRead>, Option<FileIdentity>)> {
+    let path = path.as_ref();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata().with_context(|| format!("failed to inspect {}", path.display()))?.is_file(),
+        "bundled region BED {} is not a regular file",
+        path.display()
+    );
+    text_reader_with_identity(file, path)
+}
+
+/// Non-opening equality for existing physical inputs (including FIFOs) and repeated missing paths.
+pub fn same_input_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return (a.dev(), a.ino()) == (b.dev(), b.ino());
+        }
+    }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Identifies and decompresses the same opened handle without reopening or seeking it.
+/// `path` is used only for error messages.
+fn text_reader_with_identity(
+    mut file: File,
+    path: &Path,
+) -> Result<(Box<dyn BufRead>, Option<FileIdentity>)> {
+    let context = || format!("failed to read {}", path.display());
+    let identity = FileIdentity::from_metadata(&file.metadata().with_context(context)?);
+    // A pipe may return only one byte per read. Collect both magic bytes, then replay them so
+    // neither plain nor compressed readers lose their prefix, even on an empty or one-byte input.
+    let mut prefix = Vec::with_capacity(2);
+    Read::by_ref(&mut file).take(2).read_to_end(&mut prefix).with_context(context)?;
+    let gzip = prefix == [0x1f, 0x8b];
+    let reader = std::io::Cursor::new(prefix).chain(file);
+    let reader: Box<dyn BufRead> = if gzip {
+        // BGZF and concatenated gzip are both sequences of gzip members. Unlike winnowr's own
+        // tables, external BEDs remain readable when their producer omits the BGZF EOF marker.
+        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(reader)))
+    } else {
+        Box::new(BufReader::new(reader))
+    };
+    Ok((reader, identity))
+}
+
 /// Opens a table that winnowr wrote, as [`open_text`] does, but rejects a BGZF file without the
 /// end-of-file block: winnowr always writes it, so the table was truncated (e.g. a killed run).
 ///
@@ -161,23 +275,14 @@ fn decompressing_reader(mut file: File, path: &Path) -> Result<Box<dyn BufRead>>
     let prefix_length = usize::try_from(length.min(prefix.len() as u64))?;
     file.read_exact(&mut prefix[..prefix_length]).with_context(context)?;
     let gzip = prefix[..2] == [0x1f, 0x8b];
-    let mut bgzf = false;
-    if prefix_length == prefix.len() && gzip && prefix[2] == 8 && prefix[3] & 4 != 0 {
+    let bgzf = if prefix_length == prefix.len() && gzip && prefix[2] == 8 && prefix[3] & 4 != 0 {
         let mut extra = vec![0; usize::from(u16::from_le_bytes([prefix[10], prefix[11]]))];
         file.read_exact(&mut extra).with_context(context)?;
-        let mut rest = extra.as_slice();
-        while rest.len() >= 4 {
-            let size = usize::from(u16::from_le_bytes([rest[2], rest[3]]));
-            if size > rest.len() - 4 {
-                anyhow::bail!("{} has a malformed gzip extra field", path.display());
-            }
-            bgzf |= rest[..2] == *b"BC" && size == 2;
-            rest = &rest[4 + size..];
-        }
-        if !rest.is_empty() {
-            anyhow::bail!("{} has a malformed gzip extra field", path.display());
-        }
-    }
+        has_bgzf_subfield(&extra)
+            .with_context(|| format!("{} has a malformed gzip extra field", path.display()))?
+    } else {
+        false
+    };
     if bgzf {
         let eof_length = BGZF_EOF.len() as u64;
         let mut tail = [0u8; BGZF_EOF.len()];
@@ -200,6 +305,30 @@ fn decompressing_reader(mut file: File, path: &Path) -> Result<Box<dyn BufRead>>
     } else {
         Box::new(BufReader::new(file))
     })
+}
+
+/// True if a gzip extra field (`extra`, its `XLEN` bytes) has a complete BGZF `BC` subfield,
+/// walking each subfield, as other subfields may precede `BC` (SAM/BAM spec 4.1).
+///
+/// # Errors
+///
+/// Returns an error if a subfield overruns the field, or the field ends inside a subfield's
+/// four-byte header.
+pub fn has_bgzf_subfield(extra: &[u8]) -> Result<bool> {
+    let mut bgzf = false;
+    let mut rest = extra;
+    while rest.len() >= 4 {
+        let size = usize::from(u16::from_le_bytes([rest[2], rest[3]]));
+        if size > rest.len() - 4 {
+            anyhow::bail!("a gzip extra subfield overruns the field");
+        }
+        bgzf |= rest[..2] == *b"BC" && size == 2;
+        rest = &rest[4 + size..];
+    }
+    if !rest.is_empty() {
+        anyhow::bail!("the gzip extra field ends inside a subfield header");
+    }
+    Ok(bgzf)
 }
 
 /// True if `path` is a regular file: not, e.g., a pipe (process substitution), which reading
@@ -252,14 +381,18 @@ fn lacks_bgzf_eof_with<F: FnOnce()>(path: &Path, before_open: F) -> Result<bool>
     Ok(check().unwrap_or(false))
 }
 
-/// Writes a tab-separated file with a header line.
-pub fn write_tsv<I: Iterator<Item = Vec<String>>>(
+/// Writes a TSV without overwriting any of the regular BED files actually consumed.
+///
+/// # Errors
+///
+/// Returns an error if the opened output is a protected BED or cannot be written.
+pub fn write_tsv_protecting<I: Iterator<Item = Vec<String>>>(
     path: &Path,
     header: &[&str],
     rows: I,
+    protected_beds: &[FileIdentity],
 ) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+    let file = create_output(path, protected_beds)?;
     let mut out = std::io::BufWriter::new(file);
     writeln!(out, "{}", header.join("\t"))?;
     for row in rows {
@@ -267,6 +400,40 @@ pub fn write_tsv<I: Iterator<Item = Vec<String>>>(
         writeln!(out, "{}", row.join("\t"))?;
     }
     out.flush().with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Opens an output without truncation, checks its handle against consumed BEDs, then truncates
+/// that same handle. Path changes cannot redirect the subsequent write to a protected BED.
+///
+/// # Errors
+///
+/// Returns an error before truncation if the opened file is a protected BED, or if it cannot be
+/// opened, inspected or truncated. Without protected BEDs, preserves ordinary file creation.
+pub fn create_output(path: &Path, protected_beds: &[FileIdentity]) -> Result<File> {
+    let context = || format!("failed to create {}", path.display());
+    if protected_beds.is_empty() {
+        return File::create(path).with_context(context);
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(context)?;
+    let metadata = file.metadata().with_context(context)?;
+    if FileIdentity::from_metadata(&metadata)
+        .is_some_and(|identity| protected_beds.contains(&identity))
+    {
+        anyhow::bail!(
+            "the output {} is the input region BED; write to another path",
+            path.display()
+        );
+    }
+    // Streams have no previous contents to truncate and remain valid output destinations.
+    if metadata.is_file() {
+        file.set_len(0).with_context(context)?;
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -278,6 +445,30 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_output_writes_the_checked_handle_after_its_path_changes() {
+        let dir = TempDir::new().unwrap();
+        let bed = dir.path().join("input.bed");
+        let output = dir.path().join("report.tsv");
+        let moved = dir.path().join("moved.tsv");
+        let original = b"chr1\t0\t100\n";
+        std::fs::write(&bed, original).unwrap();
+        let (_, identity) = open_text_with_identity(&bed).unwrap();
+        let protected = [identity.unwrap()];
+        std::fs::write(&output, b"old report contents").unwrap();
+        let mut file = create_output(&output, &protected).unwrap();
+        std::fs::rename(&output, &moved).unwrap();
+        std::os::unix::fs::symlink(&bed, &output).unwrap();
+        file.write_all(b"new report\n").unwrap();
+        file.flush().unwrap();
+        assert_eq!(std::fs::read(&bed).unwrap(), original);
+        assert_eq!(std::fs::read(&moved).unwrap(), b"new report\n");
+        let error = create_output(&output, &protected).unwrap_err().to_string();
+        assert!(error.contains("is the input region BED"), "{error}");
+        assert_eq!(std::fs::read(&bed).unwrap(), original);
+    }
 
     /// The BGZF block(s) of `text`, without the end-of-file block, as htslib writes them.
     fn bgzf_block(text: &[u8]) -> Vec<u8> {
@@ -312,6 +503,68 @@ mod tests {
         assert_eq!(read_text(&dir, &gzip(b"a\nb\n")), b"a\nb\n");
         let members = [bgzf_block(b"a\n"), bgzf_block(b"b\n"), BGZF_EOF.to_vec()].concat();
         assert_eq!(read_text(&dir, &members), b"a\nb\n");
+    }
+
+    #[test]
+    fn text_identity_reader_preserves_empty_short_and_long_inputs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("input.bed");
+        let long = b"chr1\t0\t5\n".repeat(10_000);
+        for text in [b"".as_slice(), b"c", &[0x1f], long.as_slice()] {
+            for bytes in [text.to_vec(), gzip(text)] {
+                std::fs::write(&path, bytes).unwrap();
+                let (mut reader, _) = open_text_with_identity(&path).unwrap();
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).unwrap();
+                assert_eq!(actual, text);
+            }
+        }
+        std::fs::write(&path, BGZF_EOF).unwrap();
+        let (mut reader, _) = open_text_with_identity(&path).unwrap();
+        let mut text = Vec::new();
+        reader.read_to_end(&mut text).unwrap();
+        assert!(text.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_identity_and_bytes_come_from_the_same_opened_handle() {
+        let dir = TempDir::new().unwrap();
+        let original = dir.path().join("original.bed");
+        let other = dir.path().join("other.bed");
+        let path = dir.path().join("input.bed");
+        let alias = dir.path().join("alias.bed");
+        for bytes in [
+            b"chr1\t0\t5\n".to_vec(),
+            gzip(b"chr1\t0\t5\n"),
+            [gzip(b"chr1\t"), gzip(b"0\t5\n")].concat(),
+            [bgzf_block(b"chr1\t0\t5\n"), BGZF_EOF.to_vec()].concat(),
+            bgzf_block(b"chr1\t0\t5\n"),
+        ] {
+            std::fs::write(&original, bytes).unwrap();
+            std::fs::write(&other, b"chr2\t0\t9\n").unwrap();
+            std::os::unix::fs::symlink(&original, &path).unwrap();
+            std::fs::hard_link(&original, &alias).unwrap();
+            let (mut reader, identity) = open_text_with_identity(&path).unwrap();
+            let opened = File::open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&other, &path).unwrap();
+            // Construct another reader after retargeting, so even its metadata and magic-byte
+            // detection must use the supplied handle, not a second observation of the path.
+            let (mut raced_reader, raced_identity) =
+                text_reader_with_identity(opened, &path).unwrap();
+            assert_eq!(raced_identity, identity);
+            for reader in [&mut reader, &mut raced_reader] {
+                let mut text = String::new();
+                reader.read_to_string(&mut text).unwrap();
+                assert_eq!(text, "chr1\t0\t5\n");
+            }
+            let identity = identity.expect("a regular BED has an identity");
+            assert!(identity.matches_path(&alias));
+            assert!(!identity.matches_path(&path));
+            std::fs::remove_file(&path).unwrap();
+            std::fs::remove_file(&alias).unwrap();
+        }
     }
 
     #[test]
