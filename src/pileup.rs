@@ -1632,7 +1632,7 @@ mod tests {
     use super::*;
     use crate::evidence::read_tables;
     use crate::model_evidence::check_options;
-    use crate::testing::{TestRead, write_bam};
+    use crate::testing::{ReadFiles, TestRead, write_bam};
 
     /// The reads counted at sites alone, without read annotations.
     fn count_sites(
@@ -2070,13 +2070,7 @@ mod tests {
             TestRead { bases: Some(&a60), ..read("a60", 90, "70M", 60) },
         ];
         let bam = write_bam(dir.path(), "reads.bam", reference.len() as u64, &reads);
-        let inputs = ReadInputs {
-            observed_indexes: None,
-            vcf: &vcf,
-            alignments: &bam,
-            reference: &fasta,
-            expected_alignment: None,
-        };
+        let inputs = ReadInputs::new(&vcf, &bam, &fasta);
         let options = PileupOptions::default();
         let rows = measure_pileup(&inputs, &["chr1", "chr2"], &options).unwrap();
         let summary: Vec<(u64, u64, AlleleCounts)> =
@@ -2098,37 +2092,19 @@ mod tests {
         );
     }
 
-    /// The paths of a VCF of `records` on [`reference`], the reads, and the reference.
-    struct Fixture {
-        vcf: std::path::PathBuf,
-        bam: std::path::PathBuf,
-        fasta: std::path::PathBuf,
+    /// Writes the read files of a VCF of `records` on [`reference`] and the reads.
+    fn fixture(dir: &Path, records: &[&str], reads: &[TestRead<'_>]) -> ReadFiles {
+        fixture_on(dir, &reference(), records, reads)
     }
 
-    impl Fixture {
-        fn new(dir: &Path, records: &[&str], reads: &[TestRead<'_>]) -> Fixture {
-            Fixture::on(dir, &reference(), records, reads)
-        }
-
-        /// A fixture of chr1 of `reference`.
-        fn on(dir: &Path, reference: &str, records: &[&str], reads: &[TestRead<'_>]) -> Fixture {
-            let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
-            Fixture {
-                vcf: crate::testing::write_indexed_vcf(dir, "in.vcf.gz", &header, records),
-                bam: write_bam(dir, "reads.bam", reference.len() as u64, reads),
-                fasta: crate::testing::write_fasta(dir, &[("chr1", reference)]),
-            }
-        }
-
-        fn inputs(&self) -> ReadInputs<'_> {
-            ReadInputs {
-                observed_indexes: None,
-                vcf: &self.vcf,
-                alignments: &self.bam,
-                reference: &self.fasta,
-                expected_alignment: None,
-            }
-        }
+    /// [`fixture`] on chr1 of `reference`.
+    fn fixture_on(
+        dir: &Path,
+        reference: &str,
+        records: &[&str],
+        reads: &[TestRead<'_>],
+    ) -> ReadFiles {
+        ReadFiles::write(dir, &[("chr1", reference)], records, reads)
     }
 
     /// A deletion in the A10 tract, an indel record without a pure insertion or deletion allele,
@@ -2213,7 +2189,7 @@ mod tests {
             bases: Some(bases),
             ..read(name, *pos, cigar, *mapq)
         }));
-        let fixture = Fixture::new(dir.path(), &RECORDS, &reads);
+        let fixture = fixture(dir.path(), &RECORDS, &reads);
         let sites =
             measure_sites(&fixture.inputs(), &["chr1"], options, Some(annotations)).unwrap();
         let rows = measure_pileup(&fixture.inputs(), &["chr1"], options).unwrap();
@@ -2299,7 +2275,7 @@ mod tests {
     #[test]
     fn sites_without_read_annotations_are_the_pileup_rows() {
         let dir = TempDir::new().unwrap();
-        let fixture = Fixture::new(dir.path(), &RECORDS, &[read("r", 90, "70M", 60)]);
+        let fixture = fixture(dir.path(), &RECORDS, &[read("r", 90, "70M", 60)]);
         let options = PileupOptions::default();
         let sites = measure_sites(&fixture.inputs(), &["chr1"], &options, None).unwrap();
         let summary: Vec<(u64, bool, Option<MapqSums>)> =
@@ -2346,7 +2322,7 @@ mod tests {
         ];
         let bases = bases_of(&reads);
         let record = format!("chr1\t123\t.\tG\tT,C\t50\tPASS\t.\tGT\t{genotype}");
-        let fixture = Fixture::new(dir.path(), &[&record], &snp_reads(&reads, &bases));
+        let fixture = fixture(dir.path(), &[&record], &snp_reads(&reads, &bases));
         let annotations = ReadAnnotationOptions::default();
         let sites = measure_annotations(&fixture.inputs(), &["chr1"], &annotations).unwrap();
         let [site] = sites.as_slice() else { panic!("{sites:?}") };
@@ -2394,7 +2370,7 @@ mod tests {
         reads: &[TestRead<'_>],
     ) -> (MapqSums, AlleleCounts) {
         let dir = TempDir::new().unwrap();
-        let fixture = Fixture::on(dir.path(), reference, &[record], reads);
+        let fixture = fixture_on(dir.path(), reference, &[record], reads);
         let annotations = ReadAnnotationOptions::default();
         let sites = measure_annotations(&fixture.inputs(), &["chr1"], &annotations).unwrap();
         let [site] = sites.as_slice() else { panic!("{sites:?}") };
@@ -2743,7 +2719,7 @@ mod tests {
             [literal.as_str(), &"=".repeat(literal.len())].into_iter().enumerate()
         {
             let dir = TempDir::new().unwrap();
-            let fixture = Fixture::new(
+            let fixture = fixture(
                 dir.path(),
                 &[record],
                 &[TestRead { bases: Some(bases), ..read("read", 50, cigar, 30) }],
@@ -2828,7 +2804,7 @@ mod tests {
             )
         };
         let (original, shifted) = (cigar(0), cigar(shift));
-        let fixture = Fixture::on(
+        let fixture = fixture_on(
             dir.path(),
             &reference,
             &[&record],
@@ -2860,7 +2836,7 @@ mod tests {
     fn an_indistinguishable_uncalled_rotation_disables_allele_sums() {
         let dir = TempDir::new().unwrap();
         let bases = inserted(61, "T");
-        let fixture = Fixture::new(
+        let fixture = fixture(
             dir.path(),
             &["chr1\t61\t.\tC\tCT,CGA\t50\tPASS\t.\tGT\t0/1"],
             &[TestRead { bases: Some(&bases), ..read("called", 50, "11M1I59M", 40) }],
@@ -2902,7 +2878,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = reference().as_bytes()[(pos - 1) as usize] as char;
         let record = format!("chr1\t{pos}\t.\t{base}\tA\t50\tPASS\t.\tGT\t0/1");
-        let fixture = Fixture::new(dir.path(), &[&record], &[read("read", start, cigar, 60)]);
+        let fixture = fixture(dir.path(), &[&record], &[read("read", start, cigar, 60)]);
         let options = ReadAnnotationOptions::default();
         let sites = measure_annotations(&fixture.inputs(), &["chr1"], &options).unwrap();
         assert_eq!(sites.len(), 1);
@@ -2939,7 +2915,7 @@ mod tests {
             })
             .collect();
         let (equal, alt, literal) = ("=".repeat(70), edited(50, 120, &edits), edited(60, 120, &[]));
-        let fixture = Fixture::new(
+        let fixture = fixture(
             dir.path(),
             &records.iter().map(String::as_str).collect::<Vec<_>>(),
             &[
@@ -2973,7 +2949,7 @@ mod tests {
     #[test]
     fn a_read_without_a_cigar_does_not_contribute_annotations() {
         let dir = TempDir::new().unwrap();
-        let fixture = Fixture::new(
+        let fixture = fixture(
             dir.path(),
             &["chr1\t71\t.\tT\tG\t50\tPASS\t.\tGT\t0/1"],
             &[read("aligned", 50, "70M", 30), read("no_cigar", 70, "", 60)],
@@ -3005,7 +2981,7 @@ mod tests {
         #[case] expected: u64,
     ) {
         let dir = TempDir::new().unwrap();
-        let fixture = Fixture::new(
+        let fixture = fixture(
             dir.path(),
             &["chr1\t71\t.\tC\tG\t50\tPASS\t.\tGT\t0/1"],
             &[read("read", 0, cigar, 60)],
@@ -3193,7 +3169,7 @@ mod tests {
         })
         .collect();
         let dir = TempDir::new().unwrap();
-        let fixture = Fixture::on(dir.path(), &reference, &[record], &reads);
+        let fixture = fixture_on(dir.path(), &reference, &[record], &reads);
         let annotations: ReadAnnotationOptions = "flank13".parse().unwrap();
         let sites = measure_annotations(&fixture.inputs(), &["chr1"], &annotations).unwrap();
         let [site] = sites.as_slice() else { panic!("{sites:?}") };
@@ -3212,7 +3188,7 @@ mod tests {
         let reads = [TestRead { bases: Some(&bases), ..read("ins", 50, "29M1I40M", 30) }];
         let dir = TempDir::new().unwrap();
         let record = "chr1\t80\t.\tCA\tC\t50\tPASS\t.\tGT\t0/1";
-        let fixture = Fixture::on(dir.path(), &r, &[record], &reads);
+        let fixture = fixture_on(dir.path(), &r, &[record], &reads);
         let annotations: ReadAnnotationOptions = "flank1".parse().unwrap();
         let sites = measure_annotations(&fixture.inputs(), &["chr1"], &annotations).unwrap();
         let [site] = sites.as_slice() else { panic!("{sites:?}") };
@@ -3247,7 +3223,7 @@ mod tests {
         let record = format!("chr1\t80\t.\t{ref_allele}\t{alts}\t50\tPASS\t.\tGT\t1/2");
         for cigar in [original, shifted] {
             let dir = TempDir::new().unwrap();
-            let fixture = Fixture::on(
+            let fixture = fixture_on(
                 dir.path(),
                 &reference,
                 &[&record],
@@ -3296,7 +3272,7 @@ mod tests {
         for (alts, called) in [("CAAAGT,CAAAA", gt), ("CAAAA,CAAAGT", swapped_gt)] {
             let dir = TempDir::new().unwrap();
             let record = format!("chr1\t80\t.\tCAAAAGT\t{alts}\t50\tPASS\t.\tGT\t{called}");
-            let fixture = Fixture::on(
+            let fixture = fixture_on(
                 dir.path(),
                 &reference,
                 &[&record],
@@ -3377,7 +3353,7 @@ mod tests {
                 ..read(name, pos, cigar, mapq)
             })
             .collect();
-        let fixture = Fixture::on(dir.path(), &reference, &[record], &reads);
+        let fixture = fixture_on(dir.path(), &reference, &[record], &reads);
         let rows = measure_pileup(&fixture.inputs(), &["chr1"], &PileupOptions::default()).unwrap();
         let [row] = rows.as_slice() else { panic!("{rows:?}") };
         assert_eq!(counts, row.counts);
@@ -3501,7 +3477,7 @@ mod tests {
         // The deletion of an A of the tract, and a complex allele, which is the one called.
         let record = "chr1\t80\t.\tCA\tC,GTT\t50\tPASS\t.\tGT\t0/2";
         let reads = [read("ref", 50, "70M", 60), read("del", 50, "35M1D34M", 60)];
-        let fixture = Fixture::new(dir.path(), &[record], &reads);
+        let fixture = fixture(dir.path(), &[record], &reads);
         let annotations = ReadAnnotationOptions::default();
         let sites = measure_annotations(&fixture.inputs(), &["chr1"], &annotations).unwrap();
         let [site] = sites.as_slice() else { panic!("{sites:?}") };
@@ -3531,7 +3507,7 @@ mod tests {
         let bases = bases_of(&[&SNP_READS[..], &extra[..]].concat());
         let mut reads = snp_reads(&[&SNP_READS[..], &extra[..]].concat(), &bases);
         reads.extend([read("left", 50, "70M", 60), read("near", 76, "50M", 60)]);
-        let fixture = Fixture::new(dir.path(), &RECORDS, &reads);
+        let fixture = fixture(dir.path(), &RECORDS, &reads);
         let inputs = fixture.inputs();
         let (sites, measured) =
             measure_annotations_and_pileup(&inputs, &["chr1"], &annotations, pileup).unwrap();
@@ -3575,7 +3551,7 @@ mod tests {
                 ..read(name, 90, "70M", *mapq)
             })
             .collect();
-        let fixture = Fixture::new(dir.path(), &RECORDS[2..], &reads);
+        let fixture = fixture(dir.path(), &RECORDS[2..], &reads);
         let (options, annotations) = (PileupOptions::default(), ReadAnnotationOptions::default());
         let mut sites =
             measure_sites(&fixture.inputs(), &["chr1"], &options, Some(&annotations)).unwrap();

@@ -4,7 +4,9 @@ Usage: winnowr extract [OPTIONS] --vcf <VCF> --output <OUTPUT>
 
 Options:
   -t, --threads <THREADS>
-          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+          The number of threads to use in all, including htslib's compression and decompression (but
+          not htslib's I/O thread per file, which mostly waits on the disk) [default:
+          OMP_NUM_THREADS when set, else 4]
       --vcf <VCF>
           The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode, or a
           standard VCF with --alignments or --feature-source vcf)

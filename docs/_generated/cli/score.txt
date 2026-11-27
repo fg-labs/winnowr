@@ -12,7 +12,9 @@ Usage: winnowr score [OPTIONS] --vcf <VCF> --models <MODELS>... --output <OUTPUT
 
 Options:
   -t, --threads <THREADS>
-          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+          The number of threads to use in all, including htslib's compression and decompression (but
+          not htslib's I/O thread per file, which mostly waits on the disk) [default:
+          OMP_NUM_THREADS when set, else 4]
 
       --vcf <VCF>
           The indexed, single-sample VCF from HaplotypeCaller (gVCF mode, e.g. --dragen-mode, or a
@@ -106,8 +108,10 @@ Options:
           models were trained with. Models trained on features measured from the reads (`extract
           --alignments`) need it: each call's mapping qualities and depth are measured from it
           before any model scores. Needs --reference. Otherwise the reads are measured while the
-          models that do not need them score, each with its own -t threads, so up to twice -t
-          threads run
+          models that do not need them score, the two sharing -t threads (score runs within -t
+          threads in all, apart from htslib's I/O thread per file, so set -t to the number of cores
+          it may use). With -t 1, or when every model needs the evidence, the reads are measured
+          first, then the models score
 
       --reference <REFERENCE>
           The indexed, uncompressed reference FASTA, for --alignments (also used to decode CRAM)

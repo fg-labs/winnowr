@@ -1159,6 +1159,7 @@ impl<'a> RegionPlan<'a> {
                  {name}=PATH",
                 paths.join(", ")
             );
+            problems.extend(read.into_iter().filter_map(|(_, bed)| bed.contigs));
             problems.push(Problem::error(Check::RegionAmbiguous, None, message));
             return None;
         }
@@ -2373,6 +2374,56 @@ mod tests {
         let (resolved, problems) = bundle.features(&model, &[], false);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(resolved[0].path, bgz);
+    }
+
+    #[rstest]
+    #[case::invalid_first("chr2\t0\t10\n", SEGDUPS, &[Check::RegionContigs, Check::RegionAmbiguous])]
+    #[case::invalid_second(SEGDUPS, "chr2\t0\t10\n", &[Check::RegionContigs, Check::RegionAmbiguous])]
+    #[case::both_invalid("chr2\t0\t10\n", "chr3\t0\t10\n", &[Check::RegionContigs, Check::RegionContigs, Check::RegionAmbiguous])]
+    #[case::equivalent_invalid("chr2\t0\t10\n", "chr2\t0\t10\n", &[Check::RegionContigs])]
+    #[case::equivalent_valid(SEGDUPS, SEGDUPS, &[])]
+    #[case::differing_valid(SEGDUPS, OTHER, &[Check::RegionAmbiguous])]
+    fn bundled_candidate_contig_errors_survive_ambiguity(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] expected: &[Check],
+        #[values(false, true)] policy: bool,
+        #[values(false, true)] allow: bool,
+    ) {
+        let bundle = Bundle::new();
+        let compressed = bundle.path(&format!("{NOT_DIFFICULT_REGIONS}.bed.gz"));
+        crate::testing::write_gzip(&compressed, first.as_bytes());
+        let plain = bundle.write(&format!("{NOT_DIFFICULT_REGIONS}.bed"), second);
+        let mut model = info(VariantType::Indel);
+        model.region_names = vec![NOT_DIFFICULT_REGIONS.to_string()];
+        model.region_digests =
+            [(NOT_DIFFICULT_REGIONS.to_string(), digest_of(first))].into_iter().collect();
+        model.policy_region_digests = model.region_digests.clone();
+        let run = RunRegions::Features { policy };
+        // Bundle::resolve asserts exact read/check metadata and diagnostic parity.
+        let (resolved, problems) = bundle.resolve(&[model], &[], run, allow);
+        assert_eq!(checks(&problems), expected);
+        assert!(problems.iter().all(|problem| problem.severity == Severity::Error));
+        if expected.contains(&Check::RegionAmbiguous) {
+            assert!(resolved.is_empty());
+            let ambiguity = problems.iter().find(|p| p.check == Check::RegionAmbiguous).unwrap();
+            for path in [&compressed, &plain] {
+                assert!(ambiguity.message.contains(&path.display().to_string()));
+            }
+        } else {
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].verified(), Some(true));
+        }
+        let contig_errors: Vec<_> =
+            problems.iter().filter(|p| p.check == Check::RegionContigs).collect();
+        if first.starts_with("chr2") {
+            assert!(contig_errors[0].message.contains(&compressed.display().to_string()));
+        } else if !contig_errors.is_empty() {
+            assert!(contig_errors[0].message.contains(&plain.display().to_string()));
+        }
+        if contig_errors.len() == 2 {
+            assert!(contig_errors[1].message.contains(&plain.display().to_string()));
+        }
     }
 
     #[rstest]

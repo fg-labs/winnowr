@@ -69,8 +69,9 @@ contigs or ranges (e.g. `chr22:20000000-30000000`). A range that starts past its
 error.
 
 With the region BEDs beside the models (`models/regions/segdups.bed.gz`, and so on), `score`
-needs no `--regions`; it checks each BED against the digest the models record. If the models
-record no digest for a BED, it is used with a warning rather than verified:
+needs no `--regions`; it checks each BED against its applicable recorded digests. Feature-region
+BEDs without one are used unchecked with a warning. Policy-only BEDs without a policy digest remain
+unchecked without that warning:
 
 ```console
 winnowr score --vcf sample.vcf.gz --gvcf sample.g.vcf.gz \

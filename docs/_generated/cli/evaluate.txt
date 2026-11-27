@@ -6,7 +6,9 @@ Options:
       --models <MODELS>...
           The model files of one variant type: a genotype model, a promote model, or one of each
   -t, --threads <THREADS>
-          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+          The number of threads to use in all, including htslib's compression and decompression (but
+          not htslib's I/O thread per file, which mostly waits on the disk) [default:
+          OMP_NUM_THREADS when set, else 4]
       --table <TABLE>
           A labelled feature table (from `extract --happy`, plus --truth-vcf for promote models) of
           a held-out sample (a training sample of the models gives optimistic metrics, with a

@@ -374,6 +374,98 @@ pub struct TestRead<'a> {
     pub bases: Option<&'a str>,
 }
 
+/// The inputs of a read pass written to a directory: the calls (`in.vcf.gz`, of sample `S1`), the
+/// reads (`reads.bam`) and the reference (`ref.fa`).
+pub struct ReadFiles {
+    /// The indexed VCF of the calls.
+    pub vcf: PathBuf,
+    /// The indexed BAM of the reads.
+    pub bam: PathBuf,
+    /// The indexed reference FASTA.
+    pub fasta: PathBuf,
+}
+
+impl ReadFiles {
+    /// Writes the `records` (VCF lines), the `reads` (on the first contig) and the reference
+    /// `sequences` to `dir`. The VCF's header declares the reference's contigs.
+    pub fn write(
+        dir: &Path,
+        sequences: &[(&str, &str)],
+        records: &[&str],
+        reads: &[TestRead<'_>],
+    ) -> Self {
+        let contigs: String = sequences
+            .iter()
+            .map(|(name, sequence)| format!("##contig=<ID={name},length={}>\n", sequence.len()))
+            .collect();
+        let header = vcf_header(&[CALL_FIELDS], &["S1"]).replacen(
+            "##contig=<ID=chr1,length=100000>\n##contig=<ID=chr2,length=100000>\n",
+            &contigs,
+            1,
+        );
+        Self {
+            vcf: write_indexed_vcf(dir, "in.vcf.gz", &header, records),
+            bam: write_bam_on_contig(
+                dir,
+                "reads.bam",
+                sequences[0].0,
+                sequences[0].1.len() as u64,
+                reads,
+                &[],
+            ),
+            fasta: write_fasta(dir, sequences),
+        }
+    }
+
+    /// The inputs of a pass over them.
+    pub fn inputs(&self) -> crate::read_pass::ReadInputs<'_> {
+        crate::read_pass::ReadInputs::new(&self.vcf, &self.bam, &self.fasta)
+    }
+}
+
+#[test]
+fn review_read_files_reads_follow_the_first_reference_contig() {
+    use rust_htslib::bam::Read as _;
+    let dir = tempfile::TempDir::new().unwrap();
+    let reads = [TestRead {
+        name: "first-contig",
+        pos: 10,
+        cigar: "10M",
+        flag: 0,
+        mapq: 60,
+        qual: 30,
+        quals: None,
+        bases: None,
+    }];
+    let files = ReadFiles::write(
+        dir.path(),
+        &[("chr2", &"A".repeat(40))],
+        &["chr2\t11\t.\tA\tC\t50\tPASS\t.\tGT\t0/1"],
+        &reads,
+    );
+    let mut reader = rust_htslib::bam::IndexedReader::from_path(&files.bam).unwrap();
+    let tid = reader.header().tid(b"chr2").expect("reads must target the first supplied contig");
+    reader.fetch((tid, 0, 40)).unwrap();
+    let records: Vec<_> = reader.records().map(|record| record.unwrap()).collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].qname(), b"first-contig");
+    assert_eq!(reader.header().target_len(tid), Some(40));
+}
+
+/// A read pass over a contig the default VCF header does not declare plans and measures it: the
+/// fixture's VCF declares the reference's contigs.
+#[test]
+fn review_read_files_declare_their_contigs_in_the_vcf() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let files = ReadFiles::write(dir.path(), &[("chrX", &"A".repeat(40))], &[], &[]);
+    let shards = crate::read_pass::run_shards(&files.inputs(), &["chrX"], 0, |shard| {
+        Ok(shard.chrom.to_string())
+    })
+    .unwrap();
+    assert!(!shards.is_empty());
+    assert!(shards.iter().all(|chrom| chrom == "chrX"));
+}
+
 /// Writes a coordinate-sorted, indexed BAM of reads on `chr1` (of `length` bases) to `dir/name`.
 pub fn write_bam(dir: &Path, name: &str, length: u64, reads: &[TestRead<'_>]) -> PathBuf {
     write_bam_with_header(dir, name, length, reads, &[])
@@ -387,11 +479,23 @@ pub fn write_bam_with_header(
     reads: &[TestRead<'_>],
     header_lines: &[&str],
 ) -> PathBuf {
+    write_bam_on_contig(dir, name, "chr1", length, reads, header_lines)
+}
+
+/// Writes reads on the named contig, preserving the chr1 defaults of the public fixture helpers.
+fn write_bam_on_contig(
+    dir: &Path,
+    name: &str,
+    contig: &str,
+    length: u64,
+    reads: &[TestRead<'_>],
+    header_lines: &[&str],
+) -> PathBuf {
     use rust_htslib::bam::{self, header::HeaderRecord, record::CigarString};
     let path = dir.join(name);
     let mut header = bam::Header::new();
     let mut sq = HeaderRecord::new(b"SQ");
-    sq.push_tag(b"SN", "chr1").push_tag(b"LN", length);
+    sq.push_tag(b"SN", contig).push_tag(b"LN", length);
     header.push_record(&sq);
     for line in header_lines {
         let mut fields = line.split('\t');

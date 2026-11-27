@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use log::warn;
 use serde::{Deserialize, Serialize};
-use winnowr_xgboost::{Booster, DMatrix};
+use winnowr_xgboost::{Booster, DMatrix, SharedPredictor};
 
 use crate::alignment_provenance::AlignmentProvenance;
 use crate::common::{Task, VariantType};
@@ -636,7 +636,8 @@ impl WinnowrModel {
         Ok(())
     }
 
-    /// Predicts class probabilities for a feature table's calls.
+    /// Predicts class probabilities for a feature table's calls, in one XGBoost call with the
+    /// booster's threads ([`Predicting::Whole`]).
     ///
     /// The probabilities are in [`Label`] order (genotype models, with the re-genotype column for
     /// re-genotype models) or [`PromoteLabel`] order (promote models).
@@ -645,18 +646,52 @@ impl WinnowrModel {
     ///
     /// Returns an error if the table lacks a model feature, or XGBoost fails.
     pub fn predict(&self, table: &FeatureTable) -> Result<Probabilities> {
+        self.predict_with(table, Predicting::Whole)
+    }
+
+    /// Predicts class probabilities for a feature table's calls as [`WinnowrModel::predict`]
+    /// does, `predicting` them in one XGBoost call or in chunks on the current rayon pool. The
+    /// probabilities are the same either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table lacks a model feature, XGBoost fails, or
+    /// [`Predicting::Chunked`] is asked of a booster of more than one thread.
+    pub fn predict_with(
+        &self,
+        table: &FeatureTable,
+        predicting: Predicting,
+    ) -> Result<Probabilities> {
         let classes = self.info.num_classes();
         if table.num_rows() == 0 {
             return Ok(Probabilities::new(Vec::new(), classes));
         }
         let values = to_matrix(table, &self.info.features)?;
-        predict_probabilities(
-            &self.booster,
-            &values,
-            table.num_rows(),
-            &self.info.features,
-            classes,
-        )
+        let (rows, features) = (table.num_rows(), &self.info.features);
+        // Only a tree booster predicts from several threads at once; another predicts in one
+        // call, with its one thread.
+        let shared = match predicting {
+            Predicting::Whole => None,
+            Predicting::Chunked => {
+                anyhow::ensure!(
+                    self.booster.threads() == NonZeroUsize::MIN,
+                    "chunked prediction needs a booster of one thread, not {}",
+                    self.booster.threads()
+                );
+                self.booster.shared_predictor()?
+            }
+        };
+        match shared {
+            Some(shared) => predict_probabilities_chunked(
+                shared,
+                &values,
+                rows,
+                features,
+                classes,
+                PREDICT_CHUNK_ROWS,
+            ),
+            None => predict_probabilities(&self.booster, &values, rows, features, classes),
+        }
     }
 }
 
@@ -826,6 +861,22 @@ pub fn named_matrix<S: AsRef<str>>(
     Ok(matrix)
 }
 
+/// How a model predicts its calls' probabilities: the probabilities are the same either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Predicting {
+    /// In one XGBoost call, with the booster's threads (OpenMP).
+    Whole,
+    /// In chunks of [`PREDICT_CHUNK_ROWS`] calls, each a task on the current rayon pool calling
+    /// XGBoost with the booster's threads, which must then be one: idle threads of the pool,
+    /// e.g. those of other work sharing it, take up chunks as they free up. A booster that is not
+    /// a tree booster (e.g. `gblinear`), which cannot predict from several threads at once,
+    /// predicts in one call with its one thread.
+    Chunked,
+}
+
+/// The calls in a chunk of [`Predicting::Chunked`] prediction: a fraction of a second of work.
+pub const PREDICT_CHUNK_ROWS: usize = 8192;
+
 /// Predicts the class probabilities of `rows` calls with a booster.
 ///
 /// # Errors
@@ -850,6 +901,61 @@ pub fn predict_probabilities<S: AsRef<str>>(
         bail!("XGBoost predicted {:?} values for {rows} calls", prediction.shape);
     }
     Ok(Probabilities::new(prediction.values.into_iter().map(f64::from).collect(), num_class))
+}
+
+/// [`predict_probabilities`] in chunks of `chunk_rows` calls (see [`Predicting::Chunked`]),
+/// predicted in parallel on the current rayon pool and put together in row order.
+///
+/// # Errors
+///
+/// Returns an error if the booster has more than one thread, there are no features or the values
+/// are not `rows` of them, or XGBoost fails or predicts another shape for a chunk.
+fn predict_probabilities_chunked<S: AsRef<str> + Sync>(
+    shared: SharedPredictor<'_>,
+    values: &[f32],
+    rows: usize,
+    features: &[S],
+    num_class: usize,
+    chunk_rows: usize,
+) -> Result<Probabilities> {
+    use rayon::prelude::*;
+    // Each of the pool's threads may predict a chunk at once.
+    anyhow::ensure!(
+        shared.threads() == NonZeroUsize::MIN,
+        "chunked prediction needs a booster of one thread, not {}",
+        shared.threads()
+    );
+    if rows == 0 {
+        return Ok(Probabilities::new(Vec::new(), num_class));
+    }
+    let width = features.len();
+    anyhow::ensure!(width > 0, "a model of no features cannot predict");
+    anyhow::ensure!(
+        values.len() == rows * width,
+        "{} values are not {rows} calls of {width} features",
+        values.len()
+    );
+    let mut timer = crate::common::PhaseTimer::start();
+    let chunks: Vec<Vec<f32>> = values
+        .par_chunks(chunk_rows * width)
+        // Each chunk is a job of its own, which any idle thread of the pool can take.
+        .with_max_len(1)
+        .map(|chunk| -> Result<Vec<f32>> {
+            #[cfg(test)]
+            let _running =
+                crate::model_evidence::work_observer::prediction(features, shared.threads().get());
+            let chunk_rows = chunk.len() / width;
+            let matrix = named_matrix(chunk, chunk_rows, features, NonZeroUsize::MIN)?;
+            let prediction = shared.predict(&matrix)?;
+            if prediction.shape != [chunk_rows, num_class] {
+                bail!("XGBoost predicted {:?} values for {chunk_rows} calls", prediction.shape);
+            }
+            Ok(prediction.values)
+        })
+        .collect::<Result<_>>()?;
+    timer.lap("running the XGBoost prediction in chunks");
+    let values = chunks.into_iter().flatten().map(f64::from).collect();
+    Ok(Probabilities::new(values, num_class))
 }
 
 /// Checks that calls come from the reference a model was trained on (its contig names and
@@ -1018,6 +1124,11 @@ mod tests {
 
     /// Trains a tiny three-class booster on features `a` and `b`.
     fn booster(features: &[&str], classes: usize) -> Booster {
+        booster_of("gbtree", features, classes)
+    }
+
+    /// A booster of kind `kind` (e.g. `gbtree`, `gblinear`) trained on 30 rows of `features`.
+    fn booster_of(kind: &str, features: &[&str], classes: usize) -> Booster {
         let rows = 30;
         let values: Vec<f32> = (0..rows * features.len()).map(|i| (i % 7) as f32).collect();
         let labels: Vec<f32> = (0..rows).map(|i| (i % classes) as f32).collect();
@@ -1027,7 +1138,11 @@ mod tests {
         let mut booster = Booster::new(&[&train], THREADS).unwrap();
         let classes_value = classes.to_string();
         booster
-            .set_params(&[("objective", "multi:softprob"), ("num_class", &classes_value)])
+            .set_params(&[
+                ("booster", kind),
+                ("objective", "multi:softprob"),
+                ("num_class", &classes_value),
+            ])
             .unwrap();
         for iteration in 0..3 {
             booster.update(iteration, &train).unwrap();
@@ -1131,6 +1246,114 @@ mod tests {
             message,
             format!("a model file must end in {MODEL_SUFFIX}: {}", wrong.display())
         );
+    }
+
+    /// The calls of a table of the features `a` and `b`, `rows` of them.
+    fn two_feature_calls(rows: usize) -> FeatureTable {
+        let column = |step: usize| (0..rows).map(|i| ((i * step) % 11) as f64).collect();
+        table(&[("a", column(3)), ("b", column(5))])
+    }
+
+    /// The bits of each probability, row by row, to compare probabilities exactly.
+    fn bits(probabilities: &Probabilities) -> Vec<u64> {
+        (0..probabilities.len())
+            .flat_map(|row| probabilities.row(row).iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// Chunked prediction gives exactly the probabilities of whole prediction, in row order,
+    /// whatever the row count and the pool, for genotype and promote models.
+    #[rstest::rstest]
+    fn chunked_prediction_is_whole_prediction(
+        #[values(Task::Genotype, Task::Promote)] task: Task,
+        #[values(1, 4)] threads: usize,
+    ) {
+        let chunk = 16;
+        let features = ["a", "b"];
+        let mut booster = booster(&features, 3);
+        booster.set_threads(NonZeroUsize::MIN).unwrap();
+        let mut model =
+            WinnowrModel { booster, info: ModelInfo { task, ..genotype_info(&features) } };
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        for rows in [0, 1, chunk - 1, chunk, chunk + 1, 5 * chunk + 3] {
+            let calls = two_feature_calls(rows);
+            let whole = model.predict_with(&calls, Predicting::Whole).unwrap();
+            let values = to_matrix(&calls, &model.info.features).unwrap();
+            let shared = model.booster.shared_predictor().unwrap().unwrap();
+            let chunked = pool
+                .install(|| {
+                    predict_probabilities_chunked(shared, &values, rows, &features, 3, chunk)
+                })
+                .unwrap();
+            assert_eq!(whole.len(), rows);
+            assert_eq!(bits(&chunked), bits(&whole), "{rows} rows");
+            let moved = &mut model;
+            let calls = &calls;
+            let default =
+                pool.install(move || moved.predict_with(calls, Predicting::Chunked)).unwrap();
+            assert_eq!(bits(&default), bits(&whole), "{rows} rows");
+        }
+    }
+
+    /// A chunk that cannot be predicted fails the prediction, as do a booster of more than one
+    /// thread, no features, and values that are not the calls' features.
+    #[test]
+    fn a_failing_chunk_fails_the_prediction() {
+        let mut booster = booster(&["a", "b"], 3);
+        booster.set_threads(NonZeroUsize::new(2).unwrap()).unwrap();
+        let values = vec![0.0; 2 * 40];
+        let chunked = |booster: &Booster, values: &[f32], features: &[&str]| {
+            let shared = booster.shared_predictor().unwrap().unwrap();
+            let error =
+                predict_probabilities_chunked(shared, values, 40, features, 3, 16).unwrap_err();
+            format!("{error:#}")
+        };
+        let message = chunked(&booster, &values, &["a", "b"]);
+        assert!(message.contains("needs a booster of one thread, not 2"), "{message}");
+        booster.set_threads(NonZeroUsize::MIN).unwrap();
+        // Three features for a model of two.
+        let message = chunked(&booster, &[0.0; 3 * 40], &["a", "b", "c"]);
+        assert!(message.contains("2 features but the matrix has 3 columns"), "{message}");
+        let message = chunked(&booster, &[], &[]);
+        assert_eq!(message, "a model of no features cannot predict");
+        let message = chunked(&booster, &values[1..], &["a", "b"]);
+        assert_eq!(message, "79 values are not 40 calls of 2 features");
+    }
+
+    /// Nonempty chunked prediction needs one thread even for a non-tree booster; whole and
+    /// empty predictions still accept a booster of more than one thread.
+    #[rstest::rstest]
+    fn chunked_prediction_rejects_multiple_threads(#[values("gbtree", "gblinear")] kind: &str) {
+        let features = ["a", "b"];
+        let mut booster = booster_of(kind, &features, 3);
+        booster.set_threads(NonZeroUsize::new(2).unwrap()).unwrap();
+        let model = WinnowrModel { booster, info: genotype_info(&features) };
+        let empty = two_feature_calls(0);
+        for predicting in [Predicting::Whole, Predicting::Chunked] {
+            let prediction = model.predict_with(&empty, predicting).unwrap();
+            assert!(prediction.is_empty());
+            assert_eq!(prediction.classes(), 3);
+        }
+        let calls = two_feature_calls(40);
+        let whole = model.predict_with(&calls, Predicting::Whole).unwrap();
+        assert_eq!((whole.len(), whole.classes()), (40, 3));
+        let message = model.predict_with(&calls, Predicting::Chunked).unwrap_err().to_string();
+        assert!(message.contains("needs a booster of one thread, not 2"), "{message}");
+    }
+
+    /// A model whose booster is not a tree booster, which cannot predict from several threads at
+    /// once, predicts in one call when asked to predict in chunks, with the same probabilities.
+    #[test]
+    fn a_linear_booster_predicts_whole_when_asked_for_chunks() {
+        let features = ["a", "b"];
+        let booster = booster_of("gblinear", &features, 3);
+        assert!(booster.shared_predictor().unwrap().is_none());
+        let model = WinnowrModel { booster, info: genotype_info(&features) };
+        let calls = two_feature_calls(40);
+        let whole = model.predict_with(&calls, Predicting::Whole).unwrap();
+        let chunked = model.predict_with(&calls, Predicting::Chunked).unwrap();
+        assert_eq!(chunked.len(), 40);
+        assert_eq!(bits(&chunked), bits(&whole));
     }
 
     #[test]

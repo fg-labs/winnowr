@@ -28,7 +28,7 @@ use crate::io::{FileIdentity, write_tsv_protecting};
 use crate::labels::{
     HappyFn, Label, PromoteLabel, TRUTH_DELTA_COLUMNS, labelled_mask, read_happy_fns,
 };
-use crate::model::WinnowrModel;
+use crate::model::{Predicting, WinnowrModel};
 use crate::numeric::metric_float;
 use crate::policy::{ModelRowDecisions, Policy, check_model_kinds, decide_model_rows};
 use crate::promote_labels::promote_mask;
@@ -1011,7 +1011,7 @@ pub fn stratify(
     let mut promote: BTreeMap<VariantType, RowIndex> = BTreeMap::new();
     for model in models {
         let vt = model.info.variant_type;
-        let decisions = decide_model_rows(table, model, policy, &mut timer)?;
+        let decisions = decide_model_rows(table, model, policy, Predicting::Whole, &mut timer)?;
         let index = RowIndex::new(decisions, table.num_rows())?;
         let d = &index.decisions;
         for (i, &row) in d.rows.iter().enumerate() {

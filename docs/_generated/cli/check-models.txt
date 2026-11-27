@@ -17,7 +17,9 @@ Options:
           The model files (`<name>.winnowr.json`), as given to `score --models`
 
   -t, --threads <THREADS>
-          The number of worker threads to use [default: OMP_NUM_THREADS when set, else 4]
+          The number of threads to use in all, including htslib's compression and decompression (but
+          not htslib's I/O thread per file, which mostly waits on the disk) [default:
+          OMP_NUM_THREADS when set, else 4]
 
       --regions <NAME=PATH>...
           Region BEDs as NAME=PATH, as given to `score --regions`; each is read and checked (a

@@ -1348,13 +1348,7 @@ mod tests {
             reference.len() as u64,
             &[read("ref", 50, "70M")],
         );
-        let inputs = ReadInputs {
-            observed_indexes: None,
-            vcf: &vcf,
-            alignments: &bam,
-            reference: &fasta,
-            expected_alignment: None,
-        };
+        let inputs = ReadInputs::new(&vcf, &bam, &fasta);
         let sites = measure_regions(&inputs, &["chr1", "chr2"], &StrlenOptions::default()).unwrap();
         // The SNP is not measured; the insertion has an empty tract (no T next to it).
         assert_eq!(
@@ -1420,13 +1414,7 @@ mod tests {
         let header = crate::testing::vcf_header(&[crate::testing::CALL_FIELDS], &["S1"]);
         let vcf = crate::testing::write_indexed_vcf(dir.path(), "in.vcf.gz", &header, &[record]);
         let bam = crate::testing::write_bam(dir.path(), "reads.bam", reference.len() as u64, &[]);
-        let inputs = ReadInputs {
-            observed_indexes: None,
-            vcf: &vcf,
-            alignments: &bam,
-            reference: &fasta,
-            expected_alignment: None,
-        };
+        let inputs = ReadInputs::new(&vcf, &bam, &fasta);
         let message = format!(
             "{:#}",
             measure_regions(&inputs, &["chr2"], &StrlenOptions::default()).unwrap_err()

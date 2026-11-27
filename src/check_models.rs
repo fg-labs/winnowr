@@ -25,7 +25,7 @@ use crate::model_set::{
     models_feature_source, recorded_digests,
 };
 use crate::pileup::PileupOptions;
-use crate::policy::NOT_DIFFICULT_REGIONS;
+use crate::policy::{NOT_DIFFICULT_REGIONS, is_indel_genotype};
 use crate::regions::{NamedBed, RegionDigest};
 use crate::strlen::StrlenOptions;
 
@@ -265,7 +265,7 @@ pub struct RegionInput {
     /// Its path.
     #[serde(serialize_with = "lossy_path::one")]
     pub path: PathBuf,
-    /// The models that use it.
+    /// The models that use it as a feature or through the default indel-genotype policy.
     #[serde(serialize_with = "lossy_path::many")]
     pub used_by: Vec<PathBuf>,
     /// Its digest (as `models[].region_digests` holds them), if it was read as a BED a run uses.
@@ -562,7 +562,9 @@ fn region_input(
         used_by: paths
             .iter()
             .zip(infos)
-            .filter(|(_, info)| info.uses_region(name))
+            .filter(|(_, info)| {
+                info.uses_region(name) || (name == NOT_DIFFICULT_REGIONS && is_indel_genotype(info))
+            })
             .map(|(path, _)| path.clone())
             .collect(),
         digest: read.map(|r| r.digest.clone()),
@@ -1330,8 +1332,8 @@ mod tests {
         let models = [save(&dir, "indel.winnowr.json", VariantType::Indel)];
         let regions = dir.path().join("regions");
         std::fs::create_dir(&regions).unwrap();
-        std::fs::write(regions.join(format!("{NOT_DIFFICULT_REGIONS}.bed")), "chr1\t0\t10\n")
-            .unwrap();
+        let unusable = regions.join(format!("{NOT_DIFFICULT_REGIONS}.bed"));
+        std::fs::write(&unusable, "chr2\t0\t10\n").unwrap();
         crate::testing::write_bgzf(
             &regions.join(format!("{NOT_DIFFICULT_REGIONS}.bed.gz")),
             b"chr1\t20\t30\n",
@@ -1340,6 +1342,10 @@ mod tests {
         assert!(!report.ok);
         assert!(checks(&report).contains(&Check::RegionAmbiguous), "{:?}", report.problems);
         assert!(!checks(&report).contains(&Check::NotDifficultMissing), "{:?}", report.problems);
+        let contigs = problem_of(&report, Check::RegionContigs);
+        assert_eq!(contigs.severity, Severity::Error);
+        assert!(contigs.message.contains(&unusable.display().to_string()));
+        assert!(report.inputs.regions.is_empty());
     }
 
     /// The BEDs are checked even when no model can be read, and a BED is not called unused while
@@ -1553,11 +1559,68 @@ mod tests {
         assert!(report.inputs.bundled_regions.is_empty());
         assert_eq!(report.inputs.regions[0].digest.as_ref().map(|d| d.intervals), Some(1));
         assert_eq!(report.inputs.regions[0].verified, None);
-        assert!(report.inputs.regions[1].used_by.is_empty());
+        assert_eq!(report.inputs.regions[1].used_by, [models[1].clone()]);
         let not_difficult = &report.set.not_difficult_regions;
         assert_eq!(not_difficult.name, NOT_DIFFICULT_REGIONS);
         assert!(not_difficult.used && not_difficult.given);
         assert_eq!(report.set.region_names, ["segdups"]);
+    }
+
+    #[rstest::rstest]
+    #[case::policy_only(Task::Genotype, VariantType::Indel, false, true)]
+    #[case::feature_and_policy(Task::Genotype, VariantType::Indel, true, true)]
+    #[case::snp_feature(Task::Genotype, VariantType::Snp, true, true)]
+    #[case::promote_feature(Task::Promote, VariantType::Indel, true, true)]
+    #[case::snp_without_feature(Task::Genotype, VariantType::Snp, false, false)]
+    #[case::promote_without_feature(Task::Promote, VariantType::Indel, false, false)]
+    fn region_users_include_only_active_feature_or_policy_roles(
+        #[case] task: Task,
+        #[case] variant_type: VariantType,
+        #[case] feature: bool,
+        #[case] used: bool,
+        #[values(false, true)] explicit: bool,
+    ) {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("regions")).unwrap();
+        let bed = dir.path().join(format!("regions/{NOT_DIFFICULT_REGIONS}.bed"));
+        std::fs::write(&bed, "chr1\t0\t10\n").unwrap();
+        let digest = crate::regions::RegionSet::from_bed("nd", &bed).unwrap().digest().unwrap();
+        let mut model = crate::testing::separable_model(task, variant_type);
+        // A recorded policy digest alone does not make an unrelated model a policy user.
+        model.info.policy_region_digests.insert(NOT_DIFFICULT_REGIONS.to_string(), digest.clone());
+        if feature {
+            model.info.region_names = vec![NOT_DIFFICULT_REGIONS.to_string()];
+            model.info.region_digests.insert(NOT_DIFFICULT_REGIONS.to_string(), digest);
+        }
+        let path = dir.path().join("model.winnowr.json");
+        model.save(&path).unwrap();
+        let models = [path.clone()];
+        let regions = [NamedBed { name: NOT_DIFFICULT_REGIONS.to_string(), path: bed }];
+        let report = check_models(&CheckInputs {
+            regions: if explicit { &regions } else { &[] },
+            ..inputs(&models)
+        });
+        assert!(report.ok, "{:?}", report.problems);
+        // A given BED is listed under `regions`, one found beside the models (if read) under
+        // `bundled_regions`.
+        let (listed, other, key) = if explicit {
+            (&report.inputs.regions, &report.inputs.bundled_regions, "regions")
+        } else {
+            (&report.inputs.bundled_regions, &report.inputs.regions, "bundled_regions")
+        };
+        assert!(other.is_empty());
+        if !used && !explicit {
+            assert!(listed.is_empty());
+        } else {
+            assert_eq!(listed.len(), 1);
+            let region = &listed[0];
+            let expected_users = if used { vec![path] } else { Vec::new() };
+            assert_eq!(region.used_by, expected_users);
+            assert_eq!(region.digest.is_some(), used);
+            assert_eq!(region.verified, used.then_some(true));
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(json["inputs"][key][0]["used_by"], serde_json::json!(expected_users));
+        }
     }
 
     /// The checks of a report's alignment provenance problems, with their severities.

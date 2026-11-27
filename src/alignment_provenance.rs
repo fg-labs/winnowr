@@ -519,9 +519,20 @@ fn profile(aligner: &str) -> Option<&'static Profile> {
     PROFILES.iter().find(|profile| profile.names.contains(&aligner))
 }
 
+/// Whether a setting key can be supplied or removed through `--alignment-tags`.
+fn valid_tag_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// A value as recorded: a path reduced to its file name, regardless of the host's separators.
 fn normalized_value(value: &str) -> String {
-    value.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or_default().to_string()
+    let name = value.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or_default();
+    if value.contains(['/', '\\']) && matches!(name, "." | "..") {
+        String::new()
+    } else {
+        name.to_string()
+    }
 }
 
 /// Records an explicit fallback value, accumulating repeats without confusing a comma inside a
@@ -533,7 +544,7 @@ fn record(
     value: &str,
     ignored: &dyn Fn(&str) -> bool,
 ) {
-    if name.is_empty() || name.contains(['/', '\\']) || ignored(name) {
+    if !valid_tag_key(name) || ignored(name) {
         return;
     }
     let value = normalized_value(value);
@@ -968,8 +979,7 @@ impl AlignmentTags {
                     None => bail!("--alignment-tags must be KEY=VALUE, KEY! or none, got: {value}"),
                 },
             };
-            let valid = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
-            if key.is_empty() || !key.chars().all(valid) {
+            if !valid_tag_key(key) {
                 bail!("--alignment-tags keys are letters, digits, '-', '_' and '.', got: {value}");
             }
             if key == SOURCE {
@@ -1398,6 +1408,34 @@ mod tests {
 
     fn parse(values: &[&str]) -> AlignmentTags {
         AlignmentTags::parse(values).unwrap().unwrap()
+    }
+
+    #[test]
+    fn review_paths_without_safe_basenames_are_redacted() {
+        for path in ["/private/project/..", "C:\\private\\project\\..", "/private/project/."] {
+            assert_eq!(normalized_value(path), "", "{path}");
+        }
+        for path in ["/private/ref.idx", "C:\\private\\ref.idx"] {
+            assert_eq!(normalized_value(path), "ref.idx");
+        }
+        assert_eq!(normalized_value("literal"), "literal");
+    }
+
+    #[test]
+    fn review_inferred_keys_can_be_edited_by_the_cli() {
+        let inferred = fallback_tags(
+            "mapper --mode=fast --ok_1.2-x=yes --bad?key=x --bad:key=x --bad!key=x --bad+key=x --@bad=x -k=15",
+        );
+        assert_eq!(
+            inferred,
+            BTreeMap::from([
+                ("mode".to_string(), "fast".to_string()),
+                ("ok_1.2-x".to_string(), "yes".to_string()),
+            ])
+        );
+        for key in inferred.keys() {
+            assert!(AlignmentTags::parse(&[format!("{key}!")]).is_ok());
+        }
     }
 
     fn parse_edits(values: &[&str]) -> TagEdits {

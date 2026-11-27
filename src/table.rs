@@ -737,12 +737,11 @@ impl FeatureTable {
         // table that read in about 70% of the time, with a lower peak memory.
         #[cfg(test)]
         tests::after_metadata();
-        // The whole footer, row-group statistics included, is compared before any row group is
-        // decoded and again once all are, so a rewrite that changes it before or during decoding
-        // is rejected; the footer ends the file, so a change of length is rejected first. Each
-        // row group checks only the length and modification time, so the footer is not read
-        // once per row group (its size grows with their number). A rewrite that leaves the
-        // length and footer bytes identical is not detected.
+        // Shared checks compare the whole footer, row-group statistics included, before decoding
+        // and again after all row groups finish. Each worker checks only length and modification
+        // time, avoiding a full footer read per group (the footer grows with their number).
+        // Rewrites may escape detection if they preserve length, modification time and footer
+        // bytes, or restore all three between observations.
         let changed = || format!("{} changed while it was read", path.display());
         let reread = || {
             format!(
