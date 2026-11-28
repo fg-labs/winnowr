@@ -180,5 +180,7 @@ the reads are measured first, then the models score. A model that cannot score t
 of a feature the table lacks) fails while the reads are measured, stopping the measurement, only if
 it scores while they are measured: a model that does not need the reads, with more than one thread.
 Any other model fails only once the reads have been measured, including a model that needs them,
-whether alone or among models that do not. See
-[Performance tuning](performance.md#threads).
+whether alone or among models that do not.
+
+winnowr 0.1.2 and earlier ran `score --alignments` on up to twice `-t` threads: if you gave it
+`-t N/2` to stay within N cores, pass `-t N` now. See [Performance tuning](performance.md#threads).

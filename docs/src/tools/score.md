@@ -28,8 +28,9 @@ Incomplete alignment-option inference produces a warning, or an error with `--st
 
 `-t` is the total thread count, `--alignments` included: set it to the number of cores `score` may
 use (e.g. the CPU count). With `--alignments`, the reads are measured while the models that do not
-need them score, within `-t` threads; `-t 1` measures the reads, then scores. See
-[Performance tuning](../user-guide/performance.md#threads).
+need them score, within `-t` threads; `-t 1` measures the reads, then scores. winnowr 0.1.2 and
+earlier ran `score --alignments` on up to twice `-t` threads: if you passed `-t N/2` to stay
+within N cores, pass `-t N` now. See [Performance tuning](../user-guide/performance.md#threads).
 
 ## Usage
 

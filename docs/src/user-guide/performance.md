@@ -15,6 +15,14 @@ that is not a positive number is ignored, with a warning.
   took, is logged at info level. `score` writes and indexes its VCF within `-t` threads too:
   htslib's compression and decompression threads are counted in them (apart from an I/O thread
   per file, which mostly waits on the disk).
+- In winnowr 0.1.2 and earlier, `score --alignments` gave the read measurement `-t` threads and
+  the models that do not need the reads another `-t`, so it ran up to twice `-t` threads, and
+  `-t N/2` kept it within N cores. `-t` is now the total: to use N cores, pass `-t N`, as
+  `-t N/2` now runs on N/2 threads and leaves the other cores idle. Every `score` also writes its
+  VCF within `-t` now, with no change to `-t` needed: when it writes in one pass (a BCF or
+  uncompressed output, or an input that is not an indexed, bgzipped VCF or has records at
+  POS 0), htslib's reader had `-t` workers and the writer of a compressed output another `-t`,
+  where the two now share `-t` - 1.
 - At debug level (`RUST_LOG=winnowr=debug`), every command logs how long each of its phases
   took and the CPU time the process used meanwhile, e.g. `writing the VCF: writing the shards took
   1.08s (cpu 12.31s)`. The CPU time is the whole process's, of every thread: phases that run at

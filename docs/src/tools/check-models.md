@@ -144,8 +144,8 @@ those two keys; a readable one also has:
 | `region_digests` | the digest of each of those region BEDs (`sha256`, `intervals`, `bases`), by name: `{}` if it records none |
 | `policy_region_digests` | the digest of each region BED of the policy it records (`train --policy-regions`): `{}` if none |
 | `training_samples` | the training samples |
-| `feature_source` | `gvcf`, `vcf`, or `alignments:` and the read settings (e.g. `alignments:mapq20,bq10,flank5`) |
-| `alignment_settings` | the read settings of the `alignments` source, else `null` |
+| `feature_source` | `gvcf`, `vcf`, or `alignments:` and the read settings (e.g. `alignments:mapq20,bq10,flank5`, with `,maxreadsN` when the depth cap is not 600) |
+| `alignment_settings` | the read settings of the `alignments` source (`feature_source` without `alignments:`), else `null` |
 | `strlen_settings` | the read settings its repeat-length evidence must be measured with (the legacy `mapq0,flank2` for a model that records none), or `null` |
 | `pileup_settings` | the settings its pileup evidence must be measured with, or `null` |
 | `needs` | what scoring with it needs: `strlen` and `pileup` (tables, or `--alignments`), `alignments` (the reads, for the `alignments` source) and `gvcf` (the raw annotations, in the VCF or a gVCF, for the `gvcf` source) |
