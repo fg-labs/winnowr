@@ -1390,6 +1390,77 @@ mod tests {
         assert!(derived.as_alt_frac.iter().all(|value| value.is_nan()));
     }
 
+    /// Without any FORMAT/SB declaration, the VCF source must still read INFO/SOR.
+    /// INFO values here are independent test inputs, not a claim of real-data GATK parity.
+    #[test]
+    fn the_vcf_source_reads_info_mq_and_sor_without_a_strand_bias_header() {
+        let dir = TempDir::new().unwrap();
+        let fields = CALL_FIELDS
+            .split_inclusive('\n')
+            .filter(|line| !line.starts_with("##FORMAT=<ID=SB,"))
+            .collect::<String>();
+        let records = [
+            "chr1 100 . A C 50 PASS DP=2;MQ=51.27;SOR=0.693 GT:AD:PL 0/1:1,1:40,0,50",
+            "chr1 200 . A G 50 PASS DP=10;MQ=39.48;SOR=2.345 GT:AD:PL 0/1:5,5:40,0,50",
+            "chr1 300 . A T 50 PASS DP=4 GT:AD:PL 0/1:2,2:40,0,50",
+        ];
+        let vcf = write_vcf(
+            &dir,
+            "native-info.vcf.gz",
+            &[&fields, DEFAULT_MODE_FIELDS],
+            &["S1"],
+            &records,
+        );
+        let records = extract_vcf_source(&vcf, &["chr1"]).unwrap();
+        assert!(records.iter().all(|record| record.sb_ref_fwd.is_nan()));
+        let derived = crate::features::derive_features(&records, &[], None);
+        for (observed, expected) in derived.mq[..2].iter().zip([51.27f32, 39.48f32]) {
+            assert!((observed - f64::from(expected)).abs() < 1e-12);
+        }
+        assert_eq!(derived.sor[..2], [f64::from(0.693f32), f64::from(2.345f32)]);
+        assert_nan(derived.mq[2], "mq without native INFO/MQ");
+        assert_nan(derived.sor[2], "sor without native INFO/SOR");
+    }
+
+    /// SOR uses low-count SB rather than zeroing totals one or two (FisherStrand's threshold),
+    /// and valid SB takes precedence over a conflicting INFO/SOR.
+    #[test]
+    fn low_strand_counts_keep_their_sor_and_override_info() {
+        let dir = TempDir::new().unwrap();
+        // These values follow the odds-ratio equation directly, independently of the feature helper.
+        let cases = [
+            ("0,0,0,0", 2.0f64.ln()),
+            ("0,0,1,0", 5.0f64.ln()),
+            ("0,0,0,1", 5.0f64.ln()),
+            ("1,0,0,0", 1.25f64.ln()),
+            ("0,1,0,0", 1.25f64.ln()),
+            ("0,0,2,0", 10.0f64.ln()),
+            ("0,0,0,2", 10.0f64.ln()),
+            ("2,0,0,0", (10.0f64 / 9.0).ln()),
+            ("0,2,0,0", (10.0f64 / 9.0).ln()),
+            ("1,0,0,1", 4.25f64.ln()),
+        ];
+        let lines: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (sb, _))| {
+                format!(
+                    "chr1 {} . A C 50 PASS DP=2;MQ=50;SOR=999 GT:AD:SB:PL 0/1:1,1:{sb}:40,0,50",
+                    index + 1
+                )
+            })
+            .collect();
+        let records: Vec<_> = lines.iter().map(String::as_str).collect();
+        let vcf = write_vcf(&dir, "low-sb.vcf.gz", &VCF_SOURCE, &["S1"], &records);
+        let records = extract_vcf_source(&vcf, &["chr1"]).unwrap();
+        assert_eq!(records.len(), cases.len());
+        let derived = crate::features::derive_features(&records, &[], None);
+        assert_eq!(derived.sor.len(), cases.len());
+        for (observed, (sb, expected)) in derived.sor.iter().zip(cases) {
+            assert!((observed - expected).abs() < 1e-12, "SB={sb}: {observed} != {expected}");
+        }
+    }
+
     /// As ReblockGVCF drops the alternates a genotype does not call, VarDP sums the depths of the
     /// reference and the called alternates only, and n_alt counts the called ones.
     #[test]

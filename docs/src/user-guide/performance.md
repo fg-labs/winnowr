@@ -71,3 +71,53 @@ allocations) asks for transparent huge pages (`madvise`) for its memory, so it g
 default THP setting (`madvise`); setting THP to `always`
 (`/sys/kernel/mm/transparent_hugepage/enabled`) gains nothing more. On macOS, only winnowr's own
 (Rust) allocations use mimalloc.
+
+## Feature-table reader validation
+
+A controlled comparison read the same programmatically generated labelled Parquet table with
+the reader before alignment provenance (`d162e784`, before #38) and the current hardened reader
+(`f73d4c7`, including #38 and #47). This measures the cumulative reader changes, not #38 alone.
+The table contains 4,835,999 calls, 58 columns and synthetic three-class labels; its Zstandard
+file is 47,386,128 bytes. Depths, qualities and strand counts vary deterministically, while many
+optional annotations are NaN. Its row count and schema resemble a whole-genome table, but its
+synthetic distributions and compressibility do not represent all real samples.
+
+Both builds used Rust 1.100.0's release profile, mimalloc and eight Rayon threads on an Apple
+M2 Max (12 cores, 64 GiB RAM). The same portable test harness called
+`FeatureTable::read_parquet_selected` in each build. Full reads decoded all columns;
+projected reads retained eight columns and 3,868,799 SNP rows. Before timing, a stock
+Parquet/Arrow decoder independent of winnowr's reader checked every
+decoded column, float bit pattern (including missing values), schema and metadata between
+builds for both operations. Post-read checks also verify exact projected columns and generated
+call identities. Each timed process initializes its Rayon pool before starting the timer.
+
+The warmed-initialization two-pair probe had about 12% full-read spread (range width over the
+mean), so the comparison used seven further pairs, alternating build order with warm input
+pages. Times below include decoding, filtering and concatenation, but exclude process startup,
+pool initialization, generation, identity checks, output writes, comparison and the returned
+table's final drop:
+
+| operation | before: median (range), seconds | current: median (range), seconds |
+|-----------|---------------------------------|----------------------------------|
+| full table | 0.1932 (0.1905-0.1981) | 0.1857 (0.1804-0.1898) |
+| SNP projection | 0.0637 (0.0608-0.0660) | 0.0649 (0.0619-0.0663) |
+
+All reads succeeded and returned the expected row counts. Full reads were faster in this run;
+the projected-read ranges overlap and do not resolve small changes. These short, synthetic
+reader-only measurements do not establish a general speedup or predict end-to-end training or
+evaluation time. The current libtest reader also executes
+inactive race-test hooks, including one mutex acquisition per row group, which the historical
+libtest and shipping binary lack. That overhead is unmeasured and further limits interpretation
+of small differences.
+
+To reproduce, build the library tests in release mode at each revision, copying the unchanged
+`src/validation_tests.rs` into the historical tree and adding `#[cfg(test)] mod validation_tests;`
+to its `src/lib.rs`. Pass the two test executables printed by Cargo to:
+
+```console
+ROWS=4835999 REPS=7 THREADS=8 bash scripts/benchmark-table-reads.sh \
+  /path/to/before-libtest /path/to/current-libtest /scratch/new-table-comparison
+```
+
+The script generates data outside the repository, verifies decoded parity, then times reads.
+Run it without competing CPU-heavy work, and choose repetitions from the observed spread.

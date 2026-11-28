@@ -61,6 +61,8 @@ mod table;
 mod testing;
 mod thresholds;
 mod training;
+#[cfg(test)]
+mod validation_tests;
 mod vcf;
 mod vcf_source;
 mod version;
