@@ -1297,10 +1297,11 @@ impl Target {
     }
 }
 
-/// Measures reads at targets on one contig: each read (see [`sweep_clusters`]) is counted at
-/// every site whose span it overlaps, until the site is full (at most [`MAX_READS`] reads are
-/// counted at a site's alleles), and, with `annotations`, in the read annotations of every target
-/// whose annotated span it overlaps (see [`MapqSums`]). Overlapping mates are both counted.
+/// Measures reads at targets on one contig, reading targets at most `cluster_gap` apart from one
+/// fetch: each read (see [`sweep_clusters`]) is counted at every site whose span it overlaps,
+/// until the site is full (at most [`MAX_READS`] reads are counted at a site's alleles), and, with
+/// `annotations`, in the read annotations of every target whose annotated span it overlaps (see
+/// [`MapqSums`]). Overlapping mates are both counted.
 ///
 /// A site's counts do not depend on whether the read annotations are measured.
 fn measure_targets(
@@ -1310,6 +1311,7 @@ fn measure_targets(
     options: &PileupOptions,
     annotations: Option<&ReadAnnotationOptions>,
     contig: &[u8],
+    cluster_gap: i64,
 ) -> Result<Vec<(Accumulator, MapqSums)>> {
     let spans: Vec<(i64, i64)> = targets.iter().map(Target::span).collect();
     let sums = |target: &Target| MapqSums {
@@ -1328,7 +1330,7 @@ fn measure_targets(
             .map_or(LEGACY_MAX_READS, ReadAnnotationOptions::max_reads),
         measured: targets.iter().map(|target| (Accumulator::default(), sums(target))).collect(),
     };
-    sweep_clusters(reads, tid, &spans, &mut counting)?;
+    sweep_clusters(reads, tid, &spans, cluster_gap, &mut counting)?;
     Ok(counting.measured)
 }
 
@@ -1620,14 +1622,18 @@ fn measure_sites<S: AsRef<str>>(
         }
         let tid = shard.tid(inputs.alignments)?;
         let (rows, targets): (Vec<PileupRow>, Vec<Target>) = pending.into_iter().unzip();
-        let measured =
-            measure_targets(shard.reads, tid, &targets, options, annotations, shard.contig)
-                .with_context(|| {
-                    format!(
-                        "failed to count reads on {}:{}-{}",
-                        shard.chrom, shard.start, shard.end
-                    )
-                })?;
+        let measured = measure_targets(
+            shard.reads,
+            tid,
+            &targets,
+            options,
+            annotations,
+            shard.contig,
+            shard.cluster_gap,
+        )
+        .with_context(|| {
+            format!("failed to count reads on {}:{}-{}", shard.chrom, shard.start, shard.end)
+        })?;
         Ok(rows
             .into_iter()
             .zip(targets)
@@ -1657,6 +1663,7 @@ mod tests {
     use super::*;
     use crate::evidence::read_tables;
     use crate::model_evidence::check_options;
+    use crate::read_pass::CLUSTER_GAP;
     use crate::testing::{ReadFiles, TestRead, write_bam};
 
     /// Retained measurements must not carry geometric spare capacity alongside the feature
@@ -1733,7 +1740,7 @@ mod tests {
     ) -> Result<Vec<Accumulator>> {
         let targets: Vec<Target> =
             sites.iter().map(|site| Target { site: Some(site.clone()), annotated: None }).collect();
-        let measured = measure_targets(reads, tid, &targets, options, None, &[])?;
+        let measured = measure_targets(reads, tid, &targets, options, None, &[], CLUSTER_GAP)?;
         Ok(measured.into_iter().map(|(accumulator, _)| accumulator).collect())
     }
 

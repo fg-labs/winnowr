@@ -595,8 +595,8 @@ impl TractAccumulator {
 
 /// Measures tracts on one contig with `options`, returning the evidence per tract. A tract gets
 /// the reads a fetch of its own span (the tract and its flanks) would return, in the same order,
-/// up to [`MAX_READS`] measured, but each read is read once per cluster of nearby tracts rather
-/// than once per tract (see [`sweep_clusters`]).
+/// up to [`MAX_READS`] measured, but each read is read once per cluster of tracts at most
+/// `cluster_gap` apart rather than once per tract (see [`sweep_clusters`]).
 ///
 /// # Errors
 ///
@@ -606,12 +606,13 @@ pub fn measure_tracts(
     tid: u32,
     tracts: &[RepeatTract],
     options: &StrlenOptions,
+    cluster_gap: i64,
 ) -> Result<Vec<TractEvidence>> {
     let spans: Vec<(i64, i64)> =
         tracts.iter().map(|tract| tract_window(tract, options.flank_of(tract)).1).collect();
     let accumulators = tracts.iter().map(|tract| TractAccumulator::new(tract, options)).collect();
     let mut measuring = Measuring { accumulators };
-    sweep_clusters(reads, tid, &spans, &mut measuring)?;
+    sweep_clusters(reads, tid, &spans, cluster_gap, &mut measuring)?;
     Ok(measuring.accumulators.into_iter().map(TractAccumulator::finish).collect())
 }
 
@@ -779,7 +780,7 @@ fn measure_shard(
     }
     let tid = shard.tid(inputs.alignments)?;
     let tracts: Vec<RepeatTract> = pending.iter().map(|(.., tract)| tract.clone()).collect();
-    let evidence = measure_tracts(shard.reads, tid, &tracts, options)
+    let evidence = measure_tracts(shard.reads, tid, &tracts, options, shard.cluster_gap)
         .with_context(|| format!("failed to measure {chrom}:{start}-{end}"))?;
     for ((pos, reference, alt, tract), evidence) in pending.into_iter().zip(evidence) {
         sites.push(StrlenSite { chrom: chrom.to_string(), pos, reference, alt, tract, evidence });
@@ -840,6 +841,7 @@ mod tests {
     use super::*;
     use crate::evidence::read_tables;
     use crate::model_evidence::check_options;
+    use crate::read_pass::{CLUSTER_GAP, CRAM_CLUSTER_GAP, cluster_gap};
 
     /// Measures a tract as [`measure_tract`] does, with other [`StrlenOptions`].
     ///
@@ -1175,7 +1177,8 @@ mod tests {
     fn measuring_tracts_together_matches_measuring_each() {
         // Reads with assorted CIGARs, flags and qualities over a 60 kb contig (a simple LCG keeps
         // them deterministic), a pile-up deeper than MAX_READS, and tracts that overlap, sit at
-        // the contig start, lie in gaps without reads, or are more than CLUSTER_GAP apart.
+        // the contig start, lie in gaps without reads, or are more than CLUSTER_GAP (but less
+        // than CRAM_CLUSTER_GAP) apart, in a BAM and a CRAM of several slices.
         let mut state = 12345u64;
         let mut next = |n: u64| {
             state = state
@@ -1186,7 +1189,7 @@ mod tests {
         let cigars = ["100M", "40M3D60M", "50M2I48M", "10S90M", "90M10S", "30M5D30M5I35M", "1M"];
         let flags = [0u16, 0, 0, 0, 0x10, 0x400, 0x100, 0x800];
         let mut specs: Vec<(String, i64, &str, u16, u8, u8)> = Vec::new();
-        for i in 0..4000 {
+        for i in 0..24_000 {
             let pos = next(20_000) as i64 + if i % 2 == 0 { 0 } else { 35_000 };
             let cigar = cigars[next(cigars.len() as u64) as usize];
             let flag = flags[next(flags.len() as u64) as usize];
@@ -1210,18 +1213,34 @@ mod tests {
             .collect();
         let dir = TempDir::new().unwrap();
         let bam = crate::testing::write_bam(dir.path(), "reads.bam", 60_000, &reads);
+        let reference = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(60_000))]);
+        let cram = crate::testing::bam_to_cram(&bam, &reference);
         let mut tracts: Vec<RepeatTract> = vec![a_tract(0), a_tract(1), a_tract(5_040)];
-        tracts.extend((0..300).map(|_| a_tract(next(59_900) as usize)));
+        // Tracts over the reads at 0-20 kb and 47-59.9 kb, and one alone at 33 kb, so that the
+        // tracts form three clusters more than CLUSTER_GAP apart but one with CRAM_CLUSTER_GAP.
+        tracts.extend((0..200).map(|_| a_tract(next(20_000) as usize)));
+        tracts.push(a_tract(33_000));
+        tracts.extend((0..100).map(|_| a_tract(47_000 + next(12_900) as usize)));
         tracts.push(RepeatTract { end: 5_200, ..a_tract(5_000) }); // longer than the reads
         tracts.push(a_tract(5_040)); // a repeat of a tract
-        let mut reader = rust_htslib::bam::IndexedReader::from_path(&bam).unwrap();
-        let together = measure_tracts(&mut reader, 0, &tracts, &StrlenOptions::default()).unwrap();
-        let each: Vec<TractEvidence> =
-            tracts.iter().map(|tract| measure_tract(&mut reader, 0, tract).unwrap()).collect();
-        assert_eq!(together, each);
-        assert!(each.iter().any(|e| e.n_overlap == MAX_READS + 1));
-        assert!(each.iter().any(|e| e.n_overlap == 0));
-        assert!(each.iter().filter(|e| e.n_spanning > 0).count() > 100);
+        let mut per_format = Vec::new();
+        for path in [&bam, &cram] {
+            let mut reader = rust_htslib::bam::IndexedReader::from_path(path).unwrap();
+            reader.set_reference(&reference).unwrap();
+            let each: Vec<TractEvidence> =
+                tracts.iter().map(|tract| measure_tract(&mut reader, 0, tract).unwrap()).collect();
+            // However far apart the tracts read from one fetch may be, each gets its own reads.
+            for gap in [0, CLUSTER_GAP, CRAM_CLUSTER_GAP, cluster_gap(path), i64::MAX / 2] {
+                let options = StrlenOptions::default();
+                let together = measure_tracts(&mut reader, 0, &tracts, &options, gap).unwrap();
+                assert_eq!(together, each, "{} with gap {gap}", path.display());
+            }
+            assert!(each.iter().any(|e| e.n_overlap == MAX_READS + 1));
+            assert!(each.iter().any(|e| e.n_overlap == 0));
+            assert!(each.iter().filter(|e| e.n_spanning > 0).count() > 100);
+            per_format.push(each);
+        }
+        assert_eq!(per_format[0], per_format[1], "a BAM and its CRAM give the same evidence");
     }
 
     #[test]
@@ -1294,8 +1313,8 @@ mod tests {
         // Measured in a sweep, each setting gives what the tract's own fetch gives.
         for settings in ["legacy", "legacy,mapq20", "mates", "default", "legacy,mapq20,mates"] {
             let option: StrlenOptions = settings.parse().unwrap();
-            let swept =
-                measure_tracts(&mut reader, 0, std::slice::from_ref(&tract), &option).unwrap();
+            let tracts = std::slice::from_ref(&tract);
+            let swept = measure_tracts(&mut reader, 0, tracts, &option, CLUSTER_GAP).unwrap();
             let alone = measure_tract_with(&mut reader, 0, &tract, &option).unwrap();
             assert_eq!(swept, vec![alone], "{settings}");
         }
