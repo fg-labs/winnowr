@@ -205,10 +205,8 @@ of at most two, 550 of them nonzero: `StrandOddsRatio` uses a minimum count of z
 `FisherStrand`'s two. QD and n_alt each differ at 163 calls; these features remain approximations,
 not interchangeable training inputs across sources.
 
-The genotyper was the local GATK development build
-`4.7.0.0-hpgc-v5-3-g5302144-SNAPSHOT`, source commit
-`5302144f35f3d453f8b612808e95f3ad43e4b977`, with HTSJDK 5.0.2 and Java 17.0.18. It was not an
-official GATK release. The source checkout was clean. RMSMappingQuality, StrandOddsRatio and
+The genotyper was a local GATK 4.7.0.0 development build from a clean source checkout, with
+HTSJDK 5.0.2 and Java 17.0.18. It was not an official GATK release. RMSMappingQuality, StrandOddsRatio and
 StrandBiasTest were unchanged from GATK 4.6.2.0; GenotypeGVCFs' relevant source differences
 concerned somatic calling and GenomicsDB setup, neither used here. The decoder dependency does
 differ from that release's HTSJDK 4.2.0, so this validates this build and dataset, not every
@@ -295,7 +293,8 @@ The numbers above are, for each feature, the share of calls whose values are equ
 
 ### The `alignments` source
 
-On the same calls, with the sample's CRAM, the `gvcf` and `alignments` sources agree as follows.
+On the 123,031 calls of the historical control above (its VCF retained FORMAT/SB), with the
+sample's CRAM, the `gvcf` and `alignments` sources agree as follows.
 The VCF was called in DRAGEN mode, so the reads were measured with
 `--alignment-settings mapq1`; the second table is of the default settings (`mapq20`), which do
 not match this VCF's caller. The "missing" column counts calls with a `gvcf` value and no
@@ -317,8 +316,8 @@ not match this VCF's caller. The "missing" column counts calls with a `gvcf` val
 | `as_alt_frac` | 54.3% | 0 | 0.051 | 0.53 | 1 | 1,620 |
 
 `sor` and `n_alt` are derived as the `vcf` source derives them, and so is `qd` but for its
-zero-VarDP fallback; they differ from the `gvcf` source as the `vcf` source's do (above). For the
-read-measured features, with `mapq1`:
+zero-VarDP fallback; they differ from the `gvcf` source as the `vcf` source's do in that control
+(above). For the read-measured features, with `mapq1`:
 
 - `mq` is within 1 of the gVCF's at 92.4% of calls, and within 5 at 99.4%.
 - `dp_norm` is within 0.1 at 86.5% of calls, and within 0.25 at 95.6%. It is rarely equal because
