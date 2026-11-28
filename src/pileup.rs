@@ -1522,7 +1522,9 @@ pub fn measure_annotations_and_pileup<S: AsRef<str>>(
     if options.reads_alleles_as(annotations) {
         let what = "measuring the read annotations and the pileup";
         let sites = measure_sites(inputs, regions, &options, Some(annotations), what)?;
-        let rows = sites.iter().filter(|site| site.counted).map(|site| site.row.clone()).collect();
+        // These cloned rows are retained too; filtering otherwise loses the exact size hint.
+        let mut rows = Vec::with_capacity(sites.iter().filter(|site| site.counted).count());
+        rows.extend(sites.iter().filter(|site| site.counted).map(|site| site.row.clone()));
         return Ok((sites, Some(PileupTables::new(options, rows))));
     }
     let sites = measure_annotations(inputs, regions, annotations)?;
@@ -1632,7 +1634,12 @@ fn measure_sites<S: AsRef<str>>(
             .collect())
     })?;
     timer.lap_in(what, "the shards");
-    let sites = per_shard.into_iter().flatten().collect();
+    // These sites stay live alongside the calls and feature table. Flattening cannot hint at
+    // every shard's length, so preallocate instead of retaining geometric spare capacity.
+    let mut sites = Vec::with_capacity(per_shard.iter().map(Vec::len).sum());
+    for shard in per_shard {
+        sites.extend(shard);
+    }
     timer.lap_in(what, "collecting the sites");
     Ok(sites)
 }
@@ -1645,6 +1652,71 @@ mod tests {
     use crate::evidence::read_tables;
     use crate::model_evidence::check_options;
     use crate::testing::{ReadFiles, TestRead, write_bam};
+
+    /// Retained measurements must not carry geometric spare capacity alongside the feature
+    /// table. Allow modest slack rather than requiring an allocator's exact capacity.
+    #[rstest::rstest]
+    #[case::all_counted(false)]
+    #[case::mixed(true)]
+    fn measured_vectors_do_not_retain_geometric_spare_capacity(#[case] mixed: bool) {
+        let dir = TempDir::new().unwrap();
+        let mut sequence = vec![b'A'; 200];
+        let mut records = Vec::new();
+        for pos in (10..=110).step_by(10) {
+            records.push(format!("chr1\t{pos}\t.\tA\tC\t50\tPASS\t.\tGT\t0/1"));
+            if mixed {
+                // Complex indels retain annotations but cannot contribute a pileup row.
+                sequence[pos + 3..pos + 5].copy_from_slice(b"CT");
+                records.push(format!("chr1\t{}\t.\tCT\tGTT\t50\tPASS\t.\tGT\t0/1", pos + 4));
+            }
+        }
+        let sequence = String::from_utf8(sequence).unwrap();
+        let lines: Vec<&str> = records.iter().map(String::as_str).collect();
+        let fixture = ReadFiles::write(dir.path(), &[("chr1", &sequence)], &lines, &[]);
+        let annotations = ReadAnnotationOptions::default();
+        let regions = ["chr1:1-40", "chr1:41-80", "chr1:81-200"];
+        let (sites, tables) = measure_annotations_and_pileup(
+            &fixture.inputs(),
+            &regions,
+            &annotations,
+            Some(PileupOptions::default()),
+        )
+        .unwrap();
+        let expected_positions: &[u64] = if mixed {
+            &[
+                10, 14, 20, 24, 30, 34, 40, 44, 50, 54, 60, 64, 70, 74, 80, 84, 90, 94, 100, 104,
+                110, 114,
+            ]
+        } else {
+            &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110]
+        };
+        let positions: Vec<u64> = sites.iter().map(|site| site.row.pos).collect();
+        assert_eq!(positions, expected_positions);
+        for site in &sites {
+            let counted = site.row.pos % 10 == 0;
+            assert_eq!(site.counted, counted);
+            assert_eq!(site.row.chrom, "chr1");
+            assert_eq!(site.row.reference, if counted { "A" } else { "CT" });
+            assert_eq!(site.row.alt, if counted { "C" } else { "GTT" });
+        }
+        let rows = tables.unwrap().rows;
+        let expected_rows: Vec<PileupRow> = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110]
+            .into_iter()
+            .map(|pos| PileupRow {
+                chrom: "chr1".into(),
+                pos,
+                reference: "A".into(),
+                alt: "C".into(),
+                n_reads: 0,
+                counts: [[0; 3]; 3],
+            })
+            .collect();
+        assert_eq!(rows, expected_rows);
+        // A quarter of the live rows allows slack while catching geometric growth and, in the
+        // mixed case, allocating the filtered rows for all sites rather than just counted sites.
+        assert!(sites.capacity() <= sites.len() * 5 / 4, "{} site slots", sites.capacity());
+        assert!(rows.capacity() <= rows.len() * 5 / 4, "{} row slots", rows.capacity());
+    }
 
     /// The reads counted at sites alone, without read annotations.
     fn count_sites(
