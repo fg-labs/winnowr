@@ -181,14 +181,18 @@ fn text_reader_with_identity(
     Ok((reader, identity))
 }
 
-/// Opens a table that winnowr wrote, as [`open_text`] does, but rejects a BGZF file without the
-/// end-of-file block: winnowr always writes it, so the table was truncated (e.g. a killed run).
+/// Opens a plain, gzip or BGZF table that winnowr wrote (whatever its extension). A regular file
+/// is read, and decompressed if gzip, from the handle checked, and is rejected if it is BGZF
+/// without the end-of-file block: winnowr always writes it, so the table was truncated (e.g. a
+/// killed run). Anything else (e.g. a pipe) is read with [`open_text`], unchecked, as reading its
+/// start would consume it.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be opened, changes from regular to nonregular while being
-/// opened, has a malformed gzip extra field, or is BGZF-compressed (whatever subfields precede
-/// `BC`) without the end-of-file block.
+/// opened, or is a regular file with a malformed gzip extra field or BGZF-compressed (whatever
+/// subfields precede `BC`) without the end-of-file block. Further read or decompression errors
+/// (e.g. a corrupt or truncated gzip member) are reported by the reader.
 pub fn open_table<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
     open_table_with(path.as_ref(), || {}, || {})
 }
@@ -276,13 +280,15 @@ fn check_still_regular(metadata: &std::fs::Metadata, path: &Path) -> Result<()> 
 /// instead of continuing to a second open for rows. The nonblocking open can still release a
 /// FIFO producer on that failed run; it does not preserve the stream for a retry.
 ///
-/// Prelude inspection needs only the first lines, so decompression here uses flate2; tables are
-/// still read in full with [`open_table`] (htslib).
+/// Prelude inspection needs only the first lines; a table's rows are read in full with
+/// [`open_table`], which decompresses a regular file the same way, from the handle it checked.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, changes from regular to nonregular while being
-/// opened, or is BGZF-compressed without the end-of-file block.
+/// opened, has a malformed gzip extra field, or is BGZF-compressed without the end-of-file block.
+/// Further read or decompression errors (e.g. a corrupt or truncated gzip member) are reported by
+/// the reader.
 pub fn open_regular_table(path: &Path) -> Result<Option<Box<dyn BufRead>>> {
     open_regular_table_with(path, || {})
 }
@@ -697,10 +703,84 @@ mod tests {
         ] {
             std::fs::write(&path, &bytes).unwrap();
             assert_eq!(read_regular(&path).unwrap(), Some(expected.clone()), "{bytes:?}");
-            // The rows of a table are read with htslib, from the handle checked.
+            // Rows decode as the prelude does (`open_table_reads_the_file_it_checked` pins the
+            // handle).
             let mut rows = Vec::new();
             open_table(&path).unwrap().read_to_end(&mut rows).unwrap();
             assert_eq!(rows, expected, "{bytes:?}");
+        }
+    }
+
+    /// Retained-handle readers must consume every member and reject corruption, not just a
+    /// missing BGZF sentinel. Every fixture opens; the corruption must surface while decoding.
+    #[test]
+    fn retained_gzip_readers_reject_corrupt_and_truncated_members() {
+        type Open = fn(&Path) -> Result<Box<dyn BufRead>>;
+        let readers: [(&str, Open); 4] = [
+            ("table", |path| open_table(path)),
+            (
+                "regular prelude",
+                |path| Ok(open_regular_table(path)?.expect("regular test fixture")),
+            ),
+            ("identity text", |path| open_text_with_identity(path).map(|(reader, _)| reader)),
+            ("regular identity text", |path| {
+                open_regular_text_with_identity(path).map(|(reader, _)| reader)
+            }),
+        ];
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("corrupt.tsv.gz");
+        // Two members, so a reader that stops after the first fails the valid control.
+        let good = [gzip(b"a\n"), gzip(b"b\n")].concat();
+        std::fs::write(&path, &good).unwrap();
+        for (name, open) in readers {
+            let mut decoded = Vec::new();
+            open(&path).unwrap().read_to_end(&mut decoded).unwrap();
+            assert_eq!(decoded, b"a\nb\n", "{name}");
+        }
+        let mut bad_method = good.clone();
+        bad_method[2] = 0;
+        let mut bad_body = good.clone();
+        bad_body[10] = 0x07; // A final DEFLATE block with the reserved block type.
+        let mut bad_crc = good.clone();
+        let crc = bad_crc.len() - 8;
+        bad_crc[crc] ^= 1;
+        let mut bad_size = good.clone();
+        let size = bad_size.len() - 4;
+        bad_size[size] ^= 1;
+        let mut bad_bgzf_crc = bgzf_block(b"a\nb\n");
+        let crc = bad_bgzf_crc.len() - 8;
+        bad_bgzf_crc[crc] ^= 1;
+        let cases = [
+            ("compression method", bad_method),
+            ("reserved block type", bad_body),
+            ("CRC", bad_crc.clone()),
+            ("ISIZE", bad_size),
+            ("missing body", good[..10].to_vec()),
+            ("truncated body", good[..good.len() - 9].to_vec()),
+            ("truncated trailer", good[..good.len() - 1].to_vec()),
+            ("bad later member", [good.clone(), bad_crc].concat()),
+            ("truncated later member", [good.clone(), good[..good.len() - 1].to_vec()].concat()),
+            ("trailing garbage", [good, b"bad".to_vec()].concat()),
+            ("BGZF CRC with valid sentinel", [bad_bgzf_crc, BGZF_EOF.to_vec()].concat()),
+        ];
+        for (case, bytes) in cases {
+            std::fs::write(&path, bytes).unwrap();
+            for (name, open) in readers {
+                let mut reader = open(&path)
+                    .unwrap_or_else(|error| panic!("{name}, {case}: open failed: {error:#}"));
+                let error = reader
+                    .read_to_end(&mut Vec::new())
+                    .expect_err(&format!("{name} accepted {case}"));
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidInput
+                            | std::io::ErrorKind::InvalidData
+                            | std::io::ErrorKind::UnexpectedEof
+                    ),
+                    "{name}, {case}: unexpected error {error}"
+                );
+            }
         }
     }
 

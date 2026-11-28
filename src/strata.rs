@@ -1557,6 +1557,15 @@ mod tests {
                 &mut text,
             )
             .unwrap();
+            // The decoder above reads only the first gzip member; an independent decoder (htslib)
+            // reads every member, so equal text means one complete member and no further data.
+            let mut independent = String::new();
+            std::io::Read::read_to_string(
+                &mut rust_htslib::bgzf::Reader::from_path(&calls).unwrap(),
+                &mut independent,
+            )
+            .unwrap();
+            assert_eq!(text, independent);
             let lines: Vec<&str> = text.lines().collect();
             assert_eq!(lines.len(), 5);
             assert!(lines[0].starts_with("row\tchrom\tpos\tref\talt\tfilter\tvariant_type\tgt\tstratum\tlabel_v421\tlabel_v5q\t"));
