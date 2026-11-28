@@ -470,6 +470,35 @@ fn review_read_files_declare_their_contigs_in_the_vcf() {
     assert!(shards.iter().all(|chrom| chrom == "chrX"));
 }
 
+/// Writes the reads of an indexed BAM (e.g. of [`write_bam`]) as an indexed CRAM next to it,
+/// encoded against `reference` (e.g. of [`write_fasta`]), and returns its path.
+pub fn bam_to_cram(bam: &Path, reference: &Path) -> PathBuf {
+    use rust_htslib::bam::Read as _;
+    let header = rust_htslib::bam::Reader::from_path(bam).unwrap().header().clone();
+    bam_to_cram_with_header(bam, reference, &header)
+}
+
+/// As [`bam_to_cram`], with the CRAM's header text taken from `header` (e.g. one with `M5` and
+/// `UR` tags added) rather than the BAM's.
+pub fn bam_to_cram_with_header(
+    bam: &Path,
+    reference: &Path,
+    header: &rust_htslib::bam::HeaderView,
+) -> PathBuf {
+    use rust_htslib::bam::{self, Read as _};
+    let mut source = bam::Reader::from_path(bam).unwrap();
+    let header = bam::Header::from_template(header);
+    let cram = bam.with_extension("cram");
+    let mut writer = bam::Writer::from_path(&cram, &header, bam::Format::Cram).unwrap();
+    writer.set_reference(reference).unwrap();
+    for record in source.records() {
+        writer.write(&record.unwrap()).unwrap();
+    }
+    drop(writer);
+    bam::index::build(&cram, None, bam::index::Type::Bai, 1).unwrap();
+    cram
+}
+
 /// Writes a coordinate-sorted, indexed BAM of reads on `chr1` (of `length` bases) to `dir/name`.
 pub fn write_bam(dir: &Path, name: &str, length: u64, reads: &[TestRead<'_>]) -> PathBuf {
     write_bam_with_header(dir, name, length, reads, &[])

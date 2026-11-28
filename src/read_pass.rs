@@ -87,8 +87,22 @@ pub fn anchored_length(
 /// were trained on without changing their recorded settings.
 pub const MAX_READS: u64 = 600;
 
-/// Sites whose spans are at most this far apart are read from one fetch.
+/// Sites whose spans are at most this far apart are read from one fetch of a BAM: a BAM fetch
+/// starts reading near its span, so fetching again skips the reads of a longer gap.
 pub const CLUSTER_GAP: i64 = 10_000;
+
+/// Sites whose spans are at most this far apart are read from one fetch of a CRAM. A CRAM fetch
+/// decodes the whole slice holding its start (by default 10,000 reads: tens of kb of a 30x genome),
+/// so fetching again across a shorter gap decodes a slice the last fetch already did. The value
+/// was chosen by benchmarking a 30x whole genome; it is below a typical slice's span.
+pub const CRAM_CLUSTER_GAP: i64 = 25_000;
+
+/// The gap between site spans read from one fetch of the alignments at `path`:
+/// [`CRAM_CLUSTER_GAP`] for a CRAM, else [`CLUSTER_GAP`]. It changes only how many reads are
+/// decoded, never which reads a site gets.
+pub fn cluster_gap(path: &Path) -> i64 {
+    if is_cram(path) { CRAM_CLUSTER_GAP } else { CLUSTER_GAP }
+}
 
 /// The sites of one contig that [`sweep_clusters`] adds reads to, with the state they accumulate.
 pub trait SweepSites {
@@ -111,9 +125,10 @@ pub trait SweepSites {
 }
 
 /// Reads the reads at sites on one contig, given each site's 0-based, half-open span: sites whose
-/// spans are at most [`CLUSTER_GAP`] apart are read from one fetch, and each read (not one with
-/// [`SKIP_FLAGS`]) is added, in start order, to every site whose span it overlaps, until the site
-/// is full. A site gets the reads a fetch of its own span would return, in the same order.
+/// spans are at most `cluster_gap` apart (see [`cluster_gap`]) are read from one fetch, and each
+/// read (not one with [`SKIP_FLAGS`]) is added, in start order, to every site whose span it
+/// overlaps, until the site is full. Whatever the gap, a site gets the reads a fetch of its own
+/// span would return, in the same order.
 ///
 /// # Errors
 ///
@@ -122,6 +137,7 @@ pub fn sweep_clusters<S: SweepSites>(
     reads: &mut rust_htslib::bam::IndexedReader,
     tid: u32,
     spans: &[(i64, i64)],
+    cluster_gap: i64,
     sites: &mut S,
 ) -> Result<()> {
     use rust_htslib::bam::Read as _;
@@ -133,7 +149,7 @@ pub fn sweep_clusters<S: SweepSites>(
         let mut cluster_end = cluster_start + 1;
         let mut fetch_end = spans[by_start[cluster_start]].1;
         while cluster_end < by_start.len()
-            && spans[by_start[cluster_end]].0 <= fetch_end + CLUSTER_GAP
+            && spans[by_start[cluster_end]].0 <= fetch_end.saturating_add(cluster_gap)
         {
             fetch_end = fetch_end.max(spans[by_start[cluster_end]].1);
             cluster_end += 1;
@@ -305,9 +321,19 @@ impl ReadIndexObservation {
 /// nonblocking open cannot hang on a replaced FIFO. Missing or unreadable files retain the BAM
 /// search for early output checks; a measurement reader still fails to open those inputs.
 pub fn alignment_index_paths(path: &Path) -> Vec<std::path::PathBuf> {
+    if is_cram(path) {
+        crate::vcf::local_index_paths(path, &["csi", "crai"])
+    } else {
+        crate::vcf::local_index_paths(path, &["csi", "bai"])
+    }
+}
+
+/// True if `path` is a regular file starting with the CRAM magic. The nonblocking open cannot hang
+/// on a replaced FIFO; a missing or unreadable file is not a CRAM.
+fn is_cram(path: &Path) -> bool {
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let mut magic = [0; 4];
-    let cram = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
@@ -316,12 +342,7 @@ pub fn alignment_index_paths(path: &Path) -> Vec<std::path::PathBuf> {
             file.metadata().is_ok_and(|metadata| metadata.is_file())
                 && file.read_exact_at(&mut magic, 0).is_ok()
                 && &magic == b"CRAM"
-        });
-    if cram {
-        crate::vcf::local_index_paths(path, &["csi", "crai"])
-    } else {
-        crate::vcf::local_index_paths(path, &["csi", "bai"])
-    }
+        })
 }
 
 /// The inputs of a read pass (`winnowr strlen` and `winnowr pileup`).
@@ -496,6 +517,8 @@ pub struct Shard<'r> {
     pub reads: &'r mut rust_htslib::bam::IndexedReader,
     /// The contig's reference sequence.
     pub contig: &'r [u8],
+    /// The gap between site spans read from one fetch of the reads (see [`cluster_gap`]).
+    pub cluster_gap: i64,
 }
 
 impl Shard<'_> {
@@ -580,6 +603,7 @@ where
     }
     let summary = crate::vcf::VcfSummary::read(inputs.vcf)?;
     let shards = plan_shards(inputs, regions, &summary)?;
+    let cluster_gap = cluster_gap(inputs.alignments);
     // Reader sets are pooled, so at most one per worker thread is ever opened, and a shard takes
     // a set already holding its contig's sequence when there is one.
     let pool: ReaderPool<ShardReaders> = ReaderPool::new();
@@ -599,7 +623,8 @@ where
                 pool.take_preferring(|readers| readers.holds(chrom)).unwrap_or_default();
             let measured = readers.open(inputs, chrom, cram_fields, &contigs).and_then(
                 |(vcf, reads, contig)| {
-                    measure(&mut Shard { chrom, start: *start, end: *end, vcf, reads, contig })
+                    let (start, end) = (*start, *end);
+                    measure(&mut Shard { chrom, start, end, vcf, reads, contig, cluster_gap })
                 },
             );
             pool.put(readers);
@@ -705,21 +730,13 @@ mod tests {
     /// Converts the generated BAM fixture to indexed CRAM using its local reference.
     fn to_cram(path: &Path, reference: &Path) -> std::path::PathBuf {
         use rust_htslib::bam::{self, Read as _};
-        let mut source = bam::Reader::from_path(path).unwrap();
+        let source = bam::Reader::from_path(path).unwrap();
         let text = String::from_utf8_lossy(source.header().as_bytes()).replace(
             "\tLN:100",
             &format!("\tLN:100\tM5:8adc5937e635f6c9af646f0b23560fae\tUR:{}", reference.display()),
         );
-        let header = bam::Header::from_template(&bam::HeaderView::from_bytes(text.as_bytes()));
-        let output = path.with_extension("cram");
-        let mut writer = bam::Writer::from_path(&output, &header, bam::Format::Cram).unwrap();
-        writer.set_reference(reference).unwrap();
-        for record in source.records() {
-            writer.write(&record.unwrap()).unwrap();
-        }
-        drop(writer);
-        bam::index::build(&output, None, bam::index::Type::Bai, 1).unwrap();
-        output
+        let header = bam::HeaderView::from_bytes(text.as_bytes());
+        crate::testing::bam_to_cram_with_header(path, reference, &header)
     }
 
     #[rstest]
@@ -770,6 +787,37 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].qname(), b"r1");
         assert_eq!(records[0].pos(), 10);
+    }
+
+    #[test]
+    fn cluster_gap_follows_the_alignment_format() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reference = crate::testing::write_fasta(dir.path(), &[("chr1", &"A".repeat(100))]);
+        let bam = crate::testing::write_bam(dir.path(), "reads.bam", 100, &[]);
+        let cram = crate::testing::bam_to_cram(&bam, &reference);
+        assert_eq!(cluster_gap(&bam), CLUSTER_GAP);
+        assert_eq!(cluster_gap(&cram), CRAM_CLUSTER_GAP);
+        // A missing file (whose reader fails to open) or a directory is not a CRAM.
+        assert_eq!(cluster_gap(&dir.path().join("missing.cram")), CLUSTER_GAP);
+        assert_eq!(cluster_gap(dir.path()), CLUSTER_GAP);
+    }
+
+    #[rstest]
+    fn shards_read_with_the_gap_of_the_alignment_format(#[values(false, true)] cram: bool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut files = crate::testing::ReadFiles::write(
+            dir.path(),
+            &[("chr1", &"A".repeat(100))],
+            &["chr1\t11\t.\tA\tC\t50\tPASS\t.\tGT\t0/1"],
+            &[],
+        );
+        if cram {
+            files.bam = crate::testing::bam_to_cram(&files.bam, &files.fasta);
+        }
+        let gaps =
+            run_shards(&files.inputs(), &["chr1"], 0, |shard| Ok(shard.cluster_gap)).unwrap();
+        let expected = if cram { CRAM_CLUSTER_GAP } else { CLUSTER_GAP };
+        assert_eq!(gaps, vec![expected]);
     }
 
     #[test]
