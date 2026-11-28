@@ -136,9 +136,7 @@ mod tests {
         "alignments:mapq20,bq10,flank5"
     )]
     #[case::alignments_with_settings(
-        FeatureSource::VcfAlignments(ReadAnnotationOptions {
-            settings: crate::read_settings::ReadSettings { mapq: 1, min_base_quality: 0, flank: 2 }
-        }),
+        FeatureSource::VcfAlignments("mapq1,bq0,flank2".parse().unwrap()),
         "alignments:mapq1,bq0,flank2"
     )]
     fn round_trips_through_text_and_json(#[case] source: FeatureSource, #[case] text: &str) {
@@ -176,6 +174,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn maxreads_is_source_identity_and_preserves_legacy_json() {
+        let legacy_text = "alignments:mapq20,bq10,flank5";
+        let legacy: FeatureSource = legacy_text.parse().unwrap();
+        let explicit: FeatureSource = "alignments:maxreads600".parse().unwrap();
+        assert_eq!(legacy, explicit);
+        assert_eq!(serde_json::to_string(&explicit).unwrap(), format!("\"{legacy_text}\""));
+        assert_eq!(
+            serde_json::from_str::<FeatureSource>(&format!("\"{legacy_text}\"")).unwrap(),
+            legacy
+        );
+        let deeper: FeatureSource = "alignments:maxreads1200".parse().unwrap();
+        assert_ne!(deeper, legacy);
+        assert_eq!(deeper.to_string(), "alignments:mapq20,bq10,flank5,maxreads1200");
+        let json = serde_json::to_string(&deeper).unwrap();
+        assert_eq!(serde_json::from_str::<FeatureSource>(&json).unwrap(), deeper);
+        assert_eq!(deeper.to_string().to_uppercase().parse::<FeatureSource>().unwrap(), deeper);
+        assert_eq!(shared_source([legacy, explicit], |source| *source), Ok(Some(legacy)));
+        assert_eq!(shared_source([legacy, deeper], |source| *source), Err((legacy, deeper)));
+    }
+
     /// Only the gVCF source is the default, which tables and models do not record.
     #[test]
     fn only_the_gvcf_source_is_the_default() {
@@ -198,7 +217,7 @@ mod tests {
         assert_eq!(
             error,
             "bad read settings in feature source 'alignments:depth3': unknown alignment \
-             setting 'depth3' (expected mapqN, bqN, flankN or default)"
+             setting 'depth3' (expected mapqN, bqN, flankN, maxreadsN or default)"
         );
     }
 }

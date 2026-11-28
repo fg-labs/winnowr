@@ -35,9 +35,12 @@ Options:
           defaults, each at most once: mapqN (only reads with MAPQ >= N: HaplotypeCaller's minimum,
           20, or 1 in DRAGEN mode; not the high bin, as in `pileup --settings`), flankN (reads
           within N bases of the call's REF, and the aligned flank bases an indel read needs on each
-          side of the repeat tract to be counted at an allele) and bqN (the minimum base quality of
-          a SNP base counted at an allele). The table records them as part of its feature source: a
-          model scores only calls measured as its training tables were [default: mapq20,bq10,flank5]
+          side of the repeat tract to be counted at an allele), bqN (the minimum base quality of a
+          SNP base counted at an allele) and maxreadsN (the most reads counted at a call, from 1;
+          not the pileup's or repeat lengths' 600). The table records them as part of its feature
+          source (a maxreadsN only when it is not 600, which an omitted one always means): a model
+          scores only calls measured as its training tables were [default:
+          mapq20,bq10,flank5,maxreads600]
       --regions <NAME=PATH>...
           Region BEDs to flag calls in, as NAME=PATH (e.g. segdups=segdups.bed.gz). The names must
           match those a model was trained with

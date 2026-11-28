@@ -1744,6 +1744,26 @@ mod tests {
         assert_eq!(models_feature_source(&[]), None);
     }
 
+    #[rstest::rstest]
+    #[case::tiny(2)]
+    #[case::past_legacy(601)]
+    #[case::deep(1200)]
+    fn maxreads_model_sources_match_legacy_or_reject_different_caps(#[case] cap: u64) {
+        let mut snp = info(VariantType::Snp);
+        let mut indel = info(VariantType::Indel);
+        snp.feature_source = "alignments:mapq20,bq10,flank5".parse().unwrap();
+        indel.feature_source = "alignments:maxreads600".parse().unwrap();
+        assert!(check(&[snp.clone(), indel.clone()], &SetInputs::default()).is_empty());
+        let deeper = format!("alignments:maxreads{cap}").parse().unwrap();
+        indel.feature_source = deeper;
+        let problems = check(&[snp.clone(), indel.clone()], &SetInputs::default());
+        assert_eq!(checks(&problems), [Check::FeatureSourceDiffers]);
+        assert_eq!(models_feature_source(&[&snp, &indel]), None);
+        snp.feature_source = deeper;
+        assert!(check(&[snp.clone(), indel.clone()], &SetInputs::default()).is_empty());
+        assert_eq!(models_feature_source(&[&snp, &indel]), Some(deeper));
+    }
+
     /// The pileup settings must agree.
     #[test]
     fn pileup_measured_with_different_settings_is_rejected() {
