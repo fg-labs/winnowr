@@ -156,10 +156,65 @@ winnowr score --vcf sample.vcf.gz --models snp.winnowr.json indel.winnowr.json -
 
 ### The `vcf` source
 
-On the chr20 calls of a 30x whole-genome HG002 sample (123,031 calls), from a GenotypeGVCFs VCF
-and the reblocked gVCF it was genotyped from, the `gvcf` and `vcf` sources agree as follows
-(absolute differences per call). The VCF has no INFO/MQ, so it was added from the gVCF's RAW_MQandDP and
-rounded to two decimals, as GenotypeGVCFs writes it; `mq` therefore differs only by that rounding.
+#### Native INFO/MQ and INFO/SOR
+
+A separate comparison genotyped a real 30x HG002 reblocked gVCF on chr20 with GenotypeGVCFs.
+The default output contained native INFO/MQ and INFO/SOR, with no FORMAT/SB values. A second
+GenotypeGVCFs run with `-A StrandBiasBySample` retained four numeric SB counts at every call, so
+every baseline `sor` came from FORMAT/SB rather than INFO/SOR. The two
+outputs had identical CHROM, POS, REF, ALT and GT at all 122,440 calls. No MQ or SOR values
+were synthesized. The baseline joined the original gVCF for its raw annotations; 18 calls used
+the documented fallback to the first gVCF site at their position with other alleles.
+
+Extracted with winnowr `40ac9b3` (whose extraction code is unchanged at `f73d4c7`), the tables
+had no missing values for these five features:
+
+| feature | equal | median absolute difference | 99th percentile | maximum |
+|---------|-------|----------------------------|-----------------|---------|
+| `mq` | 69.8% | 0 | 0.0048201 | 0.0050004 |
+| `dp_norm` | 100% | 0 | 0 | 0 |
+| `qd` | 99.87% | 0 | 0 | 65.8333 |
+| `sor` | 0% | 0.00024185 | 0.00049378 | 0.00049994 |
+| `n_alt` | 99.87% | 0 | 0 | 1 |
+
+Every MQ difference fits GenotypeGVCFs' two-decimal rounding plus VCF Float32 decoding;
+every SOR difference fits its three-decimal rounding. This includes 554 calls with an SB total
+of at most two, 550 of them nonzero: `StrandOddsRatio` uses a minimum count of zero, unlike
+`FisherStrand`'s two. QD and n_alt each differ at 163 calls; these features remain approximations,
+not interchangeable training inputs across sources.
+
+The genotyper was the local GATK development build
+`4.7.0.0-hpgc-v5-3-g5302144-SNAPSHOT`, source commit
+`5302144f35f3d453f8b612808e95f3ad43e4b977`, with HTSJDK 5.0.2 and Java 17.0.18. It was not an
+official GATK release. The source checkout was clean. RMSMappingQuality, StrandOddsRatio and
+StrandBiasTest were unchanged from GATK 4.6.2.0; GenotypeGVCFs' relevant source differences
+concerned somatic calling and GenomicsDB setup, neither used here. The decoder dependency does
+differ from that release's HTSJDK 4.2.0, so this validates this build and dataset, not every
+upstream release or caller.
+
+To reproduce, install `bcftools` and a Java runtime compatible with your GATK JAR on `PATH`.
+Use a real indexed gVCF and the matching reference FASTA, with its `.fai` index and GATK sequence
+dictionary (`.dict`). Build the opt-in library tests and pass the test executable printed by
+Cargo to the script:
+
+```console
+cargo test --release --lib --locked --no-run
+bash scripts/validate-native-info.sh /path/to/gatk.jar GRCh38.fa sample.g.vcf.gz \
+  /path/to/winnowr /path/to/winnowr-libtest /scratch/new-native-comparison chr20
+```
+
+The script preserves both generated VCFs, checks call keys and absence of SB in the default
+output, extracts both feature tables, and reports finite-pair counts and missingness before
+summarizing differences. Empty comparisons or no finite paired MQ/SOR observations fail.
+Generated data and logs belong outside the repository.
+
+#### Historical synthesized-MQ control
+
+The historical chr20 comparison of a 30x whole-genome HG002 sample (123,031 calls) used a VCF
+retaining FORMAT/SB and the paired reblocked gVCF. Its INFO/MQ was synthesized from that gVCF's
+RAW_MQandDP and rounded to two decimals. The results below are a control for shared SB handling
+and MQ rounding, **not independent validation of native INFO/MQ or the INFO/SOR fallback**:
+`sor` is read from FORMAT/SB on both sides, and `mq` is derived from the same gVCF on both sides.
 
 | feature | equal | median | 99th percentile | maximum |
 |---------|-------|--------|-----------------|---------|
