@@ -57,9 +57,10 @@ each SNP and indel call the reads that:
 - overlap the call's REF bases, or the 5 bases on either side.
 
 Their number is the call's depth, and `dp_norm` is that depth over the calls' median depth (or
-`--dp-median`); `mq` is the root mean square of their MAPQs. At most 600 reads are counted at a
-call: `extract` and `score` warn with the number of calls on each contig that reach that cap, whose
-depth saturates at 600, and so their `dp_norm` at 600 over the median. For `as_alt_frac`, each
+`--dp-median`); `mq` is the root mean square of their MAPQs. By default at most 600 reads are
+counted at a call: `extract` and `score` warn with the number of calls on each contig that reach
+that cap, whose depth saturates at it, and so their `dp_norm` at the cap over the median (for
+deeper data, `--alignment-settings maxreadsN` sets another cap: see below). For `as_alt_frac`, each
 SNP allele comes from the read's base (with a base quality of at least 10). For an indel,
 annotations choose among the existing ALT repeat-tract windows that cover every length-changing
 ALT, called or uncalled, including equivalent placements. They use the shortest qualifying
@@ -91,13 +92,34 @@ reads on one of the contigs shows). They stop with an error when a call's contig
 reads' header, and when no read is counted at any call: the reads are of another sample, reference
 or contigs, or none passes the settings.
 
-`--alignment-settings` changes the three thresholds, as comma-separated settings over the defaults
-(`mapq20,bq10,flank5`), each given at most once: for a VCF called in DRAGEN mode, whose
-HaplotypeCaller counts reads from MAPQ 1, use `--alignment-settings mapq1`. The text is that of
-`pileup --settings`, but `mapqN` means another thing there (the lowest MAPQ of the pileup's high
-bin, where reads of every MAPQ are counted). The settings are part of the feature source, which is
-recorded as e.g. `alignments:mapq20,bq10,flank5`: tables measured with different settings are of
-different sources.
+`--alignment-settings` changes which reads are counted, as comma-separated settings over the
+defaults (`mapq20,bq10,flank5,maxreads600`), each given at most once: `mapqN`, the lowest MAPQ a
+read is counted at; `bqN`, the lowest base quality of a SNP base counted at an allele; `flankN`,
+the flank (see below); and `maxreadsN`, the most reads counted at a call (from 1 to
+285,925,104,992,708, so that the sums of squared MAPQs cannot overflow). For a VCF called in
+DRAGEN mode, whose HaplotypeCaller counts reads from MAPQ 1, use `--alignment-settings mapq1`; for
+deep data, e.g. `--alignment-settings mapq1,maxreads2000`. `mapqN`, `bqN` and `flankN` are written
+as in `pileup --settings`, but `mapqN` means another thing there (the lowest MAPQ of the pileup's
+high bin, where reads of every MAPQ are counted), and `pileup --settings` has no `maxreadsN`.
+
+The settings are part of the feature source, which is recorded as e.g.
+`alignments:mapq20,bq10,flank5`: tables measured with different settings are of different
+sources. The cap is recorded only when it is not 600 (e.g.
+`alignments:mapq1,bq10,flank5,maxreads2000`), and a source without one, including those of tables
+and models from earlier versions, always means 600: `maxreads600` is the same source as none.
+Extract the training and evaluation tables with the same cap; `score` measures the reads with the
+cap the models record, and has no option to change it (`check-models` reports it in the models'
+alignment settings). Earlier builds that read alignment sources reject a table or model that
+records a cap: `maxreadsN` is an unknown alignment setting there.
+
+The cap applies only to the read-measured annotations (`mq`, `dp_norm` and `as_alt_frac`, and `qd`
+where it takes the reads counted). Pileup evidence still counts at most 600 reads at a site's
+alleles (and records a 601st read as overflow), and repeat-length evidence still measures at most
+600 reads, whatever the cap. When `score` measures the annotations and the pileup evidence in one
+pass, the annotations go on counting reads after the pileup evidence is full, or stop before it,
+without changing the pileup counts. A cap below 600 changes the features, but seldom reads fewer
+reads: most calls are read until their pileup counts, which the same pass measures even when no
+pileup evidence is written, are full.
 
 The flank sets both the bases beside a call within which a read counts, and the bases an indel
 read must align beyond the repeat tract. HaplotypeCaller takes the reads within 2 bases of a
@@ -249,7 +271,7 @@ read-measured features, with `mapq1`:
   counted when it overlaps the 5 bases beside a call, where HaplotypeCaller takes 2, and
   HaplotypeCaller drops reads that winnowr counts, e.g. in reassembly). The large differences are
   where HaplotypeCaller downsamples: in the satellite repeats beside the chr20 centromere the gVCF
-  records 30 to 50 reads at calls where 600 (the most that are counted) overlap; 353 calls reach
+  records 30 to 50 reads at calls where 600 (the most counted by default) overlap; 353 calls reach
   that cap.
 - `as_alt_frac` is within 0.05 at 90.3% of calls, and within 0.1 at 94.4%. SNPs agree more closely
   (99th percentile 0.19) than indels (median 0.023, 99th percentile 1), whose reads are assigned by

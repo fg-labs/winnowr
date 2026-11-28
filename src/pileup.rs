@@ -33,7 +33,9 @@ use crate::alignment_provenance::AlignmentProvenance;
 use crate::alleles::{Genotype, length_change, trim_alleles, variant_type_of};
 use crate::common::{PhaseTimer, VariantType};
 use crate::evidence::{Evidence, EvidenceTables, write_table};
-use crate::read_annotations::{MapqSums, ReadAnnotationOptions, UNAVAILABLE_MAPQ};
+use crate::read_annotations::{
+    LEGACY_MAX_READS, MapqSums, ReadAnnotationOptions, UNAVAILABLE_MAPQ,
+};
 use crate::read_pass::{
     MAX_READS, ReadInputs, SweepSites, anchored_length, query_position_at, run_shards,
     sweep_clusters,
@@ -1322,6 +1324,8 @@ fn measure_targets(
         options,
         contig,
         min_mapq: annotations.map_or(0, ReadAnnotationOptions::min_mapq),
+        max_annotation_reads: annotations
+            .map_or(LEGACY_MAX_READS, ReadAnnotationOptions::max_reads),
         measured: targets.iter().map(|target| (Accumulator::default(), sums(target))).collect(),
     };
     sweep_clusters(reads, tid, &spans, &mut counting)?;
@@ -1335,6 +1339,8 @@ struct Counting<'a> {
     contig: &'a [u8],
     /// The MAPQ a read needs to count in the read annotations.
     min_mapq: u8,
+    /// The independently configured annotation cap; pileup still uses its legacy limit.
+    max_annotation_reads: u64,
     measured: Vec<(Accumulator, MapqSums)>,
 }
 
@@ -1356,7 +1362,7 @@ impl SweepSites for Counting<'_> {
     fn is_full(&self, i: usize) -> bool {
         let (target, (accumulator, sums)) = (&self.targets[i], &self.measured[i]);
         (target.site.is_none() || accumulator.is_full())
-            && (target.annotated.is_none() || sums.is_full())
+            && (target.annotated.is_none() || sums.is_full(self.max_annotation_reads))
     }
 
     fn add(
@@ -1377,7 +1383,7 @@ impl SweepSites for Counting<'_> {
         let site =
             target.site.as_ref().filter(|site| target.annotated.is_none() || overlaps(site.span));
         let annotated = target.annotated.as_ref().filter(|annotated| {
-            !sums.is_full()
+            !sums.is_full(self.max_annotation_reads)
                 && mapq >= self.min_mapq
                 && mapq != UNAVAILABLE_MAPQ
                 && overlaps(annotated.span)
@@ -3620,6 +3626,25 @@ mod tests {
     /// Measures the SNP of [`RECORDS`] with `reads` over it, as (base at the SNP, MAPQ, number
     /// of reads), in order; returns its site and the pileup's row.
     fn measure_deep_snp(reads: &[(char, u8, usize)]) -> (MeasuredSite, PileupRow) {
+        measure_deep_snp_with(reads, &ReadAnnotationOptions::default())
+    }
+
+    /// Measures the deep SNP with independent annotation settings, preserving the pileup oracle.
+    fn measure_deep_snp_with(
+        reads: &[(char, u8, usize)],
+        annotations: &ReadAnnotationOptions,
+    ) -> (MeasuredSite, PileupRow) {
+        let (mut sites, mut rows) = measure_deep_records(reads, annotations, &RECORDS[2..]);
+        assert_eq!((sites.len(), rows.len()), (1, 1));
+        (sites.remove(0), rows.remove(0))
+    }
+
+    /// Measures selected fixture records at high depth with an independently measured pileup.
+    fn measure_deep_records(
+        reads: &[(char, u8, usize)],
+        annotations: &ReadAnnotationOptions,
+        records: &[&str],
+    ) -> (Vec<MeasuredSite>, Vec<PileupRow>) {
         let dir = TempDir::new().unwrap();
         let specs: Vec<(String, String, u8)> = reads
             .iter()
@@ -3635,14 +3660,101 @@ mod tests {
                 ..read(name, 90, "70M", *mapq)
             })
             .collect();
-        let fixture = fixture(dir.path(), &RECORDS[2..], &reads);
-        let (options, annotations) = (PileupOptions::default(), ReadAnnotationOptions::default());
-        let mut sites =
-            measure_sites(&fixture.inputs(), &["chr1"], &options, Some(&annotations), "test")
+        let fixture = fixture(dir.path(), records, &reads);
+        let options = PileupOptions::default();
+        let sites =
+            measure_sites(&fixture.inputs(), &["chr1"], &options, Some(annotations), "test")
                 .unwrap();
-        let mut rows = measure_pileup(&fixture.inputs(), &["chr1"], &options).unwrap();
-        assert_eq!((sites.len(), rows.len()), (1, 1));
-        (sites.remove(0), rows.remove(0))
+        let rows = measure_pileup(&fixture.inputs(), &["chr1"], &options).unwrap();
+        (sites, rows)
+    }
+
+    #[rstest::rstest]
+    #[case::tiny(1)]
+    #[case::two(2)]
+    #[case::below_legacy(599)]
+    #[case::legacy(600)]
+    #[case::past_legacy(601)]
+    #[case::deep(1200)]
+    #[case::above_depth(2000)]
+    fn maxreads_annotations_and_pileup_have_independent_caps(#[case] cap: u64) {
+        let annotations: ReadAnnotationOptions = format!("maxreads{cap}").parse().unwrap();
+        let (site, row) = measure_deep_snp_with(&[('G', 60, 1500)], &annotations);
+        assert_eq!(site.row, row);
+        assert_eq!((row.n_reads, row.counts), (601, [[0, 0, 600], [0; 3], [0; 3]]));
+        let counted = cap.min(1500);
+        assert_eq!(
+            site.mapq.unwrap(),
+            MapqSums {
+                n_reads: counted,
+                sum_sq: counted * 3600,
+                ref_sum_sq: counted * 3600,
+                alt_sum_sq: 0,
+                alleles_read: true,
+            }
+        );
+    }
+
+    /// The cap is the annotations' alone: the pileup's settings have none.
+    #[test]
+    fn maxreads_is_not_a_pileup_setting() {
+        let error = "maxreads1200".parse::<PileupOptions>().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "unknown pileup setting 'maxreads1200' (expected mapqN, bqN, flankN or default)"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::tiny(1)]
+    #[case::boundary(601)]
+    #[case::deep(1200)]
+    #[case::above_depth(2000)]
+    fn maxreads_caps_counted_and_annotation_only_records(#[case] cap: u64) {
+        let annotations: ReadAnnotationOptions = format!("maxreads{cap}").parse().unwrap();
+        let (sites, rows) = measure_deep_records(&[('G', 60, 1300)], &annotations, &RECORDS[1..]);
+        let identities: Vec<_> = sites.iter().map(|site| (site.row.pos, site.counted)).collect();
+        assert_eq!(identities, [(100, false), (123, true)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pos, 123);
+        assert_eq!(sites[1].row, rows[0]);
+        assert_eq!(rows[0].n_reads, 601);
+        assert_eq!(rows[0].counts, [[0, 0, 600], [0; 3], [0; 3]]);
+        assert_eq!((sites[0].row.n_reads, sites[0].row.counts), (0, [[0; 3]; 3]));
+        let counted = cap.min(1300);
+        let complex = sites[0].mapq.unwrap();
+        assert_eq!(complex.n_reads, counted);
+        assert_eq!(complex.sum_sq, counted * 3600);
+        assert!(!complex.alleles_read);
+        assert_eq!((complex.ref_sum_sq, complex.alt_sum_sq), (0, 0));
+        let snp = sites[1].mapq.unwrap();
+        assert_eq!(snp.n_reads, counted);
+        assert_eq!(snp.ref_sum_sq, counted * 3600);
+    }
+
+    #[test]
+    fn maxreads_tiny_cap_still_reaches_reads_after_a_low_mapq_pileup() {
+        let annotations: ReadAnnotationOptions = "maxreads2".parse().unwrap();
+        let (site, row) =
+            measure_deep_snp_with(&[('G', 0, 650), ('T', 60, 100), ('G', 30, 20)], &annotations);
+        assert_eq!(site.row, row);
+        assert_eq!((row.n_reads, row.counts), (601, [[600, 0, 0], [0; 3], [0; 3]]));
+        let sums = site.mapq.unwrap();
+        assert_eq!(sums.n_reads, 2);
+        assert_eq!((sums.sum_sq, sums.ref_sum_sq, sums.alt_sum_sq), (7200, 0, 7200));
+    }
+
+    #[test]
+    fn maxreads_excludes_unavailable_mapq_and_sums_the_highest_available_mapq() {
+        let annotations: ReadAnnotationOptions = "maxreads1200".parse().unwrap();
+        let (site, row) = measure_deep_snp_with(&[('G', 255, 10), ('T', 254, 1300)], &annotations);
+        assert_eq!(site.row, row);
+        assert_eq!(row.n_reads, 601);
+        let sums = site.mapq.unwrap();
+        assert_eq!(sums.n_reads, 1200);
+        assert_eq!(sums.sum_sq, 1200 * 254 * 254);
+        assert_eq!(sums.ref_sum_sq, 0);
+        assert_eq!(sums.alt_sum_sq, sums.sum_sq);
     }
 
     #[test]
@@ -3664,7 +3776,7 @@ mod tests {
                 alleles_read: true
             }
         );
-        assert!(sums.is_full());
+        assert!(sums.is_full(LEGACY_MAX_READS));
     }
 
     #[test]
@@ -3685,6 +3797,6 @@ mod tests {
                 alleles_read: true
             }
         );
-        assert!(!sums.is_full());
+        assert!(!sums.is_full(LEGACY_MAX_READS));
     }
 }

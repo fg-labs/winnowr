@@ -13,8 +13,7 @@ use std::fmt;
 
 use anyhow::{Result, bail};
 
-use crate::read_pass::MAX_READS;
-use crate::read_settings::{FLANK, MIN_BASE_QUALITY, ReadSettings};
+use crate::read_settings::{FLANK, MIN_BASE_QUALITY, ReadSettings, parse_number};
 
 /// The MAPQ a read needs to be counted (by default): HaplotypeCaller's default minimum (it is 1
 /// in DRAGEN mode).
@@ -24,27 +23,39 @@ pub const MIN_MAPQ: u8 = 20;
 /// HaplotypeCaller never counts it).
 pub const UNAVAILABLE_MAPQ: u8 = 255;
 
+/// The cap implied by alignment-source text without `maxreadsN`, including existing tables and
+/// models. This meaning is permanent, independent of pileup/strlen limits or future CLI defaults.
+pub const LEGACY_MAX_READS: u64 = 600;
+
+/// MAPQ 255 is excluded before summing, so every squared MAPQ is at most 254 squared. This cap
+/// keeps the total and each allele's subset sum within u64 without checks in the read loop.
+const MAX_READS_LIMIT: u64 = u64::MAX / (254 * 254);
+
 /// Which reads are counted in the read-measured annotations, and how their alleles are read: the
 /// shared [`ReadSettings`], whose `mapq` is here the lowest MAPQ a read is counted at.
 ///
 /// Written as comma-separated settings (see [`fmt::Display`] and [`std::str::FromStr`]), e.g.
-/// `mapq20,bq10,flank5`. The text is that of [`crate::pileup::PileupOptions`], but `mapqN` is
-/// here the lowest MAPQ a read is counted at, where the pileup's is the lowest MAPQ of its high
-/// bin (see [`crate::read_settings`]). The flank is both the bases on each side of a call's REF
-/// within which a read counts towards its depth, and the aligned bases an indel read needs outside
-/// each end of the repeat tract to be counted at an allele.
+/// `mapq20,bq10,flank5,maxreads1200`. The MAPQ, base quality and flank items are those of
+/// [`crate::pileup::PileupOptions`], but `mapqN` is here the lowest MAPQ a read is counted at,
+/// where the pileup's is the lowest MAPQ of its high bin (see [`crate::read_settings`]). The
+/// flank is both the bases on each side of a call's REF within which a read counts towards its
+/// depth, and the aligned bases an indel read needs outside each end of the repeat tract to be
+/// counted at an allele. `maxreadsN` caps only these annotations, not pileup or strlen evidence;
+/// omitting it always means [`LEGACY_MAX_READS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReadAnnotationOptions {
     /// The settings; `mapq` is the MAPQ a read needs to be counted.
     pub settings: ReadSettings,
+    /// A validated positive cap whose MAPQ-squared sums cannot overflow.
+    max_reads: u64,
 }
 
 impl Default for ReadAnnotationOptions {
-    /// MAPQ [`MIN_MAPQ`], and the pileup's default base quality and flank.
+    /// MAPQ [`MIN_MAPQ`], the pileup's default base quality and flank, and the legacy 600-read cap.
     fn default() -> Self {
         let settings =
             ReadSettings { mapq: MIN_MAPQ, min_base_quality: MIN_BASE_QUALITY, flank: FLANK };
-        ReadAnnotationOptions { settings }
+        ReadAnnotationOptions { settings, max_reads: LEGACY_MAX_READS }
     }
 }
 
@@ -54,22 +65,48 @@ impl ReadAnnotationOptions {
     pub fn min_mapq(&self) -> u8 {
         self.settings.mapq
     }
+
+    /// The maximum qualifying reads counted at a call, independently of pileup evidence.
+    #[must_use]
+    pub fn max_reads(&self) -> u64 {
+        self.max_reads
+    }
 }
 
 impl fmt::Display for ReadAnnotationOptions {
-    /// Every setting, as [`std::str::FromStr`] parses it back: e.g. `mapq20,bq10,flank5`.
+    /// Canonical settings text. The legacy cap is omitted so existing source metadata retains its
+    /// bytes; every other cap is explicit, even if a future CLI default changes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.settings.fmt(f)
+        self.settings.fmt(f)?;
+        if self.max_reads != LEGACY_MAX_READS {
+            write!(f, ",maxreads{}", self.max_reads)?;
+        }
+        Ok(())
     }
 }
 
 impl std::str::FromStr for ReadAnnotationOptions {
     type Err = anyhow::Error;
 
-    /// Parses comma-separated settings over the defaults: `mapqN` (the minimum MAPQ), `bqN` and
-    /// `flankN` (`default` alone is the defaults).
+    /// Parses comma-separated `mapqN` (the minimum MAPQ), `bqN`, `flankN` and `maxreadsN`, each
+    /// at most once. Omitted caps, including legacy model strings, always mean 600 reads.
     fn from_str(text: &str) -> Result<Self> {
-        let settings = ReadAnnotationOptions::default().settings.parse_over(text, "alignment")?;
+        let mut max_reads = LEGACY_MAX_READS;
+        let expected = format!("1 to {MAX_READS_LIMIT}");
+        let parse_max_reads = |value: &str, item: &str| {
+            let count: u64 = parse_number(value, "maximum read count", item, &expected)?;
+            if !(1..=MAX_READS_LIMIT).contains(&count) {
+                bail!("bad maximum read count in {item}: expected an integer from {expected}");
+            }
+            max_reads = count;
+            Ok(())
+        };
+        let settings = ReadAnnotationOptions::default().settings.parse_over_with(
+            text,
+            "alignment",
+            Some("maxreads"),
+            parse_max_reads,
+        )?;
         if settings.mapq == UNAVAILABLE_MAPQ {
             bail!(
                 "the minimum MAPQ must be from 0 to {}: no read is counted at {UNAVAILABLE_MAPQ}, \
@@ -77,7 +114,7 @@ impl std::str::FromStr for ReadAnnotationOptions {
                 UNAVAILABLE_MAPQ - 1
             );
         }
-        Ok(ReadAnnotationOptions { settings })
+        Ok(ReadAnnotationOptions { settings, max_reads })
     }
 }
 
@@ -85,8 +122,8 @@ impl std::str::FromStr for ReadAnnotationOptions {
 /// gVCF hold (`RAW_MQandDP` and `AS_RAW_MQ`), measured from the alignments.
 ///
 /// The reads counted are those overlapping the call's REF with the settings' flank on each side
-/// that have at least the settings' MAPQ (see [`ReadAnnotationOptions`]), up to [`MAX_READS`] of
-/// them. Overlapping mates are both counted.
+/// that have at least the settings' MAPQ, up to their [`ReadAnnotationOptions::max_reads`] cap.
+/// Overlapping mates are both counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MapqSums {
     /// The reads counted.
@@ -125,11 +162,11 @@ impl MapqSums {
         }
     }
 
-    /// True once no more reads are counted: [`MAX_READS`] were, so the call's depth is at least
-    /// that, and its sums are those of the first [`MAX_READS`] reads.
+    /// True once `max_reads` qualifying reads were counted. The depth is at least that, and the
+    /// sums are those of the first `max_reads` reads.
     #[must_use]
-    pub fn is_full(&self) -> bool {
-        self.n_reads >= MAX_READS
+    pub fn is_full(&self, max_reads: u64) -> bool {
+        self.n_reads >= max_reads
     }
 }
 
@@ -148,7 +185,7 @@ pub struct ContigReads {
 /// each call's contig and sums, in contig order. Warns with the number of calls, per contig, at
 /// which no read was counted (their `mq` and `as_alt_frac` are missing, and their `dp_norm` is 0,
 /// or missing for every call when the calls' median depth is 0 and no `--dp-median` is given),
-/// and with the number whose reads reached the cap of [`MAX_READS`] (their depth saturates).
+/// and with the number whose reads reached the annotations' configured cap (their depth saturates).
 /// Returns those counts per contig of `contigs`.
 ///
 /// # Errors
@@ -179,7 +216,7 @@ where
         if let Some(count) = index.map(|index| &mut counts[index]) {
             count.calls += 1;
             count.without_reads += usize::from(sums.n_reads == 0);
-            count.at_cap += usize::from(sums.is_full());
+            count.at_cap += usize::from(sums.is_full(options.max_reads()));
         }
     }
     let total = |count: fn(&ContigReads) -> usize| counts.iter().map(count).sum::<usize>();
@@ -229,8 +266,9 @@ fn warnings<S: AsRef<str>>(
     }
     let (n_full, per_contig) = by_contig(|c| c.at_cap);
     if n_full > 0 {
+        let max_reads = options.max_reads();
         warnings.push(format!(
-            "{n_full} records reached the cap of {MAX_READS} reads counted, so their depth is at \
+            "{n_full} records reached the cap of {max_reads} reads counted, so their depth is at \
              most that (and their dp_norm at most that over the median depth) (by contig: \
              {per_contig})"
         ));
@@ -266,6 +304,100 @@ mod tests {
     }
 
     #[test]
+    fn maxreads_settings_preserve_legacy_text_and_record_nondefault_caps() {
+        let legacy = ReadAnnotationOptions::default();
+        for cap in [1, 2, 599, 600, 601, 1200, MAX_READS_LIMIT] {
+            let options: ReadAnnotationOptions = format!("maxreads{cap}").parse().unwrap();
+            let expected = if cap == 600 {
+                "mapq20,bq10,flank5".to_string()
+            } else {
+                format!("mapq20,bq10,flank5,maxreads{cap}")
+            };
+            assert_eq!(options.to_string(), expected);
+            assert_eq!(options.max_reads(), cap);
+            assert_eq!(expected.parse::<ReadAnnotationOptions>().unwrap(), options);
+            assert_eq!(options == legacy, cap == 600);
+        }
+        assert_eq!("default,maxreads600".parse::<ReadAnnotationOptions>().unwrap(), legacy);
+        let options: ReadAnnotationOptions = " maxreads1200 , bq0 ,mapq1,flank2".parse().unwrap();
+        assert_eq!(options.to_string(), "mapq1,bq0,flank2,maxreads1200");
+    }
+
+    #[test]
+    fn maxreads_rejects_nonpositive_overflowing_and_duplicate_caps() {
+        assert_eq!(MAX_READS_LIMIT, 285_925_104_992_708);
+        let too_large = (MAX_READS_LIMIT + 1).to_string();
+        for value in ["0", "-1", "", "x", "18446744073709551616", too_large.as_str()] {
+            let error = format!("maxreads{value}")
+                .parse::<ReadAnnotationOptions>()
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "bad maximum read count in maxreads{value}: expected an integer from 1 to \
+                     {MAX_READS_LIMIT}"
+                )
+            );
+        }
+        let error =
+            "maxreads1,default,maxreads2".parse::<ReadAnnotationOptions>().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "the alignment setting maxreadsN is given twice ('maxreads1' and 'maxreads2')"
+        );
+    }
+
+    /// Numbers are read as the other settings' are, and the text records the number itself, so
+    /// equal caps are one source however they were written.
+    #[test]
+    fn maxreads_text_is_canonical_for_equal_caps() {
+        for (text, expected) in [
+            ("maxreads0600", "mapq20,bq10,flank5"),
+            ("maxreads+600", "mapq20,bq10,flank5"),
+            ("maxreads01200", "mapq20,bq10,flank5,maxreads1200"),
+        ] {
+            let options: ReadAnnotationOptions = text.parse().unwrap();
+            assert_eq!(options.to_string(), expected, "{text}");
+            assert_eq!(expected.parse::<ReadAnnotationOptions>().unwrap(), options, "{text}");
+        }
+    }
+
+    #[test]
+    fn maxreads_summary_uses_the_annotation_cap() {
+        let options: ReadAnnotationOptions = "maxreads601".parse().unwrap();
+        let (below, full) = (of(600), of(601));
+        let counts = summarise([("chr1", &below), ("chr1", &full)], &["chr1"], &options).unwrap();
+        assert_eq!(counts, [ContigReads { calls: 2, without_reads: 0, at_cap: 1 }]);
+        let messages = warnings(&counts, &["chr1"], &options);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with("1 records reached the cap of 601 reads counted"));
+    }
+
+    #[test]
+    fn maxreads_safe_limit_keeps_total_and_allele_sums_in_range() {
+        let safe_max = MAX_READS_LIMIT;
+        let options: ReadAnnotationOptions = format!("maxreads{safe_max}").parse().unwrap();
+        let previous = (safe_max - 1) * 64516;
+        let mut sums = MapqSums {
+            n_reads: safe_max - 1,
+            sum_sq: previous,
+            alt_sum_sq: previous,
+            alleles_read: true,
+            ..MapqSums::default()
+        };
+        assert!(!sums.is_full(options.max_reads()));
+        sums.add(254);
+        sums.add_allele(254, true);
+        assert!(sums.is_full(options.max_reads()));
+        assert_eq!(sums.n_reads, safe_max);
+        assert_eq!(sums.sum_sq, safe_max * 64516);
+        assert_eq!(sums.alt_sum_sq, sums.sum_sq);
+        assert_eq!(sums.ref_sum_sq, 0);
+        assert!(u64::MAX - sums.sum_sq < 64516);
+    }
+
+    #[test]
     fn sums_add_reads_and_their_alleles() {
         let mut sums = MapqSums { alleles_read: true, ..MapqSums::default() };
         for (mapq, allele) in [(60, Some(false)), (20, Some(true)), (30, None)] {
@@ -282,8 +414,8 @@ mod tests {
             alleles_read: true,
         };
         assert_eq!(sums, expected);
-        assert!(!sums.is_full());
-        assert!(MapqSums { n_reads: MAX_READS, ..sums }.is_full());
+        assert!(!sums.is_full(LEGACY_MAX_READS));
+        assert!(MapqSums { n_reads: LEGACY_MAX_READS, ..sums }.is_full(LEGACY_MAX_READS));
     }
 
     /// The sums of `n_reads` reads of MAPQ 60.
@@ -295,7 +427,7 @@ mod tests {
     /// lack.
     #[test]
     fn calls_without_reads_are_counted_per_contig() {
-        let (full, none, some) = (of(MAX_READS), of(0), of(5));
+        let (full, none, some) = (of(LEGACY_MAX_READS), of(0), of(5));
         let calls = [("chr1", &full), ("chr1", &none), ("chr1", &some), ("chr2", &none)];
         let options = ReadAnnotationOptions::default();
         let counts = summarise(calls, &["chr1", "chr2"], &options).unwrap();
@@ -314,7 +446,7 @@ mod tests {
         assert!(without.starts_with("2 records had no read counted"), "{without}");
         assert!(without.ends_with("(by contig: chr1 1 of 3, chr2 1 of 1)"), "{without}");
         assert!(
-            at_cap.starts_with(&format!("1 records reached the cap of {MAX_READS}")),
+            at_cap.starts_with(&format!("1 records reached the cap of {LEGACY_MAX_READS}")),
             "{at_cap}"
         );
         assert!(at_cap.ends_with("(by contig: chr1 1 of 3)"), "{at_cap}");

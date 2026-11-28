@@ -299,11 +299,13 @@ pub(crate) struct ExtractArgs {
 
     /// Which reads of --alignments are counted at a call, as comma-separated settings over the
     /// defaults, each at most once: mapqN (only reads with MAPQ >= N: HaplotypeCaller's minimum,
-    /// 20, or 1 in DRAGEN mode; not the high bin, as in `pileup --settings`), flankN (reads within N bases of the call's REF, and the aligned flank bases an indel
-    /// read needs on each side of the repeat tract to be counted at an allele) and bqN (the
-    /// minimum base quality of a SNP base counted at an allele). The table records them as part of
-    /// its feature source: a model scores only calls measured as its training tables were
-    /// [default: mapq20,bq10,flank5].
+    /// 20, or 1 in DRAGEN mode; not the high bin, as in `pileup --settings`), flankN (reads within
+    /// N bases of the call's REF, and the aligned flank bases an indel read needs on each side of
+    /// the repeat tract to be counted at an allele), bqN (the minimum base quality of a SNP base
+    /// counted at an allele) and maxreadsN (the most reads counted at a call, from 1; not the
+    /// pileup's or repeat lengths' 600). The table records them as part of its feature source (a
+    /// maxreadsN only when it is not 600, which an omitted one always means): a model scores only
+    /// calls measured as its training tables were [default: mapq20,bq10,flank5,maxreads600]
     #[arg(long, value_name = "SETTINGS", requires = "alignments")]
     pub(crate) alignment_settings: Option<ReadAnnotationOptions>,
 
@@ -5924,6 +5926,133 @@ mod tests {
             }
         }
 
+        #[rstest]
+        #[case::tiny(2)]
+        #[case::deep(1200)]
+        fn maxreads_metadata_is_enforced_across_model_commands(#[case] cap: u64) {
+            let setup = AlignmentsModel::new();
+            let settings = format!("maxreads{cap}");
+            let source: FeatureSource = format!("alignments:{settings}").parse().unwrap();
+            let pileup = setup.path("pileup.tsv.gz");
+            let extra = ["--alignment-settings", settings.as_str(), "--pileup", pileup.as_str()];
+            let tables =
+                [setup.extract("S3", "cap-S3", &extra), setup.extract("S4", "cap-S4", &extra)];
+            let held_out = setup.extract("S5", "cap-S5", &extra);
+            // Every call has 20 or 30 qualifying reads (a median of 25): a cap of 2 counts two at
+            // each, and a cap of 1200 all of them, as the default cap does.
+            let expected_dp_norm: Vec<f64> = (0..CALLS)
+                .map(|i| match (cap, is_true(i)) {
+                    (2, _) => 1.0,
+                    (_, true) => 0.8,
+                    (_, false) => 1.2,
+                })
+                .collect();
+            for table in &tables {
+                let table = FeatureTable::read_parquet(table).unwrap();
+                assert_eq!(table.info().feature_source, source);
+                assert_eq!(table.f64_column("dp_norm").unwrap(), expected_dp_norm);
+            }
+            setup.train(&tables, "cap").unwrap();
+            let model_path = setup.path("cap.winnowr.json");
+            let model = WinnowrModel::load(&model_path, NonZeroUsize::new(1).unwrap()).unwrap();
+            assert_eq!(model.info.feature_source, source);
+            let (vcf, output, metrics) = (
+                setup.path("default.vcf.gz"),
+                setup.path("cap-scored.vcf.gz"),
+                setup.path("cap-metrics.tsv"),
+            );
+            let reads = setup.reads();
+            let reads: Vec<&str> = reads.iter().map(String::as_str).collect();
+            let score = ["score", "--vcf", &vcf, "--models", &model_path, "-o", &output];
+            try_run(&[&score[..], &reads].concat()).unwrap();
+            let checked = ["check-models", "--vcf", &vcf, "--models", &model_path];
+            try_run(&[&checked[..], &reads].concat()).unwrap();
+            try_run(&["evaluate", "--models", &model_path, "--table", &held_out, "-o", &metrics])
+                .unwrap();
+            let scored = read_gzip(&setup.dir.path().join("cap-scored.vcf.gz"));
+            assert_eq!(scored.lines().filter(|line| !line.starts_with('#')).count(), CALLS);
+
+            let legacy_table = setup.path("S1.parquet");
+            let error =
+                setup.train(&[&legacy_table, &tables[0]], "mixed-cap").unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "--tables hold features from different sources: S1's from \
+                     alignments:mapq20,bq10,flank5, S3's from {source}; extract every training \
+                     table with the same --feature-source (and, with --alignments, the same \
+                     --alignment-settings)"
+                )
+            );
+            let error = try_run(&[
+                "evaluate",
+                "--models",
+                &model_path,
+                "--table",
+                &legacy_table,
+                "-o",
+                &metrics,
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(&format!("trained on features from `{source}`")), "{error}");
+
+            // A distinct valid model role avoids a duplicate-model error masking the source check.
+            let mut promote =
+                crate::testing::separable_model_of(Task::Promote, VariantType::Snp, "mq");
+            promote.info.feature_source = source;
+            promote.info.contigs = model.info.contigs.clone();
+            promote.info.reference_contigs = model.info.reference_contigs.clone();
+            promote.info.alignment = model.info.alignment.clone();
+            let promote_path = setup.path("cap-promote.winnowr.json");
+            promote.save(&promote_path).unwrap();
+            let legacy_model = setup.path("reads.winnowr.json");
+            let mixed = format!(
+                "--models were trained on features from different sources ({legacy_model}: \
+                 alignments:mapq20,bq10,flank5; {promote_path}: {source})"
+            );
+            let score = ["score", "--vcf", &vcf, "--models", &legacy_model, &promote_path];
+            let error = try_run(&[&score[..], &reads, &["-o", &output]].concat()).unwrap_err();
+            assert!(error.to_string().starts_with(&mixed), "{error}");
+
+            // check-models reports the one error, and each model's alignment settings with its
+            // cap (none written for the legacy one).
+            let check = |models: &[&str]| {
+                let base = ["check-models", "--vcf", &vcf, "--json", "--models"];
+                let Command::CheckModels(args) =
+                    parse(&[&base[..], models, &reads].concat()).unwrap().command
+                else {
+                    panic!("not check-models")
+                };
+                let mut out = Vec::new();
+                let result = check_models_with_writers(&args, &mut out, Vec::new());
+                let report: serde_json::Value = serde_json::from_slice(&out).unwrap();
+                (result, report)
+            };
+            let (result, report) = check(&[&legacy_model, &promote_path]);
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "the models have 1 error(s); see the problems reported"
+            );
+            let errors: Vec<_> = report["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|problem| problem["severity"] == "error")
+                .collect();
+            assert_eq!(errors.len(), 1, "{report}");
+            assert_eq!(errors[0]["check"], "feature_source_differs");
+            assert!(errors[0]["message"].as_str().unwrap().starts_with(&mixed), "{report}");
+            let settings = |report: &serde_json::Value, i: usize| {
+                report["models"][i]["alignment_settings"].as_str().unwrap().to_string()
+            };
+            assert_eq!(settings(&report, 0), "mapq20,bq10,flank5");
+            assert_eq!(settings(&report, 1), format!("mapq20,bq10,flank5,maxreads{cap}"));
+            let (result, report) = check(&[&model_path, &promote_path]);
+            assert!(result.is_ok(), "{report}");
+            assert_eq!(settings(&report, 0), format!("mapq20,bq10,flank5,maxreads{cap}"));
+        }
+
         /// Features measured from the reads (`extract --alignments`) train a model that records
         /// the alignments source and its read settings, which `score` measures from the reads
         /// with no --gvcf, in one pass with the model's pileup evidence.
@@ -10247,6 +10376,49 @@ mod tests {
              (with --gvcf if the VCF lacks the raw annotations), or use a model trained on `vcf` \
              features"
         );
+    }
+
+    /// `evaluate` and `stratify` (which share this check) accept a table of the model's cap,
+    /// including an explicit `maxreads600` against an older model, and reject a table of another
+    /// cap with the `extract` settings that reproduce the model's; `score` measures with the
+    /// model's cap.
+    #[test]
+    fn a_table_of_another_read_cap_than_the_model_is_rejected() {
+        let mut model = crate::testing::separable_model(Task::Genotype, VariantType::Snp);
+        let paths = [PathBuf::from("m.winnowr.json")];
+        let table = Path::new("t.parquet");
+        let mut info = crate::testing::call_table(&[]).info().clone();
+        model.info.feature_source = "alignments:mapq1".parse().unwrap();
+        info.feature_source = "alignments:mapq1,maxreads600".parse().unwrap();
+        check_table_feature_source(table, &info, std::slice::from_ref(&model), &paths).unwrap();
+        info.feature_source = "alignments:mapq1,maxreads2000".parse().unwrap();
+        let error = check_table_feature_source(table, &info, std::slice::from_ref(&model), &paths)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "feature table t.parquet holds features from `alignments:mapq1,bq10,flank5,\
+             maxreads2000`, but model m.winnowr.json was trained on features from \
+             `alignments:mapq1,bq10,flank5`: extract the table again with --alignments, \
+             --reference and --alignment-settings mapq1,bq10,flank5, or use a model trained on \
+             `alignments:mapq1,bq10,flank5,maxreads2000` features"
+        );
+        model.info.feature_source = info.feature_source;
+        info.feature_source = "alignments:mapq1".parse().unwrap();
+        let error = check_table_feature_source(table, &info, &[model], &paths).unwrap_err();
+        assert!(
+            error.to_string().contains("--alignment-settings mapq1,bq10,flank5,maxreads2000,"),
+            "{error}"
+        );
+
+        let base = ["score", "--vcf", "v", "--models", "m.winnowr.json", "-o", "o"];
+        let reads = ["--alignments", "in.cram", "--reference", "ref.fa"];
+        let Command::Score(args) = parse(&[&base[..], &reads].concat()).unwrap().command else {
+            panic!("not score")
+        };
+        let options: ReadAnnotationOptions = "mapq1,maxreads2000".parse().unwrap();
+        let source = FeatureSource::VcfAlignments(options);
+        assert_eq!(models_read_annotations(source, &args).unwrap(), Some(options));
+        assert_eq!(options.max_reads(), 2000);
     }
 
     #[test]
